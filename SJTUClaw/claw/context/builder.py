@@ -85,6 +85,14 @@ class ContextBuilder:
             return []
         return tool_registry.list_definitions()
 
+    def update_system_prompt(self, content: str) -> None:
+        """Hot-reload the system prompt without restarting the server."""
+        self._system_prompt = content
+
+    def update_soul(self, content: str) -> None:
+        """Hot-reload the soul without restarting the server."""
+        self._soul = content
+
     # -- internal ------------------------------------------------------------
 
     def _build_memory_block(self) -> str | None:

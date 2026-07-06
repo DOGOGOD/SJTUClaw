@@ -15,6 +15,8 @@ from claw.llm.client import LLMClient
 from claw.memory.store import MemoryStore
 from claw.prompts import PromptLoadError, load_soul, load_system_prompt
 from claw.session.store import SessionStore
+from claw.tools.base import ToolRegistry
+from claw.tools.readonly import register_all_readonly
 
 
 def _force_utf8_streams() -> None:
@@ -46,7 +48,11 @@ def main() -> int:
     memory_store = MemoryStore(MEMORY_FILE)
     context_builder = ContextBuilder(system_prompt, soul, memory_store)
 
-    run_repl(client, session_store, memory_store, context_builder)
+    # -- Tool registry (Step 5: read-only tools) ----------------------------
+    tool_registry = ToolRegistry()
+    register_all_readonly(tool_registry)
+
+    run_repl(client, session_store, memory_store, context_builder, tool_registry)
     return 0
 
 

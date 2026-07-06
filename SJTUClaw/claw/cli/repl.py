@@ -4,12 +4,14 @@ This module owns terminal input/output only:
     - Session storage & persistence -> `claw.session`
     - `/session`, `/memory`, `/compact` commands -> `claw.cli.commands`
     - Assembling the LLM `messages` array -> `claw.context.builder`
-    - Talking to the LLM -> `claw.llm.client`
+    - Agent turn orchestration -> `claw.agent.loop`
+    - Tool execution -> `claw.tools`
     - Auto-compaction after each turn -> `claw.context.compaction`
 """
 
 from __future__ import annotations
 
+from claw.agent.loop import run_agent_turn
 from claw.cli.commands import RuntimeState, handle_command, is_command
 from claw.context.builder import ContextBuilder
 from claw.context.compaction import (
@@ -22,6 +24,7 @@ from claw.llm.client import LLMClient, LLMError
 from claw.memory.store import MemoryStore
 from claw.session.models import Session
 from claw.session.store import SessionStore, SessionStoreError
+from claw.tools.base import ToolRegistry
 
 EXIT_COMMANDS = {"/exit"}
 WELCOME_MESSAGE = "claw started. Type /exit to quit."
@@ -32,6 +35,7 @@ def run_repl(
     session_store: SessionStore,
     memory_store: MemoryStore,
     context_builder: ContextBuilder,
+    tool_registry: ToolRegistry,
 ) -> None:
     """Run the interactive multi-turn conversation loop."""
     initial_session = session_store.ensure_default_session()
@@ -65,7 +69,9 @@ def run_repl(
             print()
             continue
 
-        _handle_chat_turn(user_input, state, client, context_builder)
+        _handle_chat_turn(
+            user_input, state, client, context_builder, tool_registry
+        )
 
 
 def _handle_chat_turn(
@@ -73,38 +79,43 @@ def _handle_chat_turn(
     state: RuntimeState,
     client: LLMClient,
     context_builder: ContextBuilder,
+    tool_registry: ToolRegistry,
 ) -> None:
-    session = state.session_store.get(state.current_session_id)
-    session.append_message("user", user_input)
-    _save_session_quietly(state.session_store, session)
-
+    """Process one user message through the unified agent loop."""
     try:
-        messages = context_builder.build_messages(session)
-        reply = client.chat(messages)
+        reply = run_agent_turn(
+            state.current_session_id,
+            user_input,
+            session_store=state.session_store,
+            context_builder=context_builder,
+            tool_registry=tool_registry,
+            llm_client=client,
+        )
     except LLMError as exc:
         _print_error(exc)
         return
 
-    session.append_message("assistant", reply)
-    _save_session_quietly(state.session_store, session)
-    _print_assistant_reply(reply)
+    if reply:
+        _print_assistant_reply(reply)
 
-    _maybe_auto_compact(session, state, client)
+    # -- Auto-compaction check -----------------------------------------------
+    _maybe_auto_compact(state)
+    print()
 
 
-def _maybe_auto_compact(
-    session: Session, state: RuntimeState, client: LLMClient
-) -> None:
+def _maybe_auto_compact(state: RuntimeState) -> None:
     """Check and run compaction after a turn, per Step 4's agent loop rule.
 
-    Only ever touches `session.summary`/`session.messages`; failures
-    here never delete the assistant reply that was just appended.
+    Only ever touches ``session.summary`` / ``session.messages``.
     """
+    session = state.session_store.get(state.current_session_id)
     if not needs_compaction(session):
         return
 
     try:
-        outcome = compact_and_persist(session, state.session_store, client)
+        outcome = compact_and_persist(
+            session, state.session_store, state.llm_client
+        )
     except CompactionError as exc:
         _print_error(exc)
         return
@@ -122,14 +133,6 @@ def _print_compaction_outcome(session_id: str, outcome: CompactionOutcome) -> No
     print(result.summary)
     if outcome.save_error:
         print(f"[system] warning: 压缩结果保存可能未成功: {outcome.save_error}")
-    print()
-
-
-def _save_session_quietly(session_store: SessionStore, session) -> None:
-    try:
-        session_store.save(session)
-    except SessionStoreError as exc:
-        _print_error(exc)
 
 
 def _print_load_warnings(
@@ -157,12 +160,10 @@ def _read_user_input() -> str | None:
 
 def _print_assistant_reply(reply: str) -> None:
     print(f"Assistant> {reply}")
-    print()
 
 
 def _print_error(error: Exception) -> None:
     print(f"[错误] {error}")
-    print()
 
 
 def _print_goodbye() -> None:

@@ -1,18 +1,23 @@
 """Minimal LLM API client.
 
-Wraps an OpenAI-compatible chat completions endpoint with a single
-`chat(messages) -> str` entry point, translating low-level failures
-into clear, user-facing errors.
+Wraps an OpenAI-compatible chat completions endpoint with two entry
+points:
+
+    chat(messages) -> str                 # simple text-only call
+    chat_with_tools(messages, tools) -> AgentResponse   # tool-calling call
+
+Both translate low-level failures into clear, user-facing errors.
 """
 
 from __future__ import annotations
 
-from typing import Iterable, Mapping
+from typing import Any, Iterable, Mapping
 
 import openai
 from openai import OpenAI
 
 from claw.config import LLMConfig
+from claw.llm.protocol import AgentResponse, ProtocolParseError, parse_agent_response
 
 Message = Mapping[str, str]
 
@@ -40,6 +45,8 @@ class LLMClient:
         self._config = config
         self._client = OpenAI(api_key=config.api_key, base_url=config.base_url)
 
+    # -- simple text call (backward-compatible) -------------------------------
+
     def chat(self, messages: Iterable[Message]) -> str:
         """Send `messages` to the LLM and return the assistant's reply text.
 
@@ -59,12 +66,86 @@ class LLMClient:
                 the expected fields.
             LLMError: for any other unexpected failure from the SDK.
         """
-        messages_list = list(messages)
+        response = self._call_api(list(messages))
+        return self._extract_reply_text(response)
+
+    # -- tool-calling call ---------------------------------------------------
+
+    def chat_with_tools(
+        self,
+        messages: list[dict[str, str]],
+        tool_definitions: list[dict[str, Any]] | None = None,
+    ) -> AgentResponse:
+        """Send *messages* with optional tool definitions and return a
+        structured ``AgentResponse``.
+
+        If *tool_definitions* are provided and non-empty, they are passed
+        as the API ``tools`` parameter so the model can request tool
+        calls natively (OpenAI function-calling protocol). The response
+        is then parsed via ``parse_agent_response``, which prefers native
+        ``tool_calls`` and falls back to JSON-protocol parsing of the
+        text content.
+
+        Args:
+            messages: the full context (including any previous tool
+                results as ``tool``-role messages).
+            tool_definitions: OpenAI-format tool definitions from
+                ``ToolRegistry.list_definitions()``, or None.
+
+        Returns:
+            ``AgentResponse`` with either ``final`` text or ``tool_calls``.
+
+        Raises:
+            LLMConnectionError / LLMResponseStatusError /
+                LLMResponseFormatError / LLMError: on API-level failures.
+        """
+        response = self._call_api(messages, tool_definitions=tool_definitions)
+        choice = response.choices[0]
+
+        # Extract native tool calls if present
+        native_tool_calls: list[dict[str, Any]] | None = None
+        msg = choice.message
+        if hasattr(msg, "tool_calls") and msg.tool_calls:
+            native_tool_calls = [
+                {
+                    "id": tc.id if hasattr(tc, "id") else "",
+                    "function": {
+                        "name": tc.function.name,
+                        "arguments": tc.function.arguments,
+                    },
+                }
+                for tc in msg.tool_calls
+            ]
+
+        content_text: str | None = getattr(msg, "content", None) or None
+
         try:
-            response = self._client.chat.completions.create(
-                model=self._config.model,
-                messages=messages_list,  # type: ignore[arg-type]
-            )
+            return parse_agent_response(content_text, native_tool_calls)
+        except ProtocolParseError as exc:
+            raise LLMResponseFormatError(
+                f"LLM 响应协议解析失败：{exc}\n"
+                f"原始内容（前200字符）：{str(content_text or '')[:200]}"
+            ) from exc
+
+    # -- internal helpers ----------------------------------------------------
+
+    def _call_api(
+        self,
+        messages: list[dict[str, str]],
+        tool_definitions: list[dict[str, Any]] | None = None,
+    ) -> Any:
+        """Call the chat completions API and return the raw response."""
+        kwargs: dict[str, Any] = {
+            "model": self._config.model,
+            "messages": messages,  # type: ignore[arg-type]
+        }
+        if tool_definitions:
+            kwargs["tools"] = tool_definitions  # type: ignore[arg-type]
+            # Let the model decide when to call tools; don't force it
+            # kwargs["tool_choice"] = "auto"
+
+        try:
+            return self._client.chat.completions.create(**kwargs)
         except openai.APIConnectionError as exc:
             raise LLMConnectionError(
                 "无法连接到 LLM 服务，请检查网络连接以及 LLM_BASE_URL 配置是否正确。\n"
@@ -78,8 +159,6 @@ class LLMClient:
             ) from exc
         except openai.OpenAIError as exc:
             raise LLMError(f"调用 LLM 服务时发生未知错误：{exc}") from exc
-
-        return self._extract_reply_text(response)
 
     @staticmethod
     def _extract_reply_text(response: object) -> str:

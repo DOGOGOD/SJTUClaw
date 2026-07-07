@@ -1,54 +1,48 @@
 """Gateway HTTP server.
 
-A FastAPI server that exposes the claw agent runtime to frontends
-(web, desktop, chat-bot, …). It wraps ``run_agent_turn`` and never
-calls ``LLMClient`` directly — every conversation flows through the
-single agent entry point.
-
-Session strategy for ``POST /chat``:
-    - If ``sessionId`` is provided and exists → use that session.
-    - If ``sessionId`` is missing → auto-create a new session.
-    - If ``sessionId`` is provided but does **not** exist → return 404.
+A FastAPI server that exposes the claw agent runtime to frontends.
 
 Start the server::
 
     python -m claw.gateway
-
-Environment variables for the server (optional):
-    GATEWAY_HOST  – bind address (default: 127.0.0.1)
-    GATEWAY_PORT  – bind port (default: 8000)
 """
 
 from __future__ import annotations
 
 import json
-import os
+import shutil
+import threading
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from claw.agent.loop import run_agent_turn
+from claw.approval.manager import ApprovalManager, ApprovalRequest, ApprovalStatus
 from claw.config import (
     DATA_DIR,
     MEMORY_FILE,
     PROJECT_ROOT,
     SESSIONS_DIR,
-    ConfigError,
     load_config,
 )
 from claw.context.builder import ContextBuilder
 from claw.llm.client import LLMClient, LLMError
 from claw.memory.store import MemoryStore
-from claw.prompts import PromptLoadError, load_soul, load_system_prompt
-from claw.session.store import SessionNotFoundError, SessionStore, SessionStoreError
+from claw.prompts import load_soul, load_system_prompt
+from claw.session.store import SessionStore, SessionStoreError
+from claw.skills.registry import SkillRegistry
 from claw.tools.base import ToolRegistry
-from claw.tools.readonly import register_all_readonly
+from claw.tools import register_all_tools
+from claw.tools.download import get_download, list_downloads
+from claw.workspace.manager import WorkspaceManager, WorkspaceError
 from claw.scheduler.tasks_store import TasksStore, TasksStoreError
 from claw.scheduler.scheduler import Scheduler
 
@@ -65,8 +59,23 @@ _session_store = SessionStore(SESSIONS_DIR)
 _memory_store = MemoryStore(MEMORY_FILE)
 _context_builder = ContextBuilder(_system_prompt, _soul, _memory_store)
 
+_workspace_manager = WorkspaceManager()
+_approval_manager = ApprovalManager()
+
+# -- Skill registry (Step 9) -----------------------------------------------
+_skill_registry = SkillRegistry()
+_context_builder.set_skill_registry(_skill_registry)
+
 _tool_registry = ToolRegistry()
-register_all_readonly(_tool_registry)
+_turn_session_id: str | None = None
+
+register_all_tools(
+    _tool_registry,
+    workspace_manager=_workspace_manager,
+    session_id_provider=lambda: _turn_session_id or "default",
+    sessions_dir=SESSIONS_DIR,
+    include_skill_tool=True,
+)
 
 _tasks_file = DATA_DIR / "tasks" / "tasks.json"
 _tasks_store = TasksStore(_tasks_file)
@@ -74,28 +83,37 @@ _scheduler = Scheduler(
     _tasks_store, _session_store, _context_builder, _tool_registry, _llm_client
 )
 
+
+# -- Approval handler for Gateway (blocks on threading.Event) ----------------
+
+def _gateway_approval_handler(req: ApprovalRequest) -> ApprovalRequest:
+    """Block until the approval is decided via REST endpoint.
+
+    The request is already registered; just wait for the event.
+    """
+    _approval_manager._requests[req.approval_id] = req
+    _approval_manager._events[req.approval_id] = threading.Event()
+    result = _approval_manager.wait(req.approval_id, timeout=300)
+    return result or req
+
+
 # ---------------------------------------------------------------------------
 # FastAPI application
 # ---------------------------------------------------------------------------
 
-from contextlib import asynccontextmanager
-
-
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
-    # Start scheduler on server boot
     if _tasks_store.load_warning:
         print(f"[scheduler] {_tasks_store.load_warning}")
     _scheduler.start()
     yield
-    # Stop scheduler on server shutdown
     _scheduler.stop()
 
 
 app = FastAPI(
     title="SJTUClaw Gateway",
     description="HTTP API for the claw agent runtime.",
-    version="0.2.0",
+    version="0.3.0",
     lifespan=_lifespan,
 )
 
@@ -106,6 +124,23 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# -- Serve web UI at root ---------------------------------------------------
+_WEB_DIR = PROJECT_ROOT / "web"
+
+
+@app.get("/", response_class=HTMLResponse)
+def serve_web_ui():
+    """Serve the main web UI page."""
+    index_path = _WEB_DIR / "index.html"
+    if not index_path.exists():
+        raise HTTPException(status_code=404, detail="Web UI not found")
+    return HTMLResponse(content=index_path.read_text(encoding="utf-8"))
+
+
+# Mount web directory as static files (for future CSS/JS assets)
+if _WEB_DIR.exists():
+    app.mount("/static", StaticFiles(directory=str(_WEB_DIR)), name="static")
 
 
 # ---------------------------------------------------------------------------
@@ -165,7 +200,6 @@ def _meta_file(session_id: str) -> Path:
 
 
 def _read_attachments_meta(session_id: str) -> list[dict[str, Any]]:
-    """Read attachment metadata list, returning [] on any error."""
     mf = _meta_file(session_id)
     if not mf.exists():
         return []
@@ -238,7 +272,7 @@ async def _generic_error_handler(_request, exc: Exception):
 
 
 # ---------------------------------------------------------------------------
-# Routes
+# Routes — Chat
 # ---------------------------------------------------------------------------
 
 
@@ -246,10 +280,12 @@ async def _generic_error_handler(_request, exc: Exception):
 def handle_chat(req: ChatRequest):
     """Send a user message and get the assistant's reply.
 
-    If ``sessionId`` is omitted a new session is created automatically
-    and its id is returned in the response.  If ``sessionId`` is given
-    but does not exist, a **404** is returned.
+    If approval is required for a tool call, this endpoint will block
+    until the approval is decided (or timeout).  The frontend should
+    show a loading indicator during this time.
     """
+    global _turn_session_id
+
     # Resolve session
     if req.session_id:
         if not _session_store.exists(req.session_id):
@@ -262,17 +298,23 @@ def handle_chat(req: ChatRequest):
         session = _session_store.create_session()
         sid = session.session_id
 
-    # Run agent turn — this is the ONLY call site that invokes the LLM
-    reply = run_agent_turn(
-        sid,
-        req.message,
-        session_store=_session_store,
-        context_builder=_context_builder,
-        tool_registry=_tool_registry,
-        llm_client=_llm_client,
-    )
+    # Set thread-local session id for tool handlers
+    _turn_session_id = sid
 
-    # Return updated messages so the frontend can refresh
+    try:
+        reply = run_agent_turn(
+            sid,
+            req.message,
+            session_store=_session_store,
+            context_builder=_context_builder,
+            tool_registry=_tool_registry,
+            llm_client=_llm_client,
+            approval_handler=_gateway_approval_handler,
+            skill_registry=_skill_registry,
+        )
+    finally:
+        _turn_session_id = None
+
     session = _session_store.get(sid)
     messages = [{"role": m.role, "content": m.content} for m in session.messages]
 
@@ -286,10 +328,14 @@ def handle_chat(req: ChatRequest):
 
 
 # ---------------------------------------------------------------------------
-# Command endpoint — handles /session, /memory, /compact for web frontend
+# Routes — Command endpoint
 # ---------------------------------------------------------------------------
 
-_COMMAND_PREFIXES = ("/session", "/memory", "/compact", "/exit", "/task")
+_COMMAND_PREFIXES = (
+    "/session", "/memory", "/compact", "/exit", "/task",
+    "/workspace", "/approve", "/reject", "/approvals",
+    "/skill",
+)
 
 
 class CommandRequest(BaseModel):
@@ -303,19 +349,12 @@ class CommandRequest(BaseModel):
 
 @app.post("/command")
 def handle_command(req: CommandRequest):
-    """Execute a CLI-style command and return the result.
-
-    Supported commands are the same as the terminal CLI:
-    ``/session new|list|switch|rename|delete``,
-    ``/memory add|list|delete``, ``/compact``, ``/exit``.
-
-    The response includes an ``actions`` list so the frontend knows
-    which UI updates to perform (e.g. reload the session list).
-    """
+    """Execute a CLI-style command and return the result."""
     root, *args = req.command.split()
     actions: list[str] = []
     result_text = ""
     switch_to: str | None = None
+    sid = req.session_id or "default"
 
     # ---- /session ----------------------------------------------------------
     if root == "/session":
@@ -343,13 +382,13 @@ def handle_command(req: CommandRequest):
             if not args[1:]:
                 result_text = "用法: /session switch <sessionId>"
             else:
-                sid = args[1]
-                if not _session_store.exists(sid):
-                    result_text = f"Session 不存在: {sid}"
+                target_sid = args[1]
+                if not _session_store.exists(target_sid):
+                    result_text = f"Session 不存在: {target_sid}"
                 else:
-                    result_text = f"Switched to session: {sid}"
+                    result_text = f"Switched to session: {target_sid}"
                     actions = ["switch_session"]
-                    switch_to = sid
+                    switch_to = target_sid
         elif sub == "rename":
             if len(args) < 3:
                 result_text = "用法: /session rename <sessionId> <title>"
@@ -364,15 +403,15 @@ def handle_command(req: CommandRequest):
             if not args[1:]:
                 result_text = "用法: /session delete <sessionId>"
             else:
-                sid = args[1]
-                if not _session_store.exists(sid):
-                    result_text = f"Session 不存在: {sid}"
+                target_sid = args[1]
+                if not _session_store.exists(target_sid):
+                    result_text = f"Session 不存在: {target_sid}"
                 else:
                     try:
-                        _session_store.delete(sid)
-                        result_text = f"Deleted session: {sid}"
+                        _session_store.delete(target_sid)
+                        result_text = f"Deleted session: {target_sid}"
                         actions = ["reload_sessions"]
-                        if req.session_id == sid:
+                        if req.session_id == target_sid:
                             actions.append("switch_session")
                             summaries = _session_store.list_summaries()
                             switch_to = summaries[0].session_id if summaries else _session_store.ensure_default_session().session_id
@@ -448,7 +487,7 @@ def handle_command(req: CommandRequest):
                 except CompactionError as exc:
                     result_text = f"错误: {exc}"
 
-    # ---- /task ---------------------------------------------------------------
+    # ---- /task -------------------------------------------------------------
     elif root in ("/task", "/tasks"):
         sub = args[0] if args else "list"
         if sub == "list":
@@ -496,7 +535,136 @@ def handle_command(req: CommandRequest):
             result_text = "用法: /task <list|cancel|delete> ..."
         actions = ["reload_sessions"]
 
-    # ---- /exit (web: just clear session state) ------------------------------
+    # ---- /workspace (Step 8) -----------------------------------------------
+    elif root == "/workspace":
+        sub = args[0] if args else ""
+        if sub == "set":
+            path_str = " ".join(args[1:]) if args[1:] else ""
+            if not path_str:
+                result_text = "用法: /workspace set <路径>"
+            else:
+                try:
+                    resolved = _workspace_manager.set(sid, path_str)
+                    result_text = f"Workspace 已设置为: {resolved}"
+                    actions = ["reload_workspace"]
+                except WorkspaceError as exc:
+                    result_text = f"错误: {exc}"
+        elif sub == "show":
+            ws = _workspace_manager.get(sid)
+            if ws is None:
+                result_text = "当前 session 未设置 workspace。使用 /workspace set <路径> 来设置。"
+            else:
+                result_text = f"当前 workspace: {ws}"
+            actions = ["reload_workspace"]
+        elif sub == "unset":
+            _workspace_manager.unset(sid)
+            result_text = "Workspace 已取消设置。"
+            actions = ["reload_workspace"]
+        else:
+            result_text = "用法: /workspace <set|show|unset> ..."
+
+    # ---- /approvals --------------------------------------------------------
+    elif root == "/approvals":
+        pending = _approval_manager.get_pending()
+        if not pending:
+            result_text = "当前没有待审批的操作。"
+        else:
+            lines = ["待审批操作:"]
+            for r in pending:
+                args_safe = {
+                    k: (v[:80] + "..." if isinstance(v, str) and len(v) > 80 else v)
+                    for k, v in r.tool_args.items()
+                }
+                lines.append(
+                    f"  [{r.approval_id}] {r.tool_name} session={r.session_id}"
+                )
+                lines.append(f"    参数: {args_safe}")
+            lines.append("使用 /approve <id> 批准，/reject <id> [原因] 拒绝。")
+            result_text = "\n".join(lines)
+
+    # ---- /approve ----------------------------------------------------------
+    elif root == "/approve":
+        approval_id = args[0] if args else ""
+        if not approval_id:
+            pending = _approval_manager.get_pending()
+            if len(pending) == 1:
+                approval_id = pending[0].approval_id
+            else:
+                result_text = "用法: /approve <approvalId>"
+        if approval_id:
+            r = _approval_manager.approve(approval_id)
+            if r is None:
+                result_text = f"未找到审批请求: {approval_id}"
+            else:
+                result_text = f"已批准: [{r.approval_id}] {r.tool_name}"
+
+    # ---- /reject -----------------------------------------------------------
+    elif root == "/reject":
+        approval_id = args[0] if args else ""
+        if not approval_id:
+            pending = _approval_manager.get_pending()
+            if len(pending) == 1:
+                approval_id = pending[0].approval_id
+            else:
+                result_text = "用法: /reject <approvalId> [原因]"
+        if approval_id:
+            reason = " ".join(args[1:]) if len(args) > 1 else ""
+            r = _approval_manager.reject(approval_id, reason)
+            if r is None:
+                result_text = f"未找到审批请求: {approval_id}"
+            else:
+                reason_text = f"原因: {reason}" if reason else "未提供原因"
+                result_text = f"已拒绝: [{r.approval_id}] {r.tool_name} ({reason_text})"
+
+    # ---- /skill (Step 9) -------------------------------------------------
+    elif root == "/skill":
+        sub = args[0] if args else ""
+        if sub == "list":
+            skills = _skill_registry.list_skills()
+            if not skills:
+                result_text = "Skills: (empty)"
+            else:
+                lines = ["Skills:"]
+                for s in skills:
+                    lines.append(f"  {s.name}")
+                    lines.append(f"    {s.description}")
+                result_text = "\n".join(lines)
+        elif sub == "show":
+            if not args[1:]:
+                result_text = "用法: /skill show <skill-name>"
+            else:
+                skill = _skill_registry.get_skill(args[1])
+                if skill is None:
+                    result_text = f"未找到 skill: \"{args[1]}\""
+                else:
+                    lines = [
+                        f"Skill: {skill.name}",
+                        f"描述: {skill.description}",
+                        "",
+                        "使用说明:",
+                        skill.instructions[:1500],
+                    ]
+                    result_text = "\n".join(lines)
+        elif sub == "usage":
+            if not req.session_id:
+                result_text = "没有当前 session"
+            else:
+                session = _session_store.get(req.session_id)
+                records = session.skill_usage
+                if not records:
+                    result_text = "当前 session 暂无 skill 使用记录。"
+                else:
+                    lines = ["Skill 使用记录:"]
+                    for i, r in enumerate(records, 1):
+                        src = "显式调用" if r.get("source") == "explicit" else "模型自主"
+                        lines.append(
+                            f"  [{i}] {r.get('skillName','?')} | {src} | {r.get('usedAt','?')}"
+                        )
+                    result_text = "\n".join(lines)
+        else:
+            result_text = "用法: /skill <list|show|usage|<skill-name> <task>> ..."
+
+    # ---- /exit (web: just clear session state) ----------------------------
     elif root == "/exit":
         result_text = "bye."
         actions = ["clear_session"]
@@ -515,9 +683,13 @@ def handle_command(req: CommandRequest):
     return resp
 
 
+# ---------------------------------------------------------------------------
+# Routes — Sessions
+# ---------------------------------------------------------------------------
+
+
 @app.get("/sessions")
 def list_sessions():
-    """List all existing sessions."""
     summaries = _session_store.list_summaries()
     return {
         "ok": True,
@@ -535,7 +707,6 @@ def list_sessions():
 
 @app.post("/sessions")
 def create_session(req: CreateSessionRequest | None = None):
-    """Create a new session."""
     title = req.title if req and req.title else None
     session = _session_store.create_session(title=title)
     return {
@@ -547,7 +718,6 @@ def create_session(req: CreateSessionRequest | None = None):
 
 @app.get("/sessions/{session_id}/messages")
 def get_messages(session_id: str):
-    """Return the full message history for *session_id*."""
     if not _session_store.exists(session_id):
         raise HTTPException(status_code=404, detail=f"Session 不存在: {session_id}")
     session = _session_store.get(session_id)
@@ -559,17 +729,16 @@ def get_messages(session_id: str):
     }
 
 
+# ---------------------------------------------------------------------------
+# Routes — Attachments
+# ---------------------------------------------------------------------------
+
+
 @app.post("/sessions/{session_id}/attachments")
 async def upload_attachment(session_id: str, file: UploadFile = File(...)):
-    """Upload an attachment to *session_id*.
-
-    The file is stored under ``data/sessions/<sessionId>/attachments/``
-    and is only visible to its owning session.
-    """
     if not _session_store.exists(session_id):
         raise HTTPException(status_code=404, detail=f"Session 不存在: {session_id}")
 
-    # Validate file
     if not file.filename:
         raise HTTPException(status_code=400, detail="文件名不能为空")
 
@@ -578,21 +747,17 @@ async def upload_attachment(session_id: str, file: UploadFile = File(...)):
     size = len(content)
     mime_type = file.content_type or "application/octet-stream"
 
-    # Generate a collision-resistant stored name
     attachment_id = f"att_{uuid.uuid4().hex[:12]}"
-    # Keep extension from original name for usability
     safe_suffix = Path(original_name).suffix
     if safe_suffix and len(safe_suffix) > 20:
         safe_suffix = ""
     stored_name = f"{attachment_id}{safe_suffix}"
 
-    # Write file
     d = _attachments_dir(session_id)
     d.mkdir(parents=True, exist_ok=True)
     file_path = d / stored_name
     file_path.write_bytes(content)
 
-    # Record metadata
     record = _add_attachment_record(
         session_id, attachment_id, original_name, stored_name, size, mime_type
     )
@@ -612,7 +777,6 @@ async def upload_attachment(session_id: str, file: UploadFile = File(...)):
 
 @app.get("/sessions/{session_id}/attachments")
 def list_attachments(session_id: str):
-    """List attachment metadata for *session_id*."""
     if not _session_store.exists(session_id):
         raise HTTPException(status_code=404, detail=f"Session 不存在: {session_id}")
     records = _read_attachments_meta(session_id)
@@ -634,6 +798,178 @@ def list_attachments(session_id: str):
 
 
 # ==========================================================================
+# Step 8 Routes — Workspace, Approval, Download
+# ==========================================================================
+
+
+# -- Workspace ---------------------------------------------------------------
+
+class SetWorkspaceRequest(BaseModel):
+    session_id: str = Field(alias="sessionId")
+    path: str = Field(..., min_length=1)
+
+
+@app.get("/workspace")
+def get_workspace(session_id: str = Query(..., alias="sessionId")):
+    """Get the workspace for a session."""
+    ws = _workspace_manager.get(session_id)
+    return {
+        "ok": True,
+        "sessionId": session_id,
+        "workspace": str(ws) if ws else None,
+        "isSet": ws is not None,
+    }
+
+
+@app.post("/workspace")
+def set_workspace(req: SetWorkspaceRequest):
+    """Set the workspace for a session."""
+    try:
+        resolved = _workspace_manager.set(req.session_id, req.path)
+    except WorkspaceError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {
+        "ok": True,
+        "sessionId": req.session_id,
+        "workspace": str(resolved),
+    }
+
+
+@app.delete("/workspace")
+def unset_workspace(session_id: str = Query(..., alias="sessionId")):
+    """Remove the workspace binding for a session."""
+    _workspace_manager.unset(session_id)
+    return {"ok": True, "sessionId": session_id}
+
+
+# -- Approval ----------------------------------------------------------------
+
+@app.get("/approvals")
+def list_approvals(session_id: str | None = Query(None, alias="sessionId")):
+    """List pending approvals, optionally filtered by session."""
+    if session_id:
+        all_reqs = _approval_manager.list_by_session(session_id)
+        pending = [r for r in all_reqs if r.status == ApprovalStatus.PENDING.value]
+    else:
+        pending = _approval_manager.get_pending()
+    return {
+        "ok": True,
+        "approvals": [r.to_dict() for r in pending],
+    }
+
+
+@app.post("/approvals/{approval_id}/approve")
+def approve_request(approval_id: str):
+    """Approve a pending approval request."""
+    req = _approval_manager.approve(approval_id)
+    if req is None:
+        raise HTTPException(status_code=404, detail=f"审批请求不存在: {approval_id}")
+    return {"ok": True, "approval": req.to_dict()}
+
+
+class RejectRequest(BaseModel):
+    reason: str = Field(default="", description="Optional rejection reason.")
+
+
+@app.post("/approvals/{approval_id}/reject")
+def reject_request(approval_id: str, body: RejectRequest | None = None):
+    """Reject a pending approval request with an optional reason."""
+    reason = body.reason if body else ""
+    req = _approval_manager.reject(approval_id, reason)
+    if req is None:
+        raise HTTPException(status_code=404, detail=f"审批请求不存在: {approval_id}")
+    return {"ok": True, "approval": req.to_dict()}
+
+
+# -- Download ----------------------------------------------------------------
+
+@app.get("/downloads")
+def list_download_entries():
+    """List all active download entries."""
+    entries = list_downloads()
+    return {
+        "ok": True,
+        "downloads": [
+            {"downloadId": did, "fileName": fname}
+            for did, fname in entries.items()
+        ],
+    }
+
+
+@app.get("/downloads/{download_id}")
+def serve_download(download_id: str):
+    """Serve the file registered under *download_id*."""
+    file_path = get_download(download_id)
+    if file_path is None:
+        raise HTTPException(
+            status_code=404, detail=f"下载入口不存在或已过期: {download_id}"
+        )
+    if not file_path.exists():
+        raise HTTPException(
+            status_code=404, detail=f"文件已被删除: {file_path.name}"
+        )
+    return FileResponse(
+        path=str(file_path),
+        filename=file_path.name,
+        media_type="application/octet-stream",
+    )
+
+
+# ==========================================================================
+# Step 9 Routes — Skills
+# ==========================================================================
+
+
+@app.get("/skills")
+def list_skills_endpoint():
+    """List all available skills (lightweight index)."""
+    skills = _skill_registry.list_skills()
+    return {
+        "ok": True,
+        "skills": [
+            {
+                "name": s.name,
+                "description": s.description,
+                "hasAssets": len(s.assets) > 0,
+                "hasReferences": len(s.references) > 0,
+            }
+            for s in skills
+        ],
+    }
+
+
+@app.get("/skills/{skill_name}")
+def get_skill_detail(skill_name: str):
+    """Get full details of a specific skill."""
+    skill = _skill_registry.get_skill(skill_name)
+    if skill is None:
+        raise HTTPException(status_code=404, detail=f"Skill 不存在: {skill_name}")
+    return {
+        "ok": True,
+        "skill": {
+            "name": skill.name,
+            "description": skill.description,
+            "instructions": skill.instructions,
+            "assets": [str(a.relative_to(skill.directory)) for a in skill.assets],
+            "references": [str(r.relative_to(skill.directory)) for r in skill.references],
+        },
+    }
+
+
+@app.get("/sessions/{session_id}/skill-usage")
+def get_skill_usage(session_id: str):
+    """Get skill usage records for a session."""
+    if not _session_store.exists(session_id):
+        raise HTTPException(status_code=404, detail=f"Session 不存在: {session_id}")
+    session = _session_store.get(session_id)
+    return {
+        "ok": True,
+        "sessionId": session_id,
+        "records": session.skill_usage,
+    }
+
+
+# ==========================================================================
 # Admin routes — edit system prompt, soul, sessions, memory
 # ==========================================================================
 
@@ -645,52 +981,36 @@ class RenameSessionRequest(BaseModel):
     title: str = Field(..., min_length=1)
 
 
-# -- System prompt ----------------------------------------------------------
-
-
 @app.get("/admin/system-prompt")
 def get_system_prompt():
-    """Return the current system prompt content."""
     return {"ok": True, "content": _system_prompt}
 
 
 @app.put("/admin/system-prompt")
 def update_system_prompt(req: UpdateContentRequest):
-    """Overwrite the system prompt file and hot-reload it."""
     _write_prompt_file("system_prompt.md", req.content)
-    nonlocal_sp = "_system_prompt"
     import claw.gateway.server as _srv
-    _srv.__dict__[nonlocal_sp] = req.content
+    _srv.__dict__["_system_prompt"] = req.content
     _context_builder.update_system_prompt(req.content)
     return {"ok": True}
 
 
-# -- Soul -------------------------------------------------------------------
-
-
 @app.get("/admin/soul")
 def get_soul():
-    """Return the current soul content."""
     return {"ok": True, "content": _soul}
 
 
 @app.put("/admin/soul")
 def update_soul(req: UpdateContentRequest):
-    """Overwrite the soul file and hot-reload it."""
     _write_prompt_file("soul.md", req.content)
-    nonlocal_soul = "_soul"
     import claw.gateway.server as _srv
-    _srv.__dict__[nonlocal_soul] = req.content
+    _srv.__dict__["_soul"] = req.content
     _context_builder.update_soul(req.content)
     return {"ok": True}
 
 
-# -- Session rename / delete ------------------------------------------------
-
-
 @app.patch("/sessions/{session_id}")
 def rename_session(session_id: str, req: RenameSessionRequest):
-    """Rename a session."""
     if not _session_store.exists(session_id):
         raise HTTPException(status_code=404, detail=f"Session 不存在: {session_id}")
     _session_store.rename(session_id, req.title)
@@ -699,10 +1019,8 @@ def rename_session(session_id: str, req: RenameSessionRequest):
 
 @app.delete("/sessions/{session_id}")
 def delete_session(session_id: str):
-    """Delete a session and its attachments."""
     if not _session_store.exists(session_id):
         raise HTTPException(status_code=404, detail=f"Session 不存在: {session_id}")
-    import shutil
     _session_store.delete(session_id)
     att_dir = _attachments_dir(session_id)
     if att_dir.exists():
@@ -710,12 +1028,8 @@ def delete_session(session_id: str):
     return {"ok": True}
 
 
-# -- Memory management (RESTful wrappers) ------------------------------------
-
-
 @app.get("/memories")
 def list_memories():
-    """List all memory entries."""
     entries = _memory_store.list()
     return {
         "ok": True,
@@ -732,23 +1046,17 @@ class AddMemoryRequest(BaseModel):
 
 @app.post("/memories")
 def add_memory(req: AddMemoryRequest):
-    """Add a new memory entry."""
     entry = _memory_store.add(req.content)
     return {"ok": True, "id": entry.memory_id, "content": entry.content}
 
 
 @app.delete("/memories/{memory_id}")
 def delete_memory(memory_id: str):
-    """Delete a memory entry."""
     _memory_store.delete(memory_id)
     return {"ok": True}
 
 
-# -- Helpers ----------------------------------------------------------------
-
-
 def _write_prompt_file(filename: str, content: str) -> None:
-    """Write prompt content to ``prompts/<filename>`` atomically."""
     target = PROJECT_ROOT / "prompts" / filename
     tmp = target.with_suffix(".tmp")
     tmp.write_text(content, encoding="utf-8")
@@ -759,27 +1067,19 @@ def _write_prompt_file(filename: str, content: str) -> None:
 # Task management (Scheduler)
 # ==========================================================================
 
-from datetime import datetime, timezone
-
 
 class CreateTaskRequest(BaseModel):
-    content: str = Field(..., min_length=1, description="任务内容（到期后作为用户消息发送）")
-    trigger_type: str = Field(..., alias="triggerType", description="once / interval / daily")
-    trigger_rule: str = Field(..., alias="triggerRule", description="ISO时间 / 秒数 / HH:MM")
-    session_id: str = Field(..., alias="sessionId", description="所属 session id")
+    content: str = Field(..., min_length=1)
+    trigger_type: str = Field(..., alias="triggerType")
+    trigger_rule: str = Field(..., alias="triggerRule")
+    session_id: str = Field(..., alias="sessionId")
 
 
 @app.post("/tasks")
 def create_task(req: CreateTaskRequest):
-    """Create a scheduled task.
-
-    *triggerType* must be one of ``once``, ``interval``, ``daily``.
-    The session must exist.
-    """
     if req.trigger_type not in ("once", "interval", "daily"):
         raise HTTPException(status_code=400, detail=f"无效的 triggerType: {req.trigger_type}")
 
-    # Validate trigger_rule
     if req.trigger_type == "once":
         try:
             datetime.fromisoformat(req.trigger_rule)
@@ -802,7 +1102,6 @@ def create_task(req: CreateTaskRequest):
             raise HTTPException(status_code=400, detail="daily 任务的 triggerRule 格式必须为 HH:MM")
 
     if not _session_store.exists(req.session_id):
-        # Auto-create the session for convenience
         _session_store.create_session(session_id=req.session_id)
 
     try:
@@ -815,38 +1114,26 @@ def create_task(req: CreateTaskRequest):
     except TasksStoreError as exc:
         raise HTTPException(status_code=500, detail=str(exc))
 
-    return {
-        "ok": True,
-        "task": _task_to_dict(task),
-    }
+    return {"ok": True, "task": _task_to_dict(task)}
 
 
 @app.get("/tasks")
 def list_tasks():
-    """List all tasks ordered by creation time (newest first)."""
     tasks = _tasks_store.list_all()
-    return {
-        "ok": True,
-        "tasks": [_task_to_dict(t) for t in tasks],
-    }
+    return {"ok": True, "tasks": [_task_to_dict(t) for t in tasks]}
 
 
 @app.get("/tasks/{task_id}")
 def get_task(task_id: str):
-    """Get a single task including its full execution history."""
     try:
         task = _tasks_store.get(task_id)
     except TasksStoreError:
         raise HTTPException(status_code=404, detail=f"任务不存在: {task_id}")
-    return {
-        "ok": True,
-        "task": _task_to_dict(task),
-    }
+    return {"ok": True, "task": _task_to_dict(task)}
 
 
 @app.post("/tasks/{task_id}/cancel")
 def cancel_task(task_id: str):
-    """Cancel a waiting task. Completed/cancelled tasks cannot be re-cancelled."""
     try:
         task = _tasks_store.get(task_id)
     except TasksStoreError:
@@ -859,10 +1146,6 @@ def cancel_task(task_id: str):
 
 @app.delete("/tasks/{task_id}")
 def delete_task(task_id: str):
-    """Delete a task completely, including its execution history.
-
-    Running tasks should be cancelled first.
-    """
     try:
         task = _tasks_store.get(task_id)
     except TasksStoreError:

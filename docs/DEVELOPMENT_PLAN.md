@@ -588,8 +588,7 @@ Approval 流程接入" 顺序推进，各自单元测试。
      绝对路径逃逸出 workspace，非法路径直接拒绝并返回清晰错误
    - 如果 workspace 未设置，任何涉及文件修改/命令执行/附件拷贝/下载入口创建的
      tool 调用都必须直接失败并提示先设置 workspace
-2. claw/tools/update.py：实现 create_file / overwrite_file / edit_file（三选一
-   合并成 update_file + operation 参数也可以，但必须覆盖创建/覆盖/编辑三种能力）。
+2. claw/tools/update.py：实现 create_file / overwrite_file / edit_file。
    每次执行结果需要包含：是否成功、tool 名称、影响路径、简要结果或错误信息。
    路径若超出 workspace，直接返回失败，不允许写入。
 3. claw/tools/shell.py：实现两个 tool：
@@ -599,7 +598,7 @@ Approval 流程接入" 顺序推进，各自单元测试。
      继承前面 cd/环境变量/source 的效果）；没有已启动的 shell 时返回明确错误提示
      先调用 new_shell。执行前后都要检查 shell 当前 cwd 是否仍在 workspace 内，
      如果越界要终止该 shell 并返回错误。返回结果需包含：是否成功、执行的命令、
-     执行时 cwd、退出码、stdout、stderr、是否超时、输出是否被截断、错误信息
+     执行时 cwd、退出码、stdout、stderr、是否超时、输出是否被截断、错误信息。
 4. claw/tools/download.py：实现 create_download，为 workspace 内已存在文件生成
    一个临时下载入口（downloadId 或 downloadUrl），并让 Gateway 能提供实际文件下载
    路由。create_download 本身不需要把文件内容返回给模型。
@@ -738,7 +737,7 @@ SJTUClaw/SJTUClaw.md 的 Step 9 章节，实现 Skill System。
 ```
 你是 SJTUClaw 项目的开发者，Step 0-9 的功能均已实现（session/context/memory/
 compaction/tool/agent loop/gateway/scheduler/workspace/approval/skill）。请阅读
-SJTUClaw/SJTUClaw.md 全文和项目现状，完成收尾工作。
+SJTUClaw/SJTUClaw.md 和C:\Users\GZQ\Desktop\SJTUClaw\docs\DEVELOPMENT_PLAN.md全文和项目现状，完成收尾工作。
 
 任务：
 1. 整理 docs/QA_CHECKLIST.md，把 Step 0-9 每一步文档中"最小程序行为"对应的验收

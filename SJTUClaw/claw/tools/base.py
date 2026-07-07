@@ -16,8 +16,7 @@ All tools in Step 5 carry ``safety_level='read_only'``.
 
 from __future__ import annotations
 
-import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable
 
 

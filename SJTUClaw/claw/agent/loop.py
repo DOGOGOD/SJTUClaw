@@ -10,30 +10,47 @@ Loop flow::
     user message
       -> append to session
       -> loop:
-           buildContext (messages + tool definitions)
+           buildContext (messages + tool definitions + skill index)
            -> callLLM
            -> if final:
                 save assistant message -> return
-           -> if tool_call(s):
-                execute each tool (max 5 / round)
-                save tool results as ``tool``-role messages
-                -> continue loop
+           -> if use_skill (skill_select):
+                create skill approval -> user confirms/denies
+                if approved: inject skill content -> continue
+                if rejected: record rejection -> continue
+           -> if write / shell tool:
+                create approval -> wait for user decision
+                if rejected: record rejection -> continue
+                execute tool, save result
+           -> if download / read-only:
+                execute tool, save result
+           -> continue loop
 
-There is **no** hard iteration cap on the outer loop. The single-round
-cap of 5 tool calls is enforced by ``parse_agent_response``.
+``use_skill`` is a special tool with safety_level ``skill_select``.
+When the model invokes it, the agent loop pauses for user confirmation
+BEFORE the skill content enters the LLM context — the model only sees
+the full instructions after the user approves.
 """
 
 from __future__ import annotations
 
 import json
-import textwrap
-from typing import Any
+from datetime import datetime, timezone
+from typing import Any, Callable
 
 from claw.context.builder import ContextBuilder
-from claw.llm.client import LLMClient, LLMError
-from claw.llm.protocol import AgentResponse
+from claw.llm.client import LLMClient
 from claw.session.store import SessionStore, SessionStoreError
-from claw.tools.base import ToolRegistry, ToolResult
+from claw.tools.base import ToolRegistry
+
+
+_APPROVAL_REQUIRED_LEVELS = {"write", "shell"}
+_SKILL_SELECT_LEVEL = "skill_select"
+_MAX_AGENT_ITERATIONS = 15  # safety cap: prevent infinite tool-calling loops
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 # ---------------------------------------------------------------------------
@@ -49,74 +66,178 @@ def run_agent_turn(
     context_builder: ContextBuilder,
     tool_registry: ToolRegistry,
     llm_client: LLMClient,
+    approval_handler: Callable | None = None,
+    skill_registry=None,
+    skill_source: str = "",
+    skill_name: str = "",
+    auto_reason: str = "",
 ) -> str:
     """Run a single agent turn: user message in, assistant reply out.
 
-    This is the **only** call-site that talks to the LLM during a normal
-    conversation. It:
-
-    1. Writes the user message into *session_id*.
-    2. Enters an inner think→act→observe loop:
-       - Builds the full context (stable + conversation).
-       - Passes tool definitions natively (API ``tools`` param) and falls
-         back to JSON-protocol parsing if the model text-replies instead.
-       - If the model responds ``final``: saves the assistant message and
-         returns the reply text.
-       - If the model requests ``tool_call(s)``: executes every requested
-         tool via ``ToolRegistry`` (max 5 per round), saves each result
-         as a ``tool``-role message, prints a trace line, and loops.
-    3. Tool failures are fed back as observation messages — the loop
-       never crashes because of a tool error.
+    Args:
+        session_id: target session.
+        user_message: the user's input text.
+        session_store: session persistence.
+        context_builder: assembles the LLM ``messages`` array.
+        tool_registry: registered tools (must include ``use_skill`` if
+            ``skill_registry`` is provided).
+        llm_client: the LLM API wrapper.
+        approval_handler: optional callable
+            ``(approval_request) -> ApprovalRequest``.
+        skill_registry: optional ``SkillRegistry`` for skill injection.
+        skill_source: ``"explicit"`` if the user typed ``/skill name task``,
+            ``"auto"`` if the model selected the skill, ``""`` otherwise.
+        skill_name: if *skill_source* is set, the pre-selected skill name.
+        auto_reason: if *skill_source* == ``"auto"``, the model's reason.
 
     Returns:
         The assistant's final reply text.
-
-    Raises:
-        LLMError: on unrecoverable API failures.
-        SessionStoreError: if session persistence fails at critical
-            points (the error is also raised so the caller can surface
-            it; in-memory state is kept up-to-date regardless).
     """
+
+    def _needs_approval(tool_name: str) -> bool:
+        t = tool_registry.get_tool(tool_name)
+        return t is not None and t.safety_level in _APPROVAL_REQUIRED_LEVELS
+
+    def _is_skill_select(tool_name: str) -> bool:
+        t = tool_registry.get_tool(tool_name)
+        return t is not None and t.safety_level == _SKILL_SELECT_LEVEL
+
     session = session_store.get(session_id)
 
-    # -- 1. Append user message ----------------------------------------------
-    session.append_message("user", user_message)
+    # -- 1. If this turn is an explicit /skill invocation, inject skill
+    #      content right away (user already chose the skill).
+    if skill_source == "explicit" and skill_name:
+        injected = context_builder.build_skill_injection_message(
+            skill_name, user_message
+        )
+        session.append_message("user", injected)
+        _record_skill_usage(
+            session, skill_name, user_message, "explicit", ""
+        )
+    else:
+        session.append_message("user", user_message)
+
     _save_safe(session_store, session)
+
+    # Track whether we've already handled skill selection in this turn
+    skill_already_injected_for_turn = skill_source == "explicit"
 
     # -- 2. Think → Act → Observe loop ---------------------------------------
     turn_count = 0
     while True:
         turn_count += 1
+        if turn_count > _MAX_AGENT_ITERATIONS:
+            print(f"[agent] 达到最大迭代次数 {_MAX_AGENT_ITERATIONS}，强制结束本回合")
+            final_text = (
+                "本轮任务涉及的操作过多，已达到最大工具调用次数限制。"
+                "请尝试将任务拆分为更小的步骤，或检查是否需要调整方案。"
+            )
+            session.append_message("assistant", final_text)
+            _save_safe(session_store, session)
+            return final_text
 
-        # 2a. Build context
         messages = context_builder.build_messages(
             session,
             tool_registry=tool_registry,
-            include_tool_instructions=True,  # JSON fallback path
+            include_tool_instructions=True,
         )
         tool_defs = context_builder.get_tool_definitions(tool_registry)
 
-        # 2b. Call LLM
         response = llm_client.chat_with_tools(messages, tool_defs)
 
-        # 2c. Final answer — done
+        # -- Final answer ----------------------------------------------------
         if response.is_final and response.final is not None:
             final_text = response.final
             session.append_message("assistant", final_text)
             _save_safe(session_store, session)
             return final_text
 
-        # 2d. Tool call(s) — execute and feed back
+        # -- Tool call(s) ----------------------------------------------------
         if response.is_tool_call:
-            _execute_and_record_tool_calls(
-                response, session, session_store, tool_registry
-            )
-            # Loop continues — model gets another call with the tool
-            # results now in the session messages.
+            for tc in response.tool_calls:
+                args_json = json.dumps(tc.args, ensure_ascii=False)
+                print(f"[tool_call #{turn_count}] {tc.name} {args_json}")
+
+                # ---- use_skill (second call already handled) -------------------
+                if _is_skill_select(tc.name) and skill_already_injected_for_turn:
+                    msg = (
+                        f"skill \"{skill_name or '?'}\" 已在本轮加载，"
+                        f"无需重复调用 use_skill。请直接继续执行任务。"
+                    )
+                    session.append_message(
+                        "tool",
+                        json.dumps(
+                            {"tool": "use_skill", "ok": True, "result": msg},
+                            ensure_ascii=False,
+                        ),
+                    )
+                    print(f"[tool_result] use_skill: {msg}")
+                    continue
+
+                # ---- use_skill (skill_select) -------------------------------
+                if _is_skill_select(tc.name) and not skill_already_injected_for_turn:
+                    result = _handle_skill_select(
+                        tc.args,
+                        session,
+                        session_store,
+                        context_builder,
+                        approval_handler,
+                        session_id,
+                        skill_registry,
+                    )
+                    # If rejected or failed, result is the observation text
+                    if result is not None:
+                        session.append_message("tool", result)
+                        _save_safe(session_store, session)
+                    skill_already_injected_for_turn = True
+                    continue
+
+                # ---- Approval gate for write / shell tools ------------------
+                if _needs_approval(tc.name) and approval_handler is not None:
+                    from claw.approval.manager import ApprovalStatus
+
+                    req = _make_approval_request(session_id, tc.name, tc.args)
+                    decided = approval_handler(req)
+
+                    if decided is None or decided.status == ApprovalStatus.REJECTED.value:
+                        reason = (
+                            decided.reject_reason
+                            if decided and decided.reject_reason
+                            else "用户拒绝了该操作"
+                        )
+                        result_content = json.dumps(
+                            {"tool": tc.name, "ok": False, "result": f"操作被拒绝: {reason}"},
+                            ensure_ascii=False,
+                        )
+                        session.append_message("tool", result_content)
+                        print(f"[tool_result] {tc.name}: 被拒绝 — {reason}")
+                        continue
+
+                # ---- Execute the tool ---------------------------------------
+                result = tool_registry.execute_by_name(tc.name, tc.args)
+
+                if result.ok:
+                    result_content = result.content or "(空结果)"
+                    print(f"[tool_result] {tc.name}: 成功")
+                else:
+                    result_content = json.dumps(
+                        {"tool": tc.name, "ok": False, "result": f"错误: {result.error}"},
+                        ensure_ascii=False,
+                    )
+                    print(f"[tool_result] {tc.name}: 失败 — {result.error}")
+
+                tool_msg_content = result.content if (result.ok and result.content) else result_content
+                session.append_message("tool", tool_msg_content)
+
+                # If this was an overwrite_file and skill was active,
+                # record the output path
+                if tc.name == "overwrite_file" and skill_name:
+                    _update_skill_output(session, tc.args.get("path", ""))
+
+            _save_safe(session_store, session)
             continue
 
-        # 2e. Neither final nor tool_call (should not happen, but be safe)
-        # Treat empty tool_calls list as a final with empty content
+        # -- Neither final nor tool_call ------------------------------------
         empty_reply = ""
         session.append_message("assistant", empty_reply)
         _save_safe(session_store, session)
@@ -124,49 +245,139 @@ def run_agent_turn(
 
 
 # ---------------------------------------------------------------------------
+# Skill selection handler
+# ---------------------------------------------------------------------------
+
+
+def _handle_skill_select(
+    args: dict[str, Any],
+    session,
+    session_store: SessionStore,
+    context_builder: ContextBuilder,
+    approval_handler: Callable | None,
+    session_id: str,
+    skill_registry,
+) -> str | None:
+    """Handle a ``use_skill`` tool call.
+
+    1. Resolve the skill name from args.
+    2. If approval_handler is provided, create a skill approval and wait.
+    3. If approved (or no handler), inject the skill content.
+    4. Record skill usage.
+
+    Returns:
+        A tool-observation JSON string to append to the session, or None
+        if the skill was approved and injected (in which case the caller
+        continues the loop).
+    """
+    from claw.approval.manager import ApprovalRequest, ApprovalStatus
+
+    skill_name = args.get("skill_name", "").strip()
+    auto_reason = args.get("reason", "").strip()
+
+    if not skill_name:
+        return json.dumps(
+            {"tool": "use_skill", "ok": False, "result": "错误: 未指定 skill 名称"},
+            ensure_ascii=False,
+        )
+
+    # Verify skill exists
+    if skill_registry is None or skill_registry.get_skill(skill_name) is None:
+        return json.dumps(
+            {"tool": "use_skill", "ok": False, "result": f"错误: 未找到 skill \"{skill_name}\""},
+            ensure_ascii=False,
+        )
+
+    # -- Skill approval ------------------------------------------------------
+    if approval_handler is not None:
+        req = ApprovalRequest(
+            session_id=session_id,
+            tool_name="use_skill",
+            tool_args={
+                "skill_name": skill_name,
+                "reason": auto_reason or "模型自主判断该任务适合此 skill",
+            },
+        )
+        decided = approval_handler(req)
+
+        if decided is None or decided.status == ApprovalStatus.REJECTED.value:
+            reason = (
+                decided.reject_reason
+                if decided and decided.reject_reason
+                else "用户拒绝了该 skill 的使用"
+            )
+            print(f"[skill] {skill_name}: 用户拒绝 — {reason}")
+            return json.dumps(
+                {"tool": "use_skill", "ok": False, "result": f"skill 使用被拒绝: {reason}"},
+                ensure_ascii=False,
+            )
+
+    # -- Inject skill content ------------------------------------------------
+    print(f"[skill] {skill_name}: 已批准，注入 skill 内容")
+
+    # Get the original user task (the first user message of this turn)
+    user_task = ""
+    for m in reversed(session.messages):
+        if m.role == "user":
+            user_task = m.content
+            break
+
+    injected = context_builder.build_skill_injection_message(skill_name, user_task)
+    session.append_message("user", injected)
+
+    _record_skill_usage(session, skill_name, user_task, "auto", auto_reason)
+    _save_safe(session_store, session)
+
+    return None  # Signal success — the loop continues with skill content injected
+
+
+# ---------------------------------------------------------------------------
+# Skill usage tracking
+# ---------------------------------------------------------------------------
+
+
+def _record_skill_usage(
+    session,
+    skill_name: str,
+    user_task: str,
+    source: str,
+    auto_reason: str,
+) -> None:
+    """Append a skill usage record to *session.skill_usage*."""
+    from claw.skills.registry import SkillUsageRecord
+
+    record = SkillUsageRecord(
+        skill_name=skill_name,
+        session_id=session.session_id,
+        user_task=user_task[:500],  # truncate long tasks
+        source=source,
+        auto_reason=auto_reason,
+    )
+    session.skill_usage.append(record.to_dict())
+
+
+def _update_skill_output(session, path: str) -> None:
+    """Update the latest skill usage record with the output path."""
+    if not session.skill_usage or not path:
+        return
+    session.skill_usage[-1]["outputPath"] = path
+
+
+# ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
 
-def _execute_and_record_tool_calls(
-    response: AgentResponse,
-    session,
-    session_store: SessionStore,
-    tool_registry: ToolRegistry,
-) -> None:
-    """Execute every tool call in *response* and record results.
-
-    Each tool result is appended to *session* as a ``tool``-role message.
-    Traces are printed to stdout for debugging / verification.
-    """
-    for tc in response.tool_calls:
-        # Print trace
-        args_json = json.dumps(tc.args, ensure_ascii=False)
-        print(f"[tool_call] {tc.name} {args_json}")
-
-        # Execute
-        result = tool_registry.execute_by_name(tc.name, tc.args)
-
-        # Format result for the session message
-        if result.ok:
-            result_content = result.content or "(空结果)"
-            print(f"[tool_result] {tc.name}: 成功")
-        else:
-            result_content = f"错误: {result.error}"
-            print(f"[tool_result] {tc.name}: 失败 — {result.error}")
-
-        # Write tool message into session
-        tool_msg_content = json.dumps(
-            {"tool": tc.name, "ok": result.ok, "result": result_content},
-            ensure_ascii=False,
-        )
-        session.append_message("tool", tool_msg_content)
-
-    _save_safe(session_store, session)
+def _make_approval_request(session_id: str, tool_name: str, tool_args: dict):
+    from claw.approval.manager import ApprovalRequest
+    return ApprovalRequest(
+        session_id=session_id,
+        tool_name=tool_name,
+        tool_args=tool_args,
+    )
 
 
 def _save_safe(session_store: SessionStore, session) -> None:
-    """Persist *session*, printing a warning but not crashing on failure."""
     try:
         session_store.save(session)
     except SessionStoreError as exc:

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import sys
 
+from claw.approval.manager import ApprovalManager
 from claw.cli.repl import run_repl
 from claw.config import MEMORY_FILE, SESSIONS_DIR, ConfigError, load_config
 from claw.context.builder import ContextBuilder
@@ -15,17 +16,12 @@ from claw.llm.client import LLMClient
 from claw.memory.store import MemoryStore
 from claw.prompts import PromptLoadError, load_soul, load_system_prompt
 from claw.session.store import SessionStore
+from claw.skills.registry import SkillRegistry
 from claw.tools.base import ToolRegistry
-from claw.tools.readonly import register_all_readonly
+from claw.workspace.manager import WorkspaceManager
 
 
 def _force_utf8_streams() -> None:
-    """Force stdin/stdout to UTF-8.
-
-    On some Windows setups the console's active code page (e.g. GBK)
-    is used instead of UTF-8, which can corrupt non-ASCII input/output
-    (including piped input). This keeps CJK text working reliably.
-    """
     for stream in (sys.stdin, sys.stdout, sys.stderr):
         reconfigure = getattr(stream, "reconfigure", None)
         if reconfigure is not None:
@@ -48,11 +44,27 @@ def main() -> int:
     memory_store = MemoryStore(MEMORY_FILE)
     context_builder = ContextBuilder(system_prompt, soul, memory_store)
 
-    # -- Tool registry (Step 5: read-only tools) ----------------------------
+    workspace_manager = WorkspaceManager()
+    approval_manager = ApprovalManager()
+
+    # -- Skill registry (Step 9) -------------------------------------------
+    skill_registry = SkillRegistry()
+    context_builder.set_skill_registry(skill_registry)
+
     tool_registry = ToolRegistry()
+    from claw.tools.readonly import register_all_readonly
     register_all_readonly(tool_registry)
 
-    run_repl(client, session_store, memory_store, context_builder, tool_registry)
+    run_repl(
+        client,
+        session_store,
+        memory_store,
+        context_builder,
+        tool_registry,
+        workspace_manager=workspace_manager,
+        approval_manager=approval_manager,
+        skill_registry=skill_registry,
+    )
     return 0
 
 

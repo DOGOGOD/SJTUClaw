@@ -52,6 +52,7 @@ class Session:
     title: str
     messages: list[Message] = field(default_factory=list)
     summary: str = ""
+    skill_usage: list = field(default_factory=list)
     created_at: str = field(default_factory=_now_iso)
     updated_at: str = field(default_factory=_now_iso)
 
@@ -68,6 +69,10 @@ class Session:
             "title": self.title,
             "messages": [m.to_dict() for m in self.messages],
             "summary": self.summary,
+            "skillUsage": [
+                r if isinstance(r, dict) else r.to_dict()
+                for r in self.skill_usage
+            ],
             "createdAt": self.created_at,
             "updatedAt": self.updated_at,
         }
@@ -93,6 +98,7 @@ class Session:
 
         created_at = data.get("createdAt") or _now_iso()
         updated_at = data.get("updatedAt") or created_at
+        skill_usage_raw = data.get("skillUsage") or []
 
         messages = [Message.from_dict(item) for item in raw_messages]
         return cls(
@@ -100,6 +106,7 @@ class Session:
             title=title,
             messages=messages,
             summary=summary,
+            skill_usage=list(skill_usage_raw),
             created_at=created_at,
             updated_at=updated_at,
         )

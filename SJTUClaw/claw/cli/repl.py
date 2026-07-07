@@ -1,17 +1,14 @@
 """Interactive terminal REPL for multi-turn conversation with claw.
 
-This module owns terminal input/output only:
-    - Session storage & persistence -> `claw.session`
-    - `/session`, `/memory`, `/compact` commands -> `claw.cli.commands`
-    - Assembling the LLM `messages` array -> `claw.context.builder`
-    - Agent turn orchestration -> `claw.agent.loop`
-    - Tool execution -> `claw.tools`
-    - Auto-compaction after each turn -> `claw.context.compaction`
+This module owns terminal input/output only.
 """
 
 from __future__ import annotations
 
+import json
+
 from claw.agent.loop import run_agent_turn
+from claw.approval.manager import ApprovalManager, ApprovalRequest
 from claw.cli.commands import RuntimeState, handle_command, is_command
 from claw.context.builder import ContextBuilder
 from claw.context.compaction import (
@@ -22,9 +19,10 @@ from claw.context.compaction import (
 )
 from claw.llm.client import LLMClient, LLMError
 from claw.memory.store import MemoryStore
-from claw.session.models import Session
-from claw.session.store import SessionStore, SessionStoreError
+from claw.session.store import SessionStore
 from claw.tools.base import ToolRegistry
+from claw.tools import register_all_tools
+from claw.workspace.manager import WorkspaceManager
 
 EXIT_COMMANDS = {"/exit"}
 WELCOME_MESSAGE = "claw started. Type /exit to quit."
@@ -36,6 +34,10 @@ def run_repl(
     memory_store: MemoryStore,
     context_builder: ContextBuilder,
     tool_registry: ToolRegistry,
+    *,
+    workspace_manager: WorkspaceManager | None = None,
+    approval_manager: ApprovalManager | None = None,
+    skill_registry=None,
 ) -> None:
     """Run the interactive multi-turn conversation loop."""
     initial_session = session_store.ensure_default_session()
@@ -44,11 +46,97 @@ def run_repl(
         memory_store=memory_store,
         llm_client=client,
         current_session_id=initial_session.session_id,
+        workspace_manager=workspace_manager,
+        approval_manager=approval_manager,
+        tool_registry=tool_registry,
+        skill_registry=skill_registry,
     )
+
+    # Register advanced tools with the current session id provider
+    if workspace_manager is not None:
+        from claw.tools.base import ToolRegistry as TR
+
+        fresh_registry = TR()
+        register_all_tools(
+            fresh_registry,
+            workspace_manager=workspace_manager,
+            session_id_provider=lambda: state.current_session_id,
+            sessions_dir=session_store._sessions_dir,
+            include_skill_tool=skill_registry is not None,
+        )
+        tool_registry._tools.clear()
+        for name in fresh_registry.list_tool_names():
+            tool_registry.register(fresh_registry._tools[name])
+    elif skill_registry is not None:
+        # Register use_skill tool even without workspace
+        from claw.tools.skills import create_use_skill_tool
+
+        try:
+            tool_registry.register(create_use_skill_tool())
+        except Exception:
+            pass
+
+    # Update context builder with skill registry
+    if skill_registry is not None:
+        context_builder.set_skill_registry(skill_registry)
+
+    # Build the approval handler for CLI
+    def _cli_approval_handler(req: ApprovalRequest) -> ApprovalRequest:
+        if approval_manager is None:
+            return req
+
+        approval_manager._requests[req.approval_id] = req
+        approval_manager._events[req.approval_id] = __import__("threading").Event()
+
+        args_safe = {
+            k: (v[:200] + "..." if isinstance(v, str) and len(v) > 200 else v)
+            for k, v in req.tool_args.items()
+        }
+        print()
+        print(f"[审批] 模型请求执行: {req.tool_name}")
+        print(f"  参数: {json.dumps(args_safe, ensure_ascii=False, indent=2)}")
+        print(f"  approvalId: {req.approval_id}")
+        print(f"  输入 /approve {req.approval_id} 批准，或 /reject {req.approval_id} [原因] 拒绝")
+
+        while True:
+            try:
+                line = input("Approval> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                approval_manager.reject(req.approval_id, "用户中断")
+                return approval_manager.get(req.approval_id) or req
+
+            if not line:
+                continue
+
+            if line in EXIT_COMMANDS:
+                approval_manager.reject(req.approval_id, "用户退出")
+                return approval_manager.get(req.approval_id) or req
+
+            if is_command(line):
+                root = line.split()[0]
+                if root in ("/approve", "/reject", "/approvals"):
+                    result = handle_command(line, state)
+                    print(result)
+                    decided = approval_manager.get(req.approval_id)
+                    if decided and decided.status != "pending":
+                        return decided
+                else:
+                    print("审批等待中，仅支持 /approve、/reject、/approvals、/exit")
+            else:
+                print("审批等待中，请输入 /approve <id> 或 /reject <id> [原因]")
 
     print(WELCOME_MESSAGE)
     _print_load_warnings(session_store, memory_store)
     print(f"Current session: {state.current_session_id}")
+    if workspace_manager is not None:
+        ws = workspace_manager.get(state.current_session_id)
+        if ws:
+            print(f"Workspace: {ws}")
+        else:
+            print("Workspace: (未设置) 使用 /workspace set <路径> 设置")
+    if skill_registry is not None:
+        skills = skill_registry.list_skills()
+        print(f"Skills: {len(skills)} loaded ({', '.join(s.name for s in skills)})")
     print()
 
     while True:
@@ -65,13 +153,68 @@ def run_repl(
             return
 
         if is_command(user_input):
-            print(handle_command(user_input, state))
+            result = handle_command(user_input, state)
+
+            # Check for skill invocation sentinel
+            if result.startswith("__SKILL_INVOKE__|"):
+                _, skill_name, task = result.split("|", 2)
+                _handle_skill_invoke(
+                    skill_name, task, state, client,
+                    context_builder, tool_registry,
+                    _cli_approval_handler if approval_manager else None,
+                )
+            else:
+                print(result)
             print()
             continue
 
         _handle_chat_turn(
-            user_input, state, client, context_builder, tool_registry
+            user_input,
+            state,
+            client,
+            context_builder,
+            tool_registry,
+            approval_handler=_cli_approval_handler if approval_manager else None,
+            skill_registry=skill_registry,
         )
+
+
+def _handle_skill_invoke(
+    skill_name: str,
+    task: str,
+    state: RuntimeState,
+    client: LLMClient,
+    context_builder: ContextBuilder,
+    tool_registry: ToolRegistry,
+    approval_handler,
+) -> None:
+    """Handle explicit /skill <name> <task> invocation."""
+    print(f"[skill] 显式调用 skill: {skill_name}")
+    print(f"  任务: {task[:200]}{'...' if len(task) > 200 else ''}")
+    print()
+
+    try:
+        reply = run_agent_turn(
+            state.current_session_id,
+            task,
+            session_store=state.session_store,
+            context_builder=context_builder,
+            tool_registry=tool_registry,
+            llm_client=client,
+            approval_handler=approval_handler,
+            skill_registry=state.skill_registry,
+            skill_source="explicit",
+            skill_name=skill_name,
+        )
+    except LLMError as exc:
+        _print_error(exc)
+        return
+
+    if reply:
+        _print_assistant_reply(reply)
+
+    _maybe_auto_compact(state)
+    print()
 
 
 def _handle_chat_turn(
@@ -80,6 +223,9 @@ def _handle_chat_turn(
     client: LLMClient,
     context_builder: ContextBuilder,
     tool_registry: ToolRegistry,
+    *,
+    approval_handler=None,
+    skill_registry=None,
 ) -> None:
     """Process one user message through the unified agent loop."""
     try:
@@ -90,6 +236,10 @@ def _handle_chat_turn(
             context_builder=context_builder,
             tool_registry=tool_registry,
             llm_client=client,
+            approval_handler=approval_handler,
+            skill_registry=skill_registry,
+            skill_source="",
+            skill_name="",
         )
     except LLMError as exc:
         _print_error(exc)
@@ -98,16 +248,11 @@ def _handle_chat_turn(
     if reply:
         _print_assistant_reply(reply)
 
-    # -- Auto-compaction check -----------------------------------------------
     _maybe_auto_compact(state)
     print()
 
 
 def _maybe_auto_compact(state: RuntimeState) -> None:
-    """Check and run compaction after a turn, per Step 4's agent loop rule.
-
-    Only ever touches ``session.summary`` / ``session.messages``.
-    """
     session = state.session_store.get(state.current_session_id)
     if not needs_compaction(session):
         return
@@ -145,12 +290,6 @@ def _print_load_warnings(
 
 
 def _read_user_input() -> str | None:
-    """Read one line of user input.
-
-    Returns:
-        The stripped input string, or None if the user asked to quit
-        via EOF (Ctrl+D) or interrupted the program (Ctrl+C).
-    """
     try:
         return input("User> ").strip()
     except (EOFError, KeyboardInterrupt):

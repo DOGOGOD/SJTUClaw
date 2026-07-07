@@ -445,6 +445,49 @@ body { display: flex; overflow: hidden; }
   font-size: 0.7rem; color: var(--text-tertiary);
 }
 
+/* ---- Approval Banner ---- */
+.approval-banner {
+  background: #fef3c7;
+  border: 1px solid #f59e0b;
+  border-radius: var(--radius-md);
+  padding: 14px 18px;
+  margin: 8px 0;
+  display: flex; align-items: center; gap: 12px;
+  animation: fadeUp 0.25s ease;
+}
+.approval-banner .approval-info { flex: 1; }
+.approval-banner .approval-tool { font-weight: 600; font-size: 0.9rem; }
+.approval-banner .approval-args { font-size: 0.78rem; color: var(--text-secondary); font-family: var(--font-mono); margin-top: 4px; white-space: pre-wrap; }
+.approval-banner .approval-actions { display: flex; gap: 6px; flex-shrink: 0; }
+.approval-banner .btn-approve { padding: 6px 16px; border: none; border-radius: var(--radius-sm); background: #16a34a; color: #fff; font-weight: 500; cursor: pointer; font-size: 0.85rem; }
+.approval-banner .btn-approve:hover { background: #15803d; }
+.approval-banner .btn-reject { padding: 6px 16px; border: 1px solid #ef4444; border-radius: var(--radius-sm); background: #fff; color: #ef4444; font-weight: 500; cursor: pointer; font-size: 0.85rem; }
+.approval-banner .btn-reject:hover { background: #fef2f2; }
+
+/* ---- Download entry ---- */
+.download-entry {
+  background: #f0fdf4;
+  border: 1px solid #86efac;
+  border-radius: var(--radius-sm);
+  padding: 8px 14px;
+  margin: 4px 0;
+  font-size: 0.85rem;
+  display: flex; align-items: center; gap: 8px;
+}
+.download-entry a { color: var(--accent); text-decoration: underline; font-weight: 500; }
+.download-entry a:hover { color: var(--accent-hover); }
+
+/* ---- Workspace indicator ---- */
+.ws-indicator {
+  font-size: 0.78rem;
+  color: var(--text-tertiary);
+  margin-left: 12px;
+  padding: 2px 10px;
+  background: var(--bg-hover);
+  border-radius: 10px;
+}
+.ws-indicator.set { color: #16a34a; background: #f0fdf4; }
+
 /* ---- Session item inline actions ---- */
 .session-item { position: relative; display: flex; align-items: center; justify-content: space-between; }
 .session-item .item-text { flex:1; min-width:0; }
@@ -570,6 +613,7 @@ body { display: flex; overflow: hidden; }
   <!-- Top bar -->
   <div class="top-bar" id="top-bar">
     <span class="session-title-display" id="session-title-display">SJTUClaw</span>
+    <span class="ws-indicator" id="ws-indicator" style="display:none"></span>
     <span class="session-meta" id="session-meta"></span>
   </div>
 
@@ -615,6 +659,9 @@ body { display: flex; overflow: hidden; }
       <button class="settings-tab" data-tab="memory" onclick="switchSettingsTab('memory')">Memory</button>
       <button class="settings-tab" data-tab="sessions" onclick="switchSettingsTab('sessions')">Sessions</button>
       <button class="settings-tab" data-tab="tasks" onclick="switchSettingsTab('tasks')">Tasks</button>
+      <button class="settings-tab" data-tab="workspace" onclick="switchSettingsTab('workspace')">Workspace</button>
+      <button class="settings-tab" data-tab="approval" onclick="switchSettingsTab('approval')">Approval</button>
+      <button class="settings-tab" data-tab="skills" onclick="switchSettingsTab('skills')">Skills</button>
     </div>
     <div class="settings-body" id="settings-body"></div>
   </div>
@@ -627,7 +674,7 @@ body { display: flex; overflow: hidden; }
 // =========================================================================
 // State
 // =========================================================================
-const API = 'http://127.0.0.1:8000';
+const API = window.location.origin || 'http://127.0.0.1:8000';
 let currentSessionId = null;
 let currentSessionTitle = '';
 
@@ -1027,6 +1074,9 @@ function switchSettingsTab(tab) {
   else if (tab === 'memory') renderMemoryTab(body);
   else if (tab === 'sessions') renderSessionsTab(body);
   else if (tab === 'tasks')  renderTasksTab(body);
+  else if (tab === 'workspace') renderWorkspaceTab(body);
+  else if (tab === 'approval') renderApprovalTab(body);
+  else if (tab === 'skills') renderSkillsTab(body);
 }
 
 // -- System Prompt tab ------------------------------------------------------
@@ -1273,6 +1323,406 @@ async function deleteTask(id) {
   await fetch(API+'/tasks/'+encodeURIComponent(id),{method:'DELETE'});
   renderTasksTab(document.getElementById('settings-body'));
 }
+
+// =========================================================================
+// Workspace (Step 8)
+// =========================================================================
+async function loadWorkspaceStatus() {
+  if (!currentSessionId) return;
+  try {
+    const res = await fetch(API + '/workspace?sessionId=' + encodeURIComponent(currentSessionId));
+    const data = await res.json();
+    const el = document.getElementById('ws-indicator');
+    if (data.workspace) {
+      el.textContent = '📁 ' + data.workspace;
+      el.className = 'ws-indicator set';
+      el.style.display = '';
+    } else {
+      el.textContent = '📁 未设置 workspace';
+      el.className = 'ws-indicator';
+      el.style.display = '';
+    }
+  } catch (e) {}
+}
+
+async function renderWorkspaceTab(body) {
+  if (!currentSessionId) {
+    body.innerHTML = '<div style="color:var(--text-tertiary);padding:20px;text-align:center">请先选择一个 session</div>';
+    return;
+  }
+  let wsData;
+  try {
+    wsData = await (await fetch(API + '/workspace?sessionId=' + encodeURIComponent(currentSessionId))).json();
+  } catch (e) {
+    body.innerHTML = '<div style="color:#dc2626">无法连接 Gateway</div>';
+    return;
+  }
+  const ws = wsData.workspace || '';
+  body.innerHTML = `
+    <div style="margin-bottom:16px">
+      <label style="font-weight:600;font-size:0.85rem">当前 Session: ${esc(currentSessionId)}</label>
+    </div>
+    <div style="margin-bottom:12px">
+      <label style="font-size:0.85rem;color:var(--text-secondary)">Workspace 路径</label>
+      <div class="add-row">
+        <input type="text" id="ws-path" value="${escAttr(ws)}" placeholder="例如: C:\\Users\\GZQ\\projects\\my-repo">
+        <button class="btn-primary" style="margin:0;white-space:nowrap" onclick="setWorkspace()">设置</button>
+      </div>
+      ${ws ? `<button class="btn-sm danger" onclick="unsetWorkspace()">取消设置</button>` : ''}
+    </div>
+    <div style="font-size:0.8rem;color:var(--text-tertiary);margin-top:12px">
+      <p>Workspace 是 agent 可以操作的项目目录。文件修改、shell 命令、附件拷贝和下载入口创建都会限制在此目录内。</p>
+      <p style="margin-top:6px">• 相对路径按 workspace 解析</p>
+      <p>• 不允许通过 ../ 或绝对路径逃逸</p>
+      <p>• 未设置 workspace 时，任何写操作都会失败</p>
+    </div>`;
+}
+
+async function setWorkspace() {
+  const path = document.getElementById('ws-path').value.trim();
+  if (!path) return;
+  const res = await fetch(API + '/workspace', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({sessionId: currentSessionId, path})
+  });
+  const data = await res.json();
+  if (data.ok) {
+    await loadWorkspaceStatus();
+    renderWorkspaceTab(document.getElementById('settings-body'));
+  } else {
+    toast('设置失败: ' + (data.detail || data.error || ''));
+  }
+}
+
+async function unsetWorkspace() {
+  await fetch(API + '/workspace?sessionId=' + encodeURIComponent(currentSessionId), {method:'DELETE'});
+  await loadWorkspaceStatus();
+  renderWorkspaceTab(document.getElementById('settings-body'));
+}
+
+// =========================================================================
+// Approval (Step 8)
+// =========================================================================
+let _approvalPollTimer = null;
+
+async function renderApprovalTab(body) {
+  let data;
+  try {
+    const url = API + '/approvals' + (currentSessionId ? '?sessionId=' + encodeURIComponent(currentSessionId) : '');
+    data = await (await fetch(url)).json();
+  } catch (e) {
+    body.innerHTML = '<div style="color:#dc2626">无法连接 Gateway</div>';
+    return;
+  }
+  if (!data.approvals || !data.approvals.length) {
+    body.innerHTML = '<div style="color:var(--text-tertiary);font-size:0.85rem;padding:20px;text-align:center">当前没有待审批的操作</div>';
+    return;
+  }
+  let html = '<div style="font-weight:600;margin-bottom:12px">待审批操作 (' + data.approvals.length + ')</div>';
+  data.approvals.forEach(a => {
+    const argsStr = JSON.stringify(a.toolArgs, null, 2);
+    html += `<div class="approval-banner">
+      <div class="approval-info">
+        <div class="approval-tool">${esc(a.toolName)} <span style="font-weight:400;font-size:0.75rem;color:var(--text-tertiary)">${esc(a.approvalId)}</span></div>
+        <div class="approval-args">${esc(argsStr)}</div>
+        <div style="font-size:0.7rem;color:var(--text-tertiary);margin-top:4px">Session: ${esc(a.sessionId)} · ${fmtTime(a.createdAt)}</div>
+      </div>
+      <div class="approval-actions">
+        <button class="btn-approve" onclick="doApprove('${escAttr(a.approvalId)}')">批准</button>
+        <button class="btn-reject" onclick="doRejectPrompt('${escAttr(a.approvalId)}')">拒绝</button>
+      </div>
+    </div>`;
+  });
+  body.innerHTML = html;
+}
+
+async function doApprove(approvalId) {
+  const res = await fetch(API + '/approvals/' + encodeURIComponent(approvalId) + '/approve', {method:'POST'});
+  const data = await res.json();
+  if (data.ok) {
+    toast('已批准');
+    renderApprovalTab(document.getElementById('settings-body'));
+    document.getElementById('approval-banners-inner')?.remove();
+  } else {
+    toast('批准失败: ' + (data.detail || ''));
+  }
+}
+
+function doRejectPrompt(approvalId) {
+  const reason = prompt('拒绝原因（可选）：');
+  doReject(approvalId, reason || '');
+}
+
+async function doReject(approvalId, reason) {
+  const res = await fetch(API + '/approvals/' + encodeURIComponent(approvalId) + '/reject', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({reason: reason || ''})
+  });
+  const data = await res.json();
+  if (data.ok) {
+    toast('已拒绝');
+    renderApprovalTab(document.getElementById('settings-body'));
+    document.getElementById('approval-banners-inner')?.remove();
+  } else {
+    toast('拒绝失败: ' + (data.detail || ''));
+  }
+}
+
+function startApprovalPolling() {
+  if (_approvalPollTimer) clearInterval(_approvalPollTimer);
+  _approvalPollTimer = setInterval(pollApprovals, 1500);
+}
+
+function stopApprovalPolling() {
+  if (_approvalPollTimer) { clearInterval(_approvalPollTimer); _approvalPollTimer = null; }
+  document.getElementById('approval-banners-inner')?.remove();
+}
+
+async function pollApprovals() {
+  if (!currentSessionId) return;
+  try {
+    const url = API + '/approvals?sessionId=' + encodeURIComponent(currentSessionId);
+    const data = await (await fetch(url)).json();
+    const existing = document.getElementById('approval-banners-inner');
+    if (!data.approvals || !data.approvals.length) {
+      if (existing) existing.remove();
+      return;
+    }
+    // Build banner HTML — only update DOM when content actually changed
+    let html = '';
+    data.approvals.forEach(a => {
+      const argsStr = JSON.stringify(a.toolArgs, null, 2);
+      html += `<div class="approval-banner" data-apr-id="${escAttr(a.approvalId)}">
+        <div class="approval-info">
+          <div class="approval-tool">⚠ 模型请求: ${esc(a.toolName)}</div>
+          <div class="approval-args">${esc(argsStr)}</div>
+        </div>
+        <div class="approval-actions">
+          <button class="btn-approve" onclick="doApproveAndContinue('${escAttr(a.approvalId)}')">批准</button>
+          <button class="btn-reject" onclick="doRejectAndContinuePrompt('${escAttr(a.approvalId)}')">拒绝</button>
+        </div>
+      </div>`;
+    });
+    // Skip update if content unchanged (prevents flicker from repeated innerHTML writes)
+    if (existing && existing.getAttribute('data-hash') === html) return;
+    const inner = document.getElementById('chat-inner');
+    if (existing) {
+      existing.innerHTML = html;
+      existing.setAttribute('data-hash', html);
+    } else {
+      const wrapper = document.createElement('div');
+      wrapper.id = 'approval-banners-inner';
+      wrapper.setAttribute('data-hash', html);
+      wrapper.innerHTML = html;
+      inner.appendChild(wrapper);
+    }
+    scrollDown();
+  } catch (e) {}
+}
+
+async function doApproveAndContinue(approvalId) {
+  await doApprove(approvalId);
+}
+
+function doRejectAndContinuePrompt(approvalId) {
+  const reason = prompt('拒绝原因（可选）：');
+  doReject(approvalId, reason || '');
+}
+
+// =========================================================================
+// Download links (Step 8)
+// =========================================================================
+function extractDownloadLinks(messages) {
+  // Look for create_download tool results and extract downloadId
+  const dlContainer = document.getElementById('download-links');
+  if (!dlContainer) return;
+  let html = '';
+  messages.forEach(m => {
+    if (m.role !== 'tool') return;
+    try {
+      const obj = JSON.parse(m.content);
+      if (obj.tool === 'create_download' && obj.downloadId) {
+        const dlUrl = API + '/downloads/' + encodeURIComponent(obj.downloadId);
+        html += `<div class="download-entry">📥 <strong>${esc(obj.fileName || obj.path)}</strong> — <a href="${escAttr(dlUrl)}" target="_blank">下载</a> <span style="font-size:0.7rem;color:var(--text-tertiary)">(${esc(obj.downloadId)})</span></div>`;
+      }
+    } catch (_) {}
+  });
+  if (dlContainer) dlContainer.innerHTML = html;
+}
+
+// =========================================================================
+// Updated sendMessage with approval polling
+// =========================================================================
+const _origSendMessage = sendMessage;
+sendMessage = async function() {
+  const textarea = document.getElementById('msg-input');
+  const btn = document.getElementById('send-btn');
+  const msg = textarea.value.trim();
+  if (!msg) return;
+
+  const isCmd = /^\/(session|memory|compact|exit|task|tasks|workspace|approve|reject|approvals)\b/.test(msg);
+
+  textarea.value = '';
+  textarea.style.height = 'auto';
+  textarea.disabled = true;
+  btn.disabled = true;
+
+  const inner = document.getElementById('chat-inner');
+  const welcome = inner.querySelector('.welcome-block');
+  if (welcome) welcome.remove();
+
+  inner.insertAdjacentHTML('beforeend', renderTurn({role:'user',content:msg}, -1, []));
+
+  if (isCmd) {
+    try {
+      const body = { command: msg };
+      if (currentSessionId) body.sessionId = currentSessionId;
+      const res = await fetch(API + '/command', {
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)
+      });
+      const data = await res.json();
+      if (!data.ok) { toast(data.error || '命令执行失败'); textarea.disabled = false; btn.disabled = false; return; }
+      inner.insertAdjacentHTML('beforeend', renderTurn({role:'system',content:data.result}, -1, []));
+      scrollDown();
+      await handleCommandActions(data);
+      await loadWorkspaceStatus();
+    } catch (e) { toast('命令请求失败: ' + e.message); }
+  } else {
+    // Start approval polling in parallel
+    startApprovalPolling();
+
+    const thinkId = 'think-' + Date.now();
+    inner.insertAdjacentHTML('beforeend',
+      `<div class="thinking-row" id="${thinkId}">
+        <div class="avatar" style="width:30px;height:30px;border-radius:50%;background:#92400e;font-size:0.72rem;color:#fff;display:flex;align-items:center;justify-content:center;flex-shrink:0;">C</div>
+        <div class="typing-dots"><span></span><span></span><span></span></div>
+      </div>`);
+    scrollDown();
+
+    try {
+      const body = { message: msg };
+      if (currentSessionId) body.sessionId = currentSessionId;
+      const res = await fetch(API + '/chat', {
+        method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body)
+      });
+      const data = await res.json();
+
+      document.getElementById(thinkId)?.remove();
+      stopApprovalPolling();
+
+      if (!data.ok) { toast(data.error || '请求失败'); textarea.disabled = false; btn.disabled = false; return; }
+      if (!currentSessionId || currentSessionId !== data.sessionId) {
+        currentSessionId = data.sessionId;
+        await loadSessions();
+      }
+      await loadMessages();
+      await loadSessions();
+      document.getElementById('session-title-display').textContent = currentSessionTitle || currentSessionId || '';
+      // Extract download links
+      extractDownloadLinks(data.messages || []);
+    } catch (e) {
+      document.getElementById(thinkId)?.remove();
+      stopApprovalPolling();
+      toast('请求失败: ' + e.message);
+    }
+  }
+
+  textarea.disabled = false;
+  btn.disabled = false;
+  textarea.focus();
+};
+
+// Refresh workspace indicator on session switch
+const _origSwitchSession = switchSession;
+switchSession = async function(sid, title) {
+  await _origSwitchSession(sid, title);
+  await loadWorkspaceStatus();
+};
+
+// Add download links container after chat area
+(function() {
+  const chatArea = document.getElementById('chat-area');
+  const dlDiv = document.createElement('div');
+  dlDiv.id = 'download-links';
+  dlDiv.style.cssText = 'max-width:var(--max-chat-w);margin:0 auto;padding:0 24px 10px';
+  chatArea.after(dlDiv);
+})();
+
+// =========================================================================
+// Skills (Step 9)
+// =========================================================================
+
+async function renderSkillsTab(body) {
+  let skills;
+  try {
+    skills = await (await fetch(API + '/skills')).json();
+  } catch (e) {
+    body.innerHTML = '<div style="color:#dc2626">无法连接 Gateway</div>';
+    return;
+  }
+  if (!skills.ok || !skills.skills || !skills.skills.length) {
+    body.innerHTML = '<div style="color:var(--text-tertiary);padding:20px;text-align:center">暂无可用 Skills</div>';
+    return;
+  }
+  let html = '<div style="font-weight:600;margin-bottom:12px">可用 Skills (' + skills.skills.length + ')</div>';
+  skills.skills.forEach(s => {
+    html += `<div style="margin-bottom:16px;border:1px solid var(--border);border-radius:var(--radius-sm);padding:12px">
+      <div style="font-weight:600;font-size:0.9rem">${esc(s.name)}</div>
+      <div style="font-size:0.82rem;color:var(--text-secondary);margin-top:4px;line-height:1.5">${esc(s.description)}</div>
+      <div style="margin-top:8px">
+        <button class="btn-sm" onclick="useSkillExplicit('${escAttr(s.name)}')">使用此 Skill</button>
+        <button class="btn-sm" onclick="showSkillDetail('${escAttr(s.name)}')">查看详情</button>
+      </div>
+    </div>`;
+  });
+
+  // Skill usage section
+  if (currentSessionId) {
+    let usage;
+    try {
+      usage = await (await fetch(API + '/sessions/' + currentSessionId + '/skill-usage')).json();
+    } catch (e) {}
+    if (usage && usage.records && usage.records.length) {
+      html += '<div style="font-weight:600;margin-top:20px;margin-bottom:8px">本次 Session 使用记录</div>';
+      usage.records.forEach((r, i) => {
+        const src = r.source === 'explicit' ? '显式调用' : '模型自主选择';
+        html += `<div style="font-size:0.82rem;padding:4px 0;border-bottom:1px solid var(--border)">
+          [${i+1}] <strong>${esc(r.skillName)}</strong> | ${src} | ${fmtTime(r.usedAt)}
+          ${r.autoReason ? '<div style="color:var(--text-tertiary);margin-left:16px">理由: '+esc(r.autoReason)+'</div>' : ''}
+          ${r.outputPath ? '<div style="color:var(--text-tertiary);margin-left:16px">输出: '+esc(r.outputPath)+'</div>' : ''}
+        </div>`;
+      });
+    }
+  }
+
+  body.innerHTML = html;
+}
+
+async function showSkillDetail(name) {
+  try {
+    const res = await fetch(API + '/skills/' + encodeURIComponent(name));
+    const data = await res.json();
+    if (!data.ok) { toast(data.detail || '加载失败'); return; }
+    const s = data.skill;
+    alert('Skill: ' + s.name + '\n\n' + s.description + '\n\n使用说明:\n' + s.instructions.slice(0, 1000));
+  } catch (e) { toast('加载失败: ' + e.message); }
+}
+
+function useSkillExplicit(name) {
+  const task = prompt('请输入任务描述（将使用 ' + name + ' skill 处理）：');
+  if (!task || !task.trim()) return;
+  const cmd = '/skill ' + name + ' ' + task.trim();
+  document.getElementById('msg-input').value = cmd;
+  document.getElementById('send-btn').click();
+}
+
+// Initial workspace load
+const _origInit = (async () => {
+  await loadSessions();
+  const items = document.querySelectorAll('.session-item');
+  if (items.length > 0) items[0].click();
+  await loadWorkspaceStatus();
+})();
 </script>
 </body>
 </html>

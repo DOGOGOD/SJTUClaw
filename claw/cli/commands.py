@@ -1,0 +1,769 @@
+"""Parsing and dispatch for claw's internal CLI commands.
+
+``/session ...``, ``/memory ...``, ``/compact``, ``/workspace ...``,
+``/approve``, ``/reject`` commands are intercepted here and are never
+forwarded to the LLM as ordinary chat messages.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from claw.approval.manager import ApprovalManager
+from claw.context.compaction import (
+    KEEP_RECENT_MESSAGES_MIN,
+    CompactionError,
+    compact_and_persist,
+)
+from claw.llm.client import LLMClient
+from claw.memory.store import MemoryStore, MemoryStoreError
+from claw.session.store import SessionNotFoundError, SessionStore, SessionStoreError
+from claw.tools.base import ToolRegistry
+from claw.workspace.manager import WorkspaceManager, WorkspaceError
+
+_COMMAND_PREFIXES = (
+    "/session", "/memory", "/compact", "/workspace", "/approve", "/reject",
+    "/approvals", "/skill", "/reflect", "/cron", "/help", "/auto",
+)
+
+_HELP_TEXT = (
+    "SJTUClaw 可用指令：\n\n"
+    "  /help                    显示此帮助信息\n"
+    "  /session <sub> ...       会话管理\n"
+    "    new                      创建新会话\n"
+    "    list                     列出所有会话\n"
+    "    switch <id>              切换到指定会话\n"
+    "    rename <id> <title>      重命名会话\n"
+    "    delete <id>              删除会话\n"
+    "  /memory <sub> ...        长期记忆管理\n"
+    "    add [--category <c>] [--tags <t>] [--importance <1-5>] <内容>\n"
+    "    list [--category <类别>] 列出记忆\n"
+    "    search <关键词>          搜索记忆\n"
+    "    update <id> <新内容>     更新记忆\n"
+    "    delete <id>              删除记忆\n"
+    "    stats                    记忆统计\n"
+    "  /compact                 手动压缩当前会话历史\n"
+    "  /workspace <sub> ...     工作区路径管理\n"
+    "    set <路径>               设置工作区路径\n"
+    "    show                     查看当前工作区\n"
+    "    unset                    取消工作区设置\n"
+    "  /approvals               查看待审批操作\n"
+    "  /approve [approvalId]    批准操作\n"
+    "  /reject [approvalId]     拒绝操作\n"
+    "  /skill <sub> ...         Skill 管理\n"
+    "    list                     列出可用 Skills\n"
+    "    show <name>              查看 Skill 详情\n"
+    "    usage                    查看使用记录\n"
+    "    <name> <任务描述>        使用指定 Skill 执行任务\n"
+    "  /reflect <sub> ...       每日记忆反思\n"
+    "    status                   查看反思状态\n"
+    "    enable / disable         启用/禁用\n"
+    "    time <HH:MM>             设置执行时间\n"
+    "    now                      立即执行\n"
+    "  /cron <sub> ...          定时作业管理 (nanobot 兼容)\n"
+    "    list                     列出所有作业\n"
+    "    status                   服务状态\n"
+    "    disable <jobId>          禁用作业\n"
+    "    enable <jobId>           启用作业\n"
+    "    delete <jobId>           删除作业\n"
+    "  /exit                    退出当前会话\n"
+)
+
+
+@dataclass
+class RuntimeState:
+    """Mutable CLI-level state shared across command handlers."""
+
+    session_store: SessionStore
+    memory_store: MemoryStore
+    llm_client: LLMClient
+    current_session_id: str
+    workspace_manager: WorkspaceManager | None = None
+    approval_manager: ApprovalManager | None = None
+    tool_registry: ToolRegistry | None = None
+    skill_registry: object | None = None
+    reflection_manager: object | None = None
+    compaction_worker: object | None = None
+    llm_config: object | None = None
+    history_log: object | None = None
+    cron_service: object | None = None
+    # Track the current pending approval for the active agent turn
+    pending_approval_id: str | None = None
+
+
+def is_command(user_input: str) -> bool:
+    """Return True if `user_input` is a slash command."""
+    return any(
+        user_input == prefix or user_input.startswith(prefix + " ")
+        for prefix in _COMMAND_PREFIXES
+    )
+
+
+def handle_command(user_input: str, state: RuntimeState) -> str:
+    """Handle a command and return the text to print."""
+    root, *args = user_input.split()
+
+    if root == "/session":
+        return _handle_session_command(args, state)
+    if root == "/memory":
+        return _handle_memory_command(user_input, args, state)
+    if root == "/compact":
+        return _handle_compact_command(state)
+    if root == "/workspace":
+        return _handle_workspace_command(args, state)
+    if root == "/approvals":
+        return _handle_approvals_list(state)
+    if root == "/approve":
+        return _handle_approve(args, state)
+    if root == "/reject":
+        return _handle_reject(user_input, args, state)
+    if root == "/skill":
+        return _handle_skill_command(user_input, args, state)
+    if root == "/reflect":
+        return _handle_reflect_command(args, state)
+    if root == "/cron":
+        return _handle_cron_command(args, state)
+    if root == "/help":
+        return _HELP_TEXT
+    return f"未知命令: {root}（输入 /help 查看可用指令）"
+
+
+# -- /session ---------------------------------------------------------------
+
+
+def _handle_session_command(args: list[str], state: RuntimeState) -> str:
+    if not args:
+        return "用法: /session <new|list|switch|rename|delete> ..."
+
+    sub, rest = args[0], args[1:]
+
+    if sub == "new":
+        session = state.session_store.create_session()
+        state.current_session_id = session.session_id
+        return f"Created session: {session.session_id}"
+
+    if sub == "list":
+        return _format_session_list(state)
+
+    if sub == "switch":
+        if not rest:
+            return "用法: /session switch <sessionId>"
+        return _switch_session(rest[0], state)
+
+    if sub == "rename":
+        if len(rest) < 2:
+            return "用法: /session rename <sessionId> <title>"
+        session_id, title = rest[0], " ".join(rest[1:])
+        try:
+            state.session_store.rename(session_id, title)
+        except (SessionNotFoundError, SessionStoreError) as exc:
+            return f"[错误] {exc}"
+        return f"Renamed session {session_id} to: {title}"
+
+    if sub == "delete":
+        if not rest:
+            return "用法: /session delete <sessionId>"
+        return _delete_session(rest[0], state)
+
+    return f"未知 /session 子命令: {sub}"
+
+
+def _switch_session(session_id: str, state: RuntimeState) -> str:
+    try:
+        state.session_store.get(session_id)
+    except SessionNotFoundError as exc:
+        return f"[错误] {exc}"
+    state.current_session_id = session_id
+    return f"Switched to session: {session_id}"
+
+
+def _delete_session(session_id: str, state: RuntimeState) -> str:
+    try:
+        state.session_store.delete(session_id)
+    except (SessionNotFoundError, SessionStoreError) as exc:
+        return f"[错误] {exc}"
+
+    if state.current_session_id != session_id:
+        return f"Deleted session: {session_id}"
+
+    summaries = state.session_store.list_summaries()
+    if summaries:
+        fallback_id = summaries[0].session_id
+    else:
+        fallback_id = state.session_store.ensure_default_session().session_id
+    state.current_session_id = fallback_id
+    return (
+        f"Deleted session: {session_id}\n"
+        f"当前 session 已被删除，已自动切换到: {fallback_id}"
+    )
+
+
+def _format_session_list(state: RuntimeState) -> str:
+    summaries = state.session_store.list_summaries()
+    if not summaries:
+        return "Sessions: (empty)"
+
+    lines = ["Sessions:"]
+    for summary in summaries:
+        marker = "*" if summary.session_id == state.current_session_id else " "
+        lines.append(
+            f"{marker} {summary.session_id}\t{summary.title}\t"
+            f"messages={summary.message_count}\tupdated={summary.updated_at}"
+        )
+    return "\n".join(lines)
+
+
+# -- /memory ------------------------------------------------------------
+
+
+def _handle_memory_command(raw_input: str, args: list[str], state: RuntimeState) -> str:
+    if not args:
+        return "用法: /memory <add|list|search|update|delete|stats> ..."
+
+    sub = args[0]
+
+    if sub == "add":
+        return _add_memory(raw_input, state)
+
+    if sub == "list":
+        return _format_memory_list(args[1:], state)
+
+    if sub == "search":
+        if len(args) < 2:
+            return "用法: /memory search <关键词>"
+        return _search_memory(" ".join(args[1:]), state)
+
+    if sub == "stats":
+        return _memory_stats(state)
+
+    if sub == "update":
+        if len(args) < 3:
+            return "用法: /memory update <memoryId> <新内容>"
+        memory_id = args[1]
+        new_content = " ".join(args[2:])
+        return _update_memory(memory_id, new_content, state)
+
+    if sub == "delete":
+        if len(args) < 2:
+            return "用法: /memory delete <memoryId>"
+        return _delete_memory(args[1], state)
+
+    return f"未知 /memory 子命令: {sub}"
+
+
+def _add_memory(raw_input: str, state: RuntimeState) -> str:
+    """Parse and add a memory entry.
+
+    Supports two forms:
+        /memory add <content>                          # legacy
+        /memory add --category <c> --tags <t1,t2> <content>  # structured
+    """
+    prefix = "/memory add "
+    if not raw_input.startswith(prefix):
+        return "用法: /memory add [--category <类别>] [--tags <t1,t2>] [--importance <1-5>] <内容>"
+    rest = raw_input[len(prefix):]
+
+    # Parse optional flags
+    category = "general"
+    tags: list[str] = []
+    importance = 3
+
+    # --category <cat>
+    import re
+    cat_match = re.match(r"^--category\s+(\S+)", rest)
+    if cat_match:
+        category = cat_match.group(1)
+        rest = rest[cat_match.end():]
+
+    # --tags <t1,t2,...>
+    tags_match = re.match(r"^--tags\s+(\S+)", rest)
+    if tags_match:
+        tags = [t.strip() for t in tags_match.group(1).split(",") if t.strip()]
+        rest = rest[tags_match.end():]
+
+    # --importance <1-5>
+    imp_match = re.match(r"^--importance\s+(\d)", rest)
+    if imp_match:
+        try:
+            importance = int(imp_match.group(1))
+        except ValueError:
+            pass
+        rest = rest[imp_match.end():]
+
+    content = rest.strip()
+    if not content:
+        return "用法: /memory add [--category <类别>] [--tags <t1,t2>] [--importance <1-5>] <内容>"
+
+    try:
+        entry = state.memory_store.add(
+            content=content,
+            category=category,
+            tags=tags,
+            importance=importance,
+        )
+    except MemoryStoreError as exc:
+        return f"[错误] {exc}"
+
+    tag_str = f" [tags: {', '.join(entry.tags)}]" if entry.tags else ""
+    return f"Added memory: {entry.memory_id} [{entry.category}]{tag_str}"
+
+
+def _format_memory_list(extra_args: list[str], state: RuntimeState) -> str:
+    """List memory entries, optionally filtered by category."""
+    category: str | None = None
+    if len(extra_args) >= 2 and extra_args[0] == "--category":
+        category = extra_args[1]
+
+    from claw.memory.store import MEMORY_CATEGORIES
+    _LABELS: dict[str, str] = {
+        "user_preference": "pref",
+        "project": "proj",
+        "decision": "decn",
+        "fact": "fact",
+        "general": "gen",
+    }
+
+    try:
+        entries = state.memory_store.list_by_category(category)
+    except MemoryStoreError as exc:
+        return f"[错误] {exc}"
+
+    if not entries:
+        filter_text = f" (category={category})" if category else ""
+        return f"Memory{filter_text}: (empty)"
+
+    filter_text = f" (category={category})" if category else ""
+    lines = [f"Memory{filter_text}:"]
+    for entry in entries:
+        cat_short = _LABELS.get(entry.category, entry.category[:4])
+        tag_str = f" [tags: {', '.join(entry.tags)}]" if entry.tags else ""
+        imp_str = f" ★{entry.importance}" if entry.importance != 3 else ""
+        content_preview = entry.content[:80] + ("..." if len(entry.content) > 80 else "")
+        lines.append(
+            f"  {entry.memory_id} [{cat_short}{imp_str}] {content_preview}{tag_str}"
+        )
+    return "\n".join(lines)
+
+
+def _search_memory(query: str, state: RuntimeState) -> str:
+    """Search memory entries by keyword."""
+    try:
+        results = state.memory_store.recall(query=query, limit=10)
+    except MemoryStoreError as exc:
+        return f"[错误] {exc}"
+
+    if not results:
+        return f"未找到与 \"{query}\" 相关的记忆。"
+
+    lines = [f"搜索 \"{query}\" 的结果 ({len(results)} 条):"]
+    for i, entry in enumerate(results, 1):
+        tag_str = f" [tags: {', '.join(entry.tags)}]" if entry.tags else ""
+        lines.append(f"  [{i}] {entry.memory_id} [{entry.category}] {entry.content}{tag_str}")
+    return "\n".join(lines)
+
+
+def _memory_stats(state: RuntimeState) -> str:
+    """Show memory statistics by category."""
+    stats = state.memory_store.stats()
+    total = sum(stats.values())
+    if total == 0:
+        return "Memory 统计: (empty)"
+    lines = ["Memory 统计:", f"  总条目: {total} 条"]
+    for label, count in sorted(stats.items()):
+        lines.append(f"  {label}: {count} 条")
+    return "\n".join(lines)
+
+
+def _update_memory(memory_id: str, new_content: str, state: RuntimeState) -> str:
+    """Update a memory entry's content."""
+    try:
+        state.memory_store.update(memory_id, new_content)
+    except MemoryStoreError as exc:
+        return f"[错误] {exc}"
+    return f"Updated memory: {memory_id}"
+
+
+def _delete_memory(memory_id: str, state: RuntimeState) -> str:
+    try:
+        state.memory_store.delete(memory_id)
+    except MemoryStoreError as exc:
+        return f"[错误] {exc}"
+    return f"Deleted memory: {memory_id}"
+
+
+# -- /compact -----------------------------------------------------------
+
+
+def _handle_compact_command(state: RuntimeState) -> str:
+    session = state.session_store.get(state.current_session_id)
+
+    if len(session.messages) <= KEEP_RECENT_MESSAGES_MIN:
+        return (
+            f"当前 session 只有 {len(session.messages)} 条消息，"
+            f"不超过保留窗口（{KEEP_RECENT_MESSAGES_MIN}），无需压缩。"
+        )
+
+    try:
+        outcome = compact_and_persist(session, state.session_store, state.llm_client)
+    except CompactionError as exc:
+        return f"[错误] {exc}"
+
+    result = outcome.result
+    lines = [
+        f"Compacted session {session.session_id}.",
+        f"Old messages: {result.old_message_count}",
+        f"Recent messages: {result.recent_message_count}",
+        "Summary updated: yes",
+        "Summary:",
+        result.summary,
+    ]
+    if outcome.save_error:
+        lines.append(f"[警告] 压缩结果保存可能未成功: {outcome.save_error}")
+    return "\n".join(lines)
+
+
+# -- /workspace (Step 8) -------------------------------------------------
+
+
+def _handle_workspace_command(args: list[str], state: RuntimeState) -> str:
+    if state.workspace_manager is None:
+        return "Workspace manager 未初始化。"
+
+    if not args:
+        return "用法: /workspace <set|show|unset> ..."
+
+    sub = args[0]
+    sid = state.current_session_id
+
+    if sub == "set":
+        if len(args) < 2:
+            return "用法: /workspace set <路径>"
+        path_str = " ".join(args[1:])
+        try:
+            resolved = state.workspace_manager.set(sid, path_str)
+            return f"Workspace 已设置为: {resolved}"
+        except WorkspaceError as exc:
+            return f"[错误] {exc}"
+
+    if sub == "show":
+        ws = state.workspace_manager.get(sid)
+        if ws is None:
+            return "当前 session 未设置 workspace。使用 /workspace set <路径> 来设置。"
+        return f"当前 workspace: {ws}"
+
+    if sub == "unset":
+        state.workspace_manager.unset(sid)
+        return "Workspace 已取消设置。"
+
+    return f"未知 /workspace 子命令: {sub}"
+
+
+# -- /approvals (list pending) ---------------------------------------------
+
+
+def _handle_approvals_list(state: RuntimeState) -> str:
+    if state.approval_manager is None:
+        return "Approval manager 未初始化。"
+
+    pending = state.approval_manager.get_pending()
+    if not pending:
+        return "当前没有待审批的操作。"
+
+    lines = ["待审批操作:"]
+    for r in pending:
+        lines.append(
+            f"  [{r.approval_id}] {r.tool_name} "
+            f"session={r.session_id}"
+        )
+        # Show key args
+        args_safe = {
+            k: (v[:80] + "..." if isinstance(v, str) and len(v) > 80 else v)
+            for k, v in r.tool_args.items()
+        }
+        lines.append(f"    参数: {args_safe}")
+    lines.append("\n使用 /approve <approvalId> 批准，/reject <approvalId> [原因] 拒绝。")
+    return "\n".join(lines)
+
+
+# -- /approve --------------------------------------------------------------
+
+
+def _handle_approve(args: list[str], state: RuntimeState) -> str:
+    if state.approval_manager is None:
+        return "Approval manager 未初始化。"
+
+    if not args:
+        # If there's exactly one pending, use it
+        pending = state.approval_manager.get_pending()
+        if len(pending) == 1:
+            approval_id = pending[0].approval_id
+        else:
+            return "用法: /approve <approvalId>（或当只有一个待审批时省略 ID）"
+    else:
+        approval_id = args[0]
+
+    req = state.approval_manager.approve(approval_id)
+    if req is None:
+        return f"未找到审批请求: {approval_id}"
+    return f"已批准: [{req.approval_id}] {req.tool_name}"
+
+
+# -- /reject ---------------------------------------------------------------
+
+
+def _handle_reject(raw_input: str, args: list[str], state: RuntimeState) -> str:
+    if state.approval_manager is None:
+        return "Approval manager 未初始化。"
+
+    if not args:
+        pending = state.approval_manager.get_pending()
+        if len(pending) == 1:
+            approval_id = pending[0].approval_id
+        else:
+            return "用法: /reject <approvalId> [原因]（或当只有一个待审批时省略 ID）"
+    else:
+        approval_id = args[0]
+
+    # Extract reason: everything after the approval ID
+    if len(args) > 1:
+        reason = " ".join(args[1:])
+    elif len(args) == 1:
+        reason = ""
+    else:
+        reason = ""
+
+    req = state.approval_manager.reject(approval_id, reason)
+    if req is None:
+        return f"未找到审批请求: {approval_id}"
+    reason_text = f"原因: {reason}" if reason else "未提供原因"
+    return f"已拒绝: [{req.approval_id}] {req.tool_name} ({reason_text})"
+
+
+# -- /skill (Step 9) -------------------------------------------------------
+
+
+def _handle_skill_command(
+    raw_input: str, args: list[str], state: RuntimeState
+) -> str:
+    """Handle /skill commands.  Returns either a plain result string or
+    a special ``__SKILL_INVOKE__`` sentinel indicating that the caller
+    should run an agent turn with the skill content pre-loaded.
+    """
+    if state.skill_registry is None:
+        return "Skill registry 未初始化。"
+
+    if not args:
+        return "用法: /skill <list|show|usage|<skill-name> <task>> ..."
+
+    sub = args[0]
+
+    # /skill list
+    if sub == "list":
+        skills = state.skill_registry.list_skills()
+        if not skills:
+            return "Skills: (empty)"
+        lines = ["Skills:"]
+        for s in skills:
+            lines.append(f"  {s.name}")
+            lines.append(f"    {s.description}")
+        return "\n".join(lines)
+
+    # /skill show <name>
+    if sub == "show":
+        if len(args) < 2:
+            return "用法: /skill show <skill-name>"
+        name = args[1]
+        skill = state.skill_registry.get_skill(name)
+        if skill is None:
+            return f"未找到 skill: \"{name}\"。使用 /skill list 查看可用 skill。"
+        lines = [
+            f"Skill: {skill.name}",
+            f"描述: {skill.description}",
+            "",
+            "使用说明:",
+            skill.instructions[:1500],
+        ]
+        if len(skill.instructions) > 1500:
+            lines.append("...(已截断，完整内容在加载时可见)")
+        if skill.assets:
+            lines.append(f"\n附带资源: {[a.name for a in skill.assets]}")
+        if skill.references:
+            lines.append(f"\n参考文件: {[r.name for r in skill.references]}")
+        return "\n".join(lines)
+
+    # /skill usage
+    if sub == "usage":
+        session = state.session_store.get(state.current_session_id)
+        records = session.skill_usage
+        if not records:
+            return "当前 session 暂无 skill 使用记录。"
+        lines = [f"Skill 使用记录 (session: {state.current_session_id}):"]
+        for i, r in enumerate(records, 1):
+            source_label = "显式调用" if r.get("source") == "explicit" else "模型自主选择"
+            lines.append(
+                f"  [{i}] {r.get('skillName', '?')} | {source_label} | "
+                f"{r.get('usedAt', '?')}"
+            )
+            lines.append(f"      任务: {r.get('userTask', '')[:100]}")
+            if r.get("source") == "auto" and r.get("autoReason"):
+                lines.append(f"      选择理由: {r.get('autoReason', '')}")
+            if r.get("outputPath"):
+                lines.append(f"      输出路径: {r.get('outputPath', '')}")
+        return "\n".join(lines)
+
+    # /skill <skill-name> <task> — explicit invocation
+    skill_name = sub
+    skill = state.skill_registry.get_skill(skill_name)
+    if skill is None:
+        return f"未找到 skill: \"{skill_name}\"。使用 /skill list 查看可用 skill。"
+
+    prefix = f"/skill {skill_name} "
+    if not raw_input.startswith(prefix):
+        return f"用法: /skill {skill_name} <任务描述>"
+    task = raw_input[len(prefix):].strip()
+    if not task:
+        return f"用法: /skill {skill_name} <任务描述>"
+
+    # Return sentinel — the REPL will detect this and call run_agent_turn
+    # with the skill pre-loaded.
+    return f"__SKILL_INVOKE__|{skill_name}|{task}"
+
+
+# -- /reflect (daily memory reflection) --------------------------------------
+
+
+def _handle_reflect_command(args: list[str], state: RuntimeState) -> str:
+    """Handle /reflect commands for daily memory reflection config."""
+    if state.reflection_manager is None:
+        return "Reflection manager 未初始化。"
+
+    mgr = state.reflection_manager
+
+    if not args:
+        return "用法: /reflect <status|enable|disable|time|now> ..."
+
+    sub = args[0]
+
+    if sub == "status":
+        config = mgr.get_config()
+        last_run = config.get("lastRunAt") or "从未"
+        history = config.get("runHistory", [])
+        last_result = ""
+        if history:
+            last = history[-1]
+            last_result = (
+                f"  上次: {last.get('runAt','?')} | "
+                f"检查了 {last.get('sessionsReviewed',0)} session | "
+                f"提取了 {last.get('factsExtracted',0)} 条记忆 | "
+                f"状态: {last.get('status','?')}"
+            )
+        lines = [
+            "📋 每日记忆反思配置:",
+            f"  状态: {'✅ 已启用' if config.get('enabled') else '❌ 已禁用'}",
+            f"  时间: 每天 {config.get('time', '?')}",
+            f"  上次执行: {last_run}",
+        ]
+        if last_result:
+            lines.append(last_result)
+        return "\n".join(lines)
+
+    if sub == "enable":
+        mgr.update_config(enabled=True)
+        return "✅ 每日记忆反思已启用。每天定时自动整理对话，提取长期记忆。"
+
+    if sub == "disable":
+        mgr.update_config(enabled=False)
+        return "❌ 每日记忆反思已禁用。"
+
+    if sub == "time":
+        if len(args) < 2:
+            return "用法: /reflect time <HH:MM>（如 /reflect time 23:00）"
+        new_time = args[1]
+        import re as _re
+        if not _re.match(r"^\d{2}:\d{2}$", new_time):
+            return "时间格式错误，请使用 HH:MM 格式（如 23:00）"
+        mgr.update_config(time=new_time)
+        return f"⏰ 每日反思时间已设置为 {new_time}。"
+
+    if sub == "now":
+        result = mgr.run_now()
+        if result.get("ok"):
+            return (
+                f"✅ 即时反思完成。\n"
+                f"  检查了 {result.get('sessionsReviewed', 0)} 个 session\n"
+                f"  提取了 {result.get('factsExtracted', 0)} 条记忆"
+            )
+        else:
+            return f"❌ 反思失败: {result.get('error', '未知错误')}"
+
+    return f"未知 /reflect 子命令: {sub}"
+
+
+# -- /cron ------------------------------------------------------------------
+
+
+def _handle_cron_command(args: list[str], state: RuntimeState) -> str:
+    """Handle /cron commands (nanobot-compatible)."""
+    if state.cron_service is None:
+        return "Cron 服务未初始化。"
+
+    sub = args[0] if args else "list"
+
+    if sub == "list":
+        try:
+            jobs = state.cron_service.list_jobs(include_disabled=True)
+            if not jobs:
+                return "暂无定时作业。使用 cron 工具创建。"
+            lines = ["Cron 作业:"]
+            for j in jobs:
+                kind = j.payload.kind
+                protected = " [系统]" if kind == "system_event" else ""
+                enabled = "" if j.enabled else " [已禁用]"
+                lines.append(
+                    f"  {j.id} {j.name}{protected}{enabled} "
+                    f"schedule={j.schedule.kind}"
+                )
+                if j.state.last_status:
+                    lines.append(f"    上次: {j.state.last_status}")
+                if j.state.next_run_at_ms:
+                    from datetime import datetime
+                    dt = datetime.fromtimestamp(j.state.next_run_at_ms / 1000)
+                    lines.append(f"    下次: {dt.isoformat()}")
+            return "\n".join(lines)
+        except Exception as exc:
+            return f"错误: {exc}"
+
+    if sub == "status":
+        status = state.cron_service.status()
+        return (
+            f"Cron 服务: {'运行中' if status['enabled'] else '已停止'}\n"
+            f"作业数: {status['jobs']}"
+        )
+
+    if sub == "disable":
+        if len(args) < 2:
+            return "用法: /cron disable <jobId>"
+        job = state.cron_service.enable_job(args[1], enabled=False)
+        if job is None:
+            return f"作业不存在: {args[1]}"
+        return f"已禁用作业: {args[1]}"
+
+    if sub == "enable":
+        if len(args) < 2:
+            return "用法: /cron enable <jobId>"
+        job = state.cron_service.enable_job(args[1], enabled=True)
+        if job is None:
+            return f"作业不存在: {args[1]}"
+        return f"已启用作业: {args[1]}"
+
+    if sub == "delete":
+        if len(args) < 2:
+            return "用法: /cron delete <jobId>"
+        result = state.cron_service.remove_job(args[1])
+        if result == "removed":
+            return f"已删除作业: {args[1]}"
+        if result == "protected":
+            return f"无法删除受保护的系统作业: {args[1]}"
+        return f"作业不存在: {args[1]}"
+
+    return f"用法: /cron <list|status|disable|enable|delete> ..."

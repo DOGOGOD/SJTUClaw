@@ -38,18 +38,14 @@ _DEFAULT_KEEP_RECENT_MESSAGES_MIN = 4
 _DEFAULT_CONSOLIDATION_RATIO = 0.5
 _DEFAULT_MAX_OUTPUT_TOKENS = 4096
 
-# Idle compaction TTL — nanobot-style: only compact sessions idle longer
-# than this (minutes).  Default 60 min (1 hour).  Set to 0 to disable.
+# Idle compaction TTL: only compact sessions idle longer than this
+# (minutes).  Default 60 min (1 hour).  Set to 0 to disable.
 _DEFAULT_IDLE_TTL_MINUTES = 60
 
 # History log
 _DEFAULT_MAX_HISTORY_ENTRIES = 2000
 
-# Dream (memory consolidation) — matching nanobot DreamConfig
-_DEFAULT_DREAM_ENABLED = True
-_DEFAULT_DREAM_INTERVAL_H = 2  # Every 2 hours
-
-# Heartbeat — matching nanobot HeartbeatConfig
+# Heartbeat defaults
 _DEFAULT_HEARTBEAT_ENABLED = True
 _DEFAULT_HEARTBEAT_INTERVAL_S = 30 * 60  # 30 minutes
 _DEFAULT_HEARTBEAT_KEEP_RECENT = 8
@@ -61,6 +57,35 @@ class ConfigError(RuntimeError):
     The message is meant to be shown directly to the user, so it must
     stay clear and actionable instead of leaking a raw stack trace.
     """
+
+
+# ---------------------------------------------------------------------------
+# .env loading (called once, shared across all config loaders)
+# ---------------------------------------------------------------------------
+
+_dotenv_loaded: bool = False
+
+
+def _ensure_dotenv_loaded() -> None:
+    """Load ``.env`` once into the process environment.
+
+    ``load_dotenv(override=False)`` is idempotent, but repeating the
+    file read + parse on every ``load_config()`` / ``load_compaction_config()``
+    / ``load_heartbeat_config()`` call is wasteful.  This guard ensures
+    the file is only read once per process lifetime.
+    """
+    global _dotenv_loaded
+    if _dotenv_loaded:
+        return
+    _dotenv_loaded = True
+    # Try UTF-8 first, fall back to GBK (common on Chinese Windows)
+    try:
+        load_dotenv(dotenv_path=ENV_PATH, override=False, encoding="utf-8")
+    except (UnicodeDecodeError, LookupError):
+        try:
+            load_dotenv(dotenv_path=ENV_PATH, override=False, encoding="gbk")
+        except Exception:
+            pass  # .env not required if env vars are already set
 
 
 @dataclass(frozen=True)
@@ -100,31 +125,8 @@ class CompactionConfig:
 
 
 @dataclass(frozen=True)
-class DreamConfig:
-    """Dream memory consolidation configuration — matching nanobot DreamConfig."""
-
-    _HOUR_MS = 3_600_000
-
-    enabled: bool = True
-    interval_h: int = 2  # Every 2 hours by default
-
-    def build_schedule(self, timezone: str = "UTC"):
-        """Build the runtime schedule for the Dream cron job."""
-        from claw.cron.types import CronSchedule
-
-        return CronSchedule(
-            kind="every",
-            every_ms=self.interval_h * self._HOUR_MS,
-            tz=timezone if timezone != "UTC" else None,
-        )
-
-    def describe_schedule(self) -> str:
-        return f"每 {self.interval_h}h"
-
-
-@dataclass(frozen=True)
 class HeartbeatConfig:
-    """Heartbeat service configuration — matching nanobot HeartbeatConfig."""
+    """Heartbeat service configuration."""
 
     enabled: bool = True
     interval_s: int = 30 * 60  # 30 minutes
@@ -141,14 +143,7 @@ def load_config() -> LLMConfig:
         ConfigError: if one or more required variables are missing or
             blank.
     """
-    # Try UTF-8 first, fall back to GBK (common on Chinese Windows)
-    try:
-        load_dotenv(dotenv_path=ENV_PATH, override=False, encoding="utf-8")
-    except (UnicodeDecodeError, LookupError):
-        try:
-            load_dotenv(dotenv_path=ENV_PATH, override=False, encoding="gbk")
-        except Exception:
-            pass  # .env not required if env vars are already set
+    _ensure_dotenv_loaded()
 
     values = {name: os.getenv(name, "").strip() for name in _REQUIRED_VARS}
     missing = [name for name, value in values.items() if not value]
@@ -197,14 +192,7 @@ def load_compaction_config() -> CompactionConfig:
     All fields are optional — when the compaction LLM credentials are
     left blank the caller reuses the main ``LLMConfig``.
     """
-    # Try UTF-8 first, fall back to GBK (common on Chinese Windows)
-    try:
-        load_dotenv(dotenv_path=ENV_PATH, override=False, encoding="utf-8")
-    except (UnicodeDecodeError, LookupError):
-        try:
-            load_dotenv(dotenv_path=ENV_PATH, override=False, encoding="gbk")
-        except Exception:
-            pass  # .env not required if env vars are already set
+    _ensure_dotenv_loaded()
 
     def _int_env(name: str, default: int) -> int:
         raw = os.getenv(name, "").strip()
@@ -227,43 +215,9 @@ def load_compaction_config() -> CompactionConfig:
     )
 
 
-def load_dream_config() -> DreamConfig:
-    """Load Dream memory consolidation configuration from environment."""
-    try:
-        load_dotenv(dotenv_path=ENV_PATH, override=False, encoding="utf-8")
-    except (UnicodeDecodeError, LookupError):
-        try:
-            load_dotenv(dotenv_path=ENV_PATH, override=False, encoding="gbk")
-        except Exception:
-            pass
-
-    def _int_env(name: str, default: int) -> int:
-        raw = os.getenv(name, "").strip()
-        if not raw:
-            return default
-        try:
-            return int(raw)
-        except ValueError:
-            return default
-
-    enabled_str = os.getenv("DREAM_ENABLED", "").strip().lower()
-    enabled = enabled_str != "false" if enabled_str else _DEFAULT_DREAM_ENABLED
-
-    return DreamConfig(
-        enabled=enabled,
-        interval_h=_int_env("DREAM_INTERVAL_H", _DEFAULT_DREAM_INTERVAL_H),
-    )
-
-
 def load_heartbeat_config() -> HeartbeatConfig:
     """Load Heartbeat configuration from environment."""
-    try:
-        load_dotenv(dotenv_path=ENV_PATH, override=False, encoding="utf-8")
-    except (UnicodeDecodeError, LookupError):
-        try:
-            load_dotenv(dotenv_path=ENV_PATH, override=False, encoding="gbk")
-        except Exception:
-            pass
+    _ensure_dotenv_loaded()
 
     def _int_env(name: str, default: int) -> int:
         raw = os.getenv(name, "").strip()
@@ -281,6 +235,50 @@ def load_heartbeat_config() -> HeartbeatConfig:
         enabled=enabled,
         interval_s=_int_env("HEARTBEAT_INTERVAL_S", _DEFAULT_HEARTBEAT_INTERVAL_S),
         keep_recent_messages=_int_env("HEARTBEAT_KEEP_RECENT", _DEFAULT_HEARTBEAT_KEEP_RECENT),
+    )
+
+
+# ---------------------------------------------------------------------------
+# QQ channel config
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class QQChannelConfig:
+    """Configuration for the QQ bot channel.
+
+    Uses the Official QQ Bot API v2 with WebSocket Gateway.
+    Credentials can be obtained by scanning a QR code:
+        python -m claw.channels.qq_onboard
+    """
+
+    enabled: bool = False
+    app_id: str = ""
+    client_secret: str = ""
+    allow_from: list[str] = field(default_factory=list)
+    markdown_support: bool = True
+    ack_message: str = ""
+
+
+def load_qq_config() -> QQChannelConfig:
+    """Load QQ channel configuration from environment variables."""
+    _ensure_dotenv_loaded()
+
+    enabled = os.getenv("QQ_ENABLED", "false").strip().lower() in ("true", "1", "yes")
+    app_id = os.getenv("QQ_APP_ID", "").strip()
+    client_secret = os.getenv("QQ_CLIENT_SECRET", "").strip()
+    allow_from_raw = os.getenv("QQ_ALLOW_FROM", "").strip()
+    allow_from = [u.strip() for u in allow_from_raw.split(",") if u.strip()] if allow_from_raw else []
+    markdown_support = os.getenv("QQ_MSG_FORMAT", "markdown").strip() == "markdown"
+    ack_message = os.getenv("QQ_ACK_MESSAGE", "").strip()
+
+    return QQChannelConfig(
+        enabled=enabled,
+        app_id=app_id,
+        client_secret=client_secret,
+        allow_from=allow_from,
+        markdown_support=markdown_support,
+        ack_message=ack_message,
     )
 
 

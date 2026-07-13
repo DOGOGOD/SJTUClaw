@@ -34,19 +34,35 @@ export default {
         md: "calc(var(--radius) - 2px)",
         sm: "calc(var(--radius) - 4px)",
       },
+      fontFamily: {
+        sans: [
+          "'Helvetica Neue'", "'Segoe UI Variable'",
+          "'Segoe UI'", "Arial", "sans-serif",
+        ],
+        display: ["'Iowan Old Style'", "'Palatino Linotype'", "'Book Antiqua'", "Palatino", "Georgia", "serif"],
+        mono: [
+          "'Geist Mono'", "'SF Mono'",
+          "'JetBrains Mono'", "monospace",
+        ],
+      },
       keyframes: {
-        "fade-in": {
-          from: { opacity: "0", transform: "translateY(4px)" },
-          to: { opacity: "1", transform: "translateY(0)" },
+        "enter-up": {
+          from: { opacity: "0", transform: "translateY(10px)" },
+          to:   { opacity: "1", transform: "translateY(0)" },
         },
-        "slide-in-from-left": {
-          from: { transform: "translateX(-100%)" },
-          to: { transform: "translateX(0)" },
+        "enter-scale": {
+          from: { opacity: "0", transform: "scale(0.98)" },
+          to:   { opacity: "1", transform: "scale(1)" },
         },
       },
       animation: {
-        "fade-in": "fade-in 0.2s ease-out",
-        "slide-in-from-left": "slide-in-from-left 0.2s ease-out",
+        "enter-up":   "enter-up 0.5s cubic-bezier(0.16, 1, 0.3, 1) both",
+        "enter-scale":"enter-scale 0.3s cubic-bezier(0.16, 1, 0.3, 1) both",
+      },
+      transitionTimingFunction: {
+        spring: "cubic-bezier(0.32, 0.72, 0, 1)",
+        smooth: "cubic-bezier(0.16, 1, 0.3, 1)",
+        bounce: "cubic-bezier(0.34, 1.56, 0.64, 1)",
       },
     },
   },

@@ -1,0 +1,34 @@
+[project]
+name = "sjtuclaw"
+version = "0.1.0"
+description = "SJTUClaw — AI Agent with QQ Bot support"
+requires-python = ">=3.11"
+dependencies = [
+    "openai>=1.0.0",
+    "python-dotenv>=1.0.0",
+    "fastapi>=0.100.0",
+    "uvicorn>=0.20.0",
+    "python-multipart>=0.0.5",
+    "tiktoken>=0.5.0",
+    "filelock>=3.0.0",
+    "Pillow>=10.0.0",
+    "PyYAML>=6.0",
+    "croniter>=2.0",
+    "aiohttp>=3.8.0",
+    "httpx>=0.25.0",
+    "qrcode>=7.0",
+    "cryptography>=41.0",
+]
+
+[project.scripts]
+sjtuclaw = "claw.cli.main:main"
+
+[build-system]
+requires = ["setuptools>=75", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["claw*"]
+
+[tool.setuptools.package-data]
+"claw.pet" = ["assets/*/pet.json", "assets/*/spritesheet.webp", "assets/*/spritesheet.png"]

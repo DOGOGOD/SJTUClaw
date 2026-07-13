@@ -196,10 +196,10 @@ class CompactionWorker:
     def _idle_loop(self) -> None:
         """Periodically scan for idle sessions and hard-truncate them.
 
-        nanobot-style: only compaction trigger is idle-session scanning.
+        Only compaction trigger is idle-session scanning.
         No per-turn proactive compaction or token-threshold checks.
         """
-        # Check every 2 minutes (more responsive than nanobot's event-driven model)
+        # Check every 2 minutes (more responsive than an event-driven model)
         poll_interval = 120
 
         while self._idle_running:

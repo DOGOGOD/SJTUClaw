@@ -20,8 +20,7 @@ from datetime import datetime, timezone
 # ---------------------------------------------------------------------------
 
 
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+from claw.utils import now_iso as _now_iso
 
 
 # Keys that should NOT be persisted to disk (ephemeral runtime state).

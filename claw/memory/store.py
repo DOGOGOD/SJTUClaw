@@ -1,4 +1,4 @@
-"""Long-term, cross-session memory storage — Hermes-style Markdown files.
+"""Long-term, cross-session memory storage — Markdown files.
 
 Each memory is a standalone ``.md`` file under ``data/memory/<category>/``,
 using YAML frontmatter for structured metadata and Markdown body for rich
@@ -60,8 +60,7 @@ _MIGRATED_SUFFIX = ".migrated"
 # ---------------------------------------------------------------------------
 
 
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+from claw.utils import now_iso as _now_iso
 
 
 def _slugify(text: str, max_len: int = 50) -> str:
@@ -317,7 +316,7 @@ class MemoryEntry:
 
 
 # =============================================================================
-# MemoryStore (Hermes-style Markdown-backed)
+# MemoryStore (Markdown-backed)
 # =============================================================================
 
 
@@ -346,7 +345,20 @@ class MemoryStore:
         self._memory_dir = Path(memory_dir)
         self._entries: list[MemoryEntry] = []
         self.load_warning: str | None = None
+        # Bumped on every mutation (add/update/delete) so that
+        # ContextBuilder can invalidate its memory-block cache.
+        self._version: int = 0
         self._load()
+
+    @property
+    def version(self) -> int:
+        """Monotonically increasing version counter.
+
+        Incremented whenever the memory store's contents change
+        (add/update/delete).  Consumers can use this to detect
+        whether their cached snapshot is stale.
+        """
+        return self._version
 
     # ------------------------------------------------------------------
     # Startup: scan .md files + optional legacy migration
@@ -501,6 +513,7 @@ class MemoryStore:
         )
         self._write_md_file(entry)
         self._entries.append(entry)
+        self._version += 1
         return entry
 
     def update(self, memory_id: str, content: str) -> MemoryEntry:
@@ -520,6 +533,7 @@ class MemoryStore:
                         old_path.unlink()
                     except OSError:
                         pass
+                self._version += 1
                 return entry
 
         raise MemoryStoreError(f"未找到 memory: {memory_id}")
@@ -529,6 +543,7 @@ class MemoryStore:
             if entry.memory_id == memory_id:
                 self._delete_md_file(entry)
                 self._entries.pop(i)
+                self._version += 1
                 return
         raise MemoryStoreError(f"未找到 memory: {memory_id}")
 
@@ -609,6 +624,29 @@ class MemoryStore:
                         score += 1.0
                 except (ValueError, TypeError):
                     pass
+
+                # 4a. Recall frequency boost — frequently recalled memories
+                # are proven useful and should rank slightly higher.
+                if entry.recall_count > 0:
+                    score += min(entry.recall_count * 0.5, 3.0)
+
+                # 4b. Recency of last recall boost — if this memory was
+                # recalled recently in the same session, it's likely still
+                # relevant to the current conversation thread.
+                if entry.last_recalled_at:
+                    try:
+                        last_recall_dt = datetime.fromisoformat(
+                            entry.last_recalled_at
+                        )
+                        recall_age_hours = (
+                            datetime.now(timezone.utc) - last_recall_dt
+                        ).total_seconds() / 3600
+                        if recall_age_hours < 1:
+                            score += 2.0
+                        elif recall_age_hours < 24:
+                            score += 1.0
+                    except (ValueError, TypeError):
+                        pass
 
             if score > 0:
                 scored.append((score, entry))

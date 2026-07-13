@@ -45,5 +45,14 @@ export function useSessions() {
     [refresh]
   );
 
-  return { sessions, loading, refresh, createChat: create, deleteChat: remove, renameChat: rename };
+  /** Optimistically update a session's title in local state (no server round-trip). */
+  const updateTitle = useCallback((sessionId: string, title: string) => {
+    setSessions((prev) =>
+      prev.map((s) =>
+        s.sessionId === sessionId ? { ...s, title } : s
+      )
+    );
+  }, []);
+
+  return { sessions, loading, refresh, createChat: create, deleteChat: remove, renameChat: rename, updateTitle };
 }

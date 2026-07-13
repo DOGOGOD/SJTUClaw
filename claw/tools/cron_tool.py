@@ -6,8 +6,8 @@ from contextvars import ContextVar
 from datetime import datetime
 from typing import Any
 
-from claw.cron.service import CronService
-from claw.cron.types import CronJob, CronJobState, CronSchedule
+from claw.scheduler.service import CronService
+from claw.scheduler.types import CronJob, CronJobState, CronSchedule
 from claw.tools.base import Tool, ToolResult
 
 
@@ -32,6 +32,8 @@ class CronTool(Tool):
             default=None,
         )
         self._in_cron_context: ContextVar[bool] = ContextVar("cron_in_context", default=False)
+        # Wire the handler so ToolRegistry.execute_by_name() can call it.
+        self.handler = self.execute_sync
 
     def set_context(
         self,
@@ -63,8 +65,18 @@ class CronTool(Tool):
     @property
     def description(self) -> str:
         return (
-            "Schedule reminders and recurring tasks. Actions: add, list, remove. "
-            f"If tz is omitted, cron expressions and naive ISO times default to {self._default_timezone}."
+            "Schedule reminders and tasks. Actions: add, list, remove.\n"
+            "\n"
+            "WHEN TO USE EACH TIMING PARAMETER (action='add'):\n"
+            "- User says \"in X minutes/seconds/hours\" or \"X minutes later\"\n"
+            "  → ONE-SHOT: use delay_seconds (fires once, then auto-deletes).\n"
+            "- User says \"every X minutes/seconds/hours\" or \"每隔\"\n"
+            "  → RECURRING: use every_seconds (repeats forever until removed).\n"
+            "- User says \"at 9am every day\" or \"every Monday at 3pm\"\n"
+            "  → RECURRING: use cron_expr (e.g. '0 9 * * *' for daily 9am).\n"
+            "- User says \"at 2026-07-15 14:30\" (specific absolute time)\n"
+            "  → ONE-SHOT: use at with ISO datetime.\n"
+            f"Default timezone: {self._default_timezone}."
         )
 
     @property
@@ -88,30 +100,53 @@ class CronTool(Tool):
                     "type": "string",
                     "description": (
                         "REQUIRED when action='add'. Instruction for the agent to execute when the job triggers "
-                        "(e.g., 'Send a reminder to WeChat: xxx' or 'Check system status and report'). "
+                        "(e.g., 'Send a reminder: it has been 10 minutes!' or 'Check system status and report'). "
                         "Not used for action='list' or action='remove'."
+                    ),
+                },
+                "delay_seconds": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": (
+                        "ONE-SHOT delay in seconds. The job fires ONCE after this many seconds, "
+                        "then auto-deletes. Use when the user says \"in X minutes\", "
+                        "\"X minutes later\", \"after X seconds\", \"remind me in 30 minutes\". "
+                        "Example: \"remind me in 5 minutes\" → delay_seconds=300. "
+                        "Do NOT use this for recurring/periodic tasks."
                     ),
                 },
                 "every_seconds": {
                     "type": "integer",
-                    "description": "Interval in seconds (for recurring tasks)",
+                    "minimum": 1,
+                    "description": (
+                        "RECURRING interval in seconds. The job fires REPEATEDLY every N seconds "
+                        "until manually removed. Use when the user says \"every X minutes\", "
+                        "\"每隔X分钟\", \"periodically every X seconds\". "
+                        "Example: \"remind me every 10 minutes\" → every_seconds=600. "
+                        "Do NOT use this for one-shot/in-N-seconds tasks — use delay_seconds instead."
+                    ),
                 },
                 "cron_expr": {
                     "type": "string",
-                    "description": "Cron expression like '0 9 * * *' (for scheduled tasks)",
+                    "description": (
+                        "Cron expression for RECURRING scheduled tasks with complex patterns, "
+                        "e.g. '0 9 * * *' for daily at 9am, '*/30 * * * *' for every 30 minutes, "
+                        "'0 9 * * 1' for every Monday at 9am."
+                    ),
                 },
                 "tz": {
                     "type": "string",
                     "description": (
-                        "Optional IANA timezone for cron expressions (e.g. 'America/Vancouver'). "
+                        "Optional IANA timezone for cron expressions (e.g. 'Asia/Shanghai', 'America/Vancouver'). "
                         "When omitted with cron_expr, the tool's default timezone applies."
                     ),
                 },
                 "at": {
                     "type": "string",
                     "description": (
-                        "ISO datetime for one-time execution (e.g. '2026-02-12T10:30:00'). "
-                        "Naive values use the tool's default timezone."
+                        "ONE-SHOT absolute time as ISO datetime (e.g. '2026-02-12T10:30:00'). "
+                        "Use when the user gives a specific date+time like \"at 3pm tomorrow\". "
+                        "Naive values use the tool's default timezone. Job auto-deletes after firing."
                     ),
                 },
                 "job_id": {
@@ -151,17 +186,32 @@ class CronTool(Tool):
 
         try:
             ZoneInfo(tz)
-        except (KeyError, Exception):
+        except Exception:
             return f"Error: unknown timezone '{tz}'"
         return None
 
     def _add_job(self, args: dict[str, Any]) -> ToolResult:
         name = args.get("name")
         message = str(args.get("message", ""))
+        delay_seconds = args.get("delay_seconds")
         every_seconds = args.get("every_seconds")
         cron_expr = args.get("cron_expr")
         tz = args.get("tz")
         at = args.get("at")
+
+        timing_fields = [
+            key
+            for key in ("delay_seconds", "every_seconds", "cron_expr", "at")
+            if args.get(key) is not None
+        ]
+        if len(timing_fields) != 1:
+            return ToolResult(
+                ok=False,
+                error=(
+                    "Error: action='add' requires exactly one timing parameter: "
+                    "delay_seconds, every_seconds, cron_expr, or at"
+                ),
+            )
 
         if not message:
             return ToolResult(
@@ -199,15 +249,41 @@ class CronTool(Tool):
                 return ToolResult(ok=False, error=err)
 
         # Build schedule
+        import time as _time
+        now_ms = int(_time.time() * 1000)
         delete_after = False
-        if every_seconds:
-            schedule = CronSchedule(kind="every", every_ms=int(every_seconds) * 1000)
-        elif cron_expr:
+        if delay_seconds is not None:
+            if isinstance(delay_seconds, bool):
+                return ToolResult(ok=False, error="Error: delay_seconds must be greater than 0")
+            try:
+                delay_value = int(delay_seconds)
+            except (TypeError, ValueError, OverflowError):
+                return ToolResult(ok=False, error="Error: delay_seconds must be a positive integer")
+            if delay_value <= 0:
+                return ToolResult(ok=False, error="Error: delay_seconds must be greater than 0")
+            # One-shot delayed execution: fire once after N seconds, auto-delete.
+            delay_ms = delay_value * 1000
+            schedule = CronSchedule(kind="at", at_ms=now_ms + delay_ms)
+            delete_after = True
+        elif every_seconds is not None:
+            if isinstance(every_seconds, bool):
+                return ToolResult(ok=False, error="Error: every_seconds must be greater than 0")
+            try:
+                every_value = int(every_seconds)
+            except (TypeError, ValueError, OverflowError):
+                return ToolResult(ok=False, error="Error: every_seconds must be a positive integer")
+            if every_value <= 0:
+                return ToolResult(ok=False, error="Error: every_seconds must be greater than 0")
+            # Recurring execution every N seconds.
+            schedule = CronSchedule(kind="every", every_ms=every_value * 1000)
+        elif cron_expr is not None:
+            if not str(cron_expr).strip():
+                return ToolResult(ok=False, error="Error: cron_expr cannot be empty")
             effective_tz = tz or self._default_timezone
             if err := self._validate_timezone(effective_tz):
                 return ToolResult(ok=False, error=err)
             schedule = CronSchedule(kind="cron", expr=str(cron_expr), tz=effective_tz)
-        elif at:
+        elif at is not None:
             from zoneinfo import ZoneInfo
 
             try:
@@ -222,24 +298,35 @@ class CronTool(Tool):
                     return ToolResult(ok=False, error=err)
                 dt = dt.replace(tzinfo=ZoneInfo(self._default_timezone))
             at_ms = int(dt.timestamp() * 1000)
+            if at_ms <= now_ms:
+                return ToolResult(ok=False, error="Error: 'at' must be a future datetime")
             schedule = CronSchedule(kind="at", at_ms=at_ms)
             delete_after = True
         else:
             return ToolResult(
                 ok=False,
-                error="Error: either every_seconds, cron_expr, or at is required",
+                error=(
+                    "Error: either delay_seconds, every_seconds, cron_expr, or at is required. "
+                    "Use delay_seconds for one-shot (\"in 5 minutes\"), "
+                    "every_seconds for recurring (\"every 10 minutes\"), "
+                    "cron_expr for complex schedules (\"daily at 9am\"), "
+                    "or at for a specific absolute time."
+                ),
             )
 
-        job = self._cron.add_job(
-            name=name or message[:30],
-            schedule=schedule,
-            message=message,
-            delete_after_run=delete_after,
-            session_key=session_key,
-            origin_channel=origin_channel,
-            origin_chat_id=origin_chat_id,
-            origin_metadata=dict(self._origin_metadata.get() or {}),
-        )
+        try:
+            job = self._cron.add_job(
+                name=name or message[:30],
+                schedule=schedule,
+                message=message,
+                delete_after_run=delete_after,
+                session_key=session_key,
+                origin_channel=origin_channel,
+                origin_chat_id=origin_chat_id,
+                origin_metadata=dict(self._origin_metadata.get() or {}),
+            )
+        except ValueError as exc:
+            return ToolResult(ok=False, error=f"Error: invalid schedule: {exc}")
         return ToolResult(
             ok=True,
             content=f"Created job '{job.name}' (id: {job.id})",
@@ -274,6 +361,16 @@ class CronTool(Tool):
                 return f"every {ms // 1000}s"
             return f"every {ms}ms"
         if schedule.kind == "at" and schedule.at_ms:
+            # Show as a one-shot reminder: either a delay or an absolute time
+            import time as _time
+            now_ms = int(_time.time() * 1000)
+            if schedule.at_ms > now_ms:
+                remaining_s = (schedule.at_ms - now_ms) // 1000
+                if remaining_s < 120:
+                    return f"in {remaining_s}s"
+                if remaining_s < 7200:
+                    return f"in {remaining_s // 60}min"
+                return f"in {remaining_s // 3600}h"
             return f"at {self._format_timestamp(schedule.at_ms, self._display_timezone(schedule))}"
         return schedule.kind
 
@@ -295,8 +392,6 @@ class CronTool(Tool):
 
     @staticmethod
     def _system_job_purpose(job: CronJob) -> str:
-        if job.name == "dream":
-            return "Dream memory consolidation for long-term memory."
         if job.name == "heartbeat":
             return "Heartbeat monitoring for active tasks in HEARTBEAT.md."
         return "System-managed internal job."
@@ -324,16 +419,6 @@ class CronTool(Tool):
         if result == "removed":
             return ToolResult(ok=True, content=f"Removed job {job_id}")
         if result == "protected":
-            job = self._cron.get_job(str(job_id))
-            if job and job.name == "dream":
-                return ToolResult(
-                    ok=False,
-                    error=(
-                        "Cannot remove job `dream`.\n"
-                        "This is a system-managed Dream memory consolidation job for long-term memory.\n"
-                        "It remains visible so you can inspect it, but it cannot be removed."
-                    ),
-                )
             return ToolResult(
                 ok=False,
                 error=(

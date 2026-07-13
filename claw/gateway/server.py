@@ -9,53 +9,72 @@ Start the server::
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
+import os
+import queue
 import shutil
 import threading
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from claw.agent.events import (
+    ErrorEvent,
+    FinalEvent,
+    ThinkingEvent,
+    ToolCallEndEvent,
+    ToolCallStartEvent,
+    TurnEvent,
+)
 from claw.agent.loop import run_agent_turn
 from claw.approval.manager import ApprovalManager, ApprovalRequest, ApprovalStatus
 from claw.config import (
     DATA_DIR,
-    load_dream_config,
     load_heartbeat_config,
     MEMORY_DIR,
     PROJECT_ROOT,
     SESSIONS_DIR,
     load_config,
     load_compaction_config,
+    load_qq_config,
 )
 from claw.context.builder import ContextBuilder
 from claw.context.compaction_worker import CompactionWorker
 from claw.llm.client import LLMClient, LLMError
-from claw.memory.history_log import HistoryLog
 from claw.memory.store import MemoryStore
 from claw.prompts import load_soul, load_system_prompt
 from claw.session.store import SessionStore, SessionStoreError
+from claw.session.title import auto_title_if_first_turn
 from claw.skills.registry import SkillRegistry
 from claw.tools.base import ToolRegistry
 from claw.tools import register_all_tools
 from claw.tools.download import get_download, list_downloads
 from claw.workspace.manager import WorkspaceManager, WorkspaceError
-from claw.cron.service import CronService
-from claw.cron.callbacks import (
-    DreamCallback,
+from claw.scheduler.service import CronService
+from claw.scheduler.session_turns import visible_session_messages
+from claw.scheduler.callbacks import (
     HeartbeatCallback,
-    make_dream_system_job,
     make_heartbeat_system_job,
 )
 from claw.memory.reflection import ReflectionManager
+from claw.pet.catalog import PetCatalog, PetCatalogError
+from claw.pet.process import PetProcessManager
+from claw.pet.state import PetStateBroker
+
+# -- QQ channel support ---------------------------------------------------------
+from claw.channels.qq import QQChannel, QQConfig
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Shared runtime (initialised once at startup)
@@ -69,25 +88,31 @@ _llm_client = LLMClient(_config)
 _session_store = SessionStore(SESSIONS_DIR)
 _memory_store = MemoryStore(MEMORY_DIR)
 _compact_cfg = load_compaction_config()
-
-# -- Cross-session history log
-_history_log = HistoryLog(
-    MEMORY_DIR,
-    max_entries=_compact_cfg.max_history_entries,
-)
+_workspace_manager = WorkspaceManager()
 
 _context_builder = ContextBuilder(
     _system_prompt,
     _soul,
     _memory_store,
-    history_log=_history_log,
     workspace_path=str(PROJECT_ROOT),
+    workspace_manager=_workspace_manager,
 )
 
-_workspace_manager = WorkspaceManager()
 _approval_manager = ApprovalManager()
+_pet_catalog = PetCatalog(DATA_DIR)
+_pet_state = PetStateBroker()
 
-# -- Skill registry (Step 9) -----------------------------------------------
+
+def _pet_gateway_url() -> str:
+    host = os.getenv("GATEWAY_HOST", "127.0.0.1")
+    if host in {"0.0.0.0", "::"}:
+        host = "127.0.0.1"
+    return f"http://{host}:{os.getenv('GATEWAY_PORT', '8000')}"
+
+
+_pet_process = PetProcessManager(_pet_gateway_url(), DATA_DIR)
+
+# -- Skill registry -----------------------------------------------------
 _skill_registry = SkillRegistry()
 _context_builder.set_skill_registry(_skill_registry)
 
@@ -101,30 +126,40 @@ def _get_turn_session_id() -> str:
 def _set_turn_session_id(sid: str | None) -> None:
     _turn_session_local.session_id = sid
 
+
+def _persist_agent_fallback(session_id: str, message: str) -> str:
+    """Persist a user-visible reply when an agent worker exits unexpectedly."""
+    try:
+        session = _session_store.get(session_id)
+        last = session.messages[-1] if session.messages else None
+        if not (
+            last is not None
+            and getattr(last, "role", "") == "assistant"
+            and getattr(last, "content", "") == message
+        ):
+            session.append_message("assistant", message)
+            _session_store.save(session)
+    except Exception:
+        logger.exception("无法持久化 Agent 异常兜底消息: session=%s", session_id)
+    return message
+
+# -- Cron service (must be created before register_all_tools) --------------
+_cron_store_path = DATA_DIR / "cron" / "jobs.json"
+_cron_service = CronService(_cron_store_path)
+
 register_all_tools(
     _tool_registry,
     workspace_manager=_workspace_manager,
     session_id_provider=_get_turn_session_id,
     sessions_dir=SESSIONS_DIR,
     include_skill_tool=True,
+    skill_registry=_skill_registry,
     include_memory_tools=True,
     memory_store=_memory_store,
+    include_cron_tool=True,
+    cron_service=_cron_service,
+    default_timezone="Asia/Shanghai",
 )
-
-# -- Cron service (nanobot-compatible) ----------------------------------
-_cron_store_path = DATA_DIR / "cron" / "jobs.json"
-_cron_service = CronService(_cron_store_path)
-
-# -- Dream system job ---------------------------------------------------
-_dream_cfg = load_dream_config()
-_dream_cb: DreamCallback | None = None
-if _dream_cfg.enabled:
-    _dream_cb = DreamCallback(
-        MEMORY_DIR, _history_log, _llm_client,
-        workspace_root=SESSIONS_DIR.parent,
-    )
-    _cron_service.register_system_job(make_dream_system_job(_dream_cfg))
-    print(f"[启动] Dream: {_dream_cfg.describe_schedule()}")
 
 # -- Heartbeat system job -----------------------------------------------
 _hb_cfg = load_heartbeat_config()
@@ -140,8 +175,108 @@ if _hb_cfg.enabled:
     _cron_service.register_system_job(make_heartbeat_system_job(_hb_cfg))
     print(f"[启动] Heartbeat: 每 {_hb_cfg.interval_s}s")
 
-# Set up the dispatcher
-_cron_service.on_job = _make_cron_dispatcher()
+# -- Cron dispatcher ----------------------------------------------------------
+
+
+def _update_cron_context(
+    session_key: str, chat_id: str, channel: str = "gateway",
+    metadata: dict | None = None,
+) -> None:
+    """Update the cron tool's session context for the current turn.
+
+    Must be called before each ``run_agent_turn`` so that cron jobs
+    created by the LLM are bound to the correct session and channel.
+
+    *metadata* (e.g. ``{"chat_type": "group"}``) is persisted in the
+    cron job's ``origin_metadata`` so delivery can route correctly.
+    """
+    cron_tool = _tool_registry.get_tool("cron")
+    if cron_tool is not None and hasattr(cron_tool, "set_context"):
+        cron_tool.set_context(
+            session_key=session_key,
+            channel=channel,
+            chat_id=chat_id,
+            metadata=metadata,
+        )
+
+
+# Active session tracking for cron deferral
+_active_cron_sessions: set[str] = set()
+
+
+def _resolve_qq_chat_type(chat_id: str) -> str:
+    """Determine the QQ chat type (c2c/group/dm) for *chat_id*.
+
+    Checks session metadata first, falls back to "c2c".
+    """
+    for summary in _session_store.list_summaries():
+        try:
+            sess = _session_store.get(summary.session_id)
+            if sess.metadata.get("qq_chat_id") == chat_id:
+                return sess.metadata.get("qq_chat_type", "c2c")
+        except Exception:
+            continue
+    return "c2c"
+
+
+async def _deliver_cron_reply(
+    channel: str, chat_id: str, reply: str,
+    metadata: dict | None = None,
+) -> None:
+    """Deliver a cron job's reply back to the origin channel."""
+    print(f"[cron] deliver_reply channel={channel} chat_id={chat_id}")
+    if channel == "qq":
+        if _qq_channel is None:
+            print("[cron] QQ channel 未初始化，无法投递回复")
+            return
+        try:
+            from claw.channels.base import OutboundMessage
+            msg_meta = dict(metadata or {})
+            if "chat_type" not in msg_meta:
+                msg_meta["chat_type"] = _resolve_qq_chat_type(chat_id)
+            await _qq_channel.send(OutboundMessage(
+                chat_id=chat_id,
+                content=reply,
+                metadata=msg_meta,
+            ))
+            print(f"[cron] QQ 回复已投递 chat_id={chat_id} chat_type={msg_meta.get('chat_type', 'c2c')}")
+        except Exception as exc:
+            import traceback
+            print(f"[cron] QQ 投递失败: {exc}")
+            traceback.print_exc()
+    elif channel in ("cli", ""):
+        print(f"[cron] CLI job 回复: {reply[:200]}")
+    elif channel in ("gateway", "websocket", "webui"):
+        # run_agent_turn already persists the assistant reply in this session.
+        # Writing it again here produced duplicate WebUI messages.
+        print(f"[cron] Gateway 回复已由 agent loop 写入 session {chat_id}")
+    else:
+        print(f"[cron] 未知 channel '{channel}'，仅日志: {reply[:200]}")
+
+
+def _cron_mark_active(session_key: str) -> None:
+    _active_cron_sessions.add(session_key)
+
+
+def _cron_mark_idle(session_key: str) -> None:
+    _active_cron_sessions.discard(session_key)
+
+# -- Set up the cron dispatcher ------------------------------------------------
+from claw.scheduler.dispatcher import create_cron_dispatcher
+
+_cron_service.on_job = create_cron_dispatcher(
+    session_store=_session_store,
+    context_builder=_context_builder,
+    tool_registry=_tool_registry,
+    llm_client=_llm_client,
+    set_turn_session_id=_set_turn_session_id,
+    update_cron_context=_update_cron_context,
+    on_heartbeat=_hb_cb if _hb_cfg.enabled else None,
+    on_deliver=_deliver_cron_reply,
+    on_session_resolve=lambda sid, chat_id: _find_existing_qq_session(chat_id),
+    on_turn_active=_cron_mark_active,
+    on_turn_idle=_cron_mark_idle,
+)
 
 _reflection_mgr = ReflectionManager(
     DATA_DIR / "memory", _memory_store, _session_store, _llm_client
@@ -168,59 +303,6 @@ _compaction_worker = CompactionWorker(
 )
 
 
-# -- Cron dispatcher ----------------------------------------------------------
-
-
-def _make_cron_dispatcher():
-    """Build a dispatcher that routes cron jobs to their callbacks."""
-
-    async def dispatch(job) -> str | None:
-        if job.name == "dream" and _dream_cb is not None:
-            return await _dream_cb(job)
-        if job.name == "heartbeat" and _hb_cfg.enabled:
-            return await _hb_cb(job)
-
-        # User-created agent_turn jobs
-        if job.payload.kind == "agent_turn" and job.payload.message:
-            try:
-                sid = job.payload.session_key or "default"
-                if not _session_store.exists(sid):
-                    _session_store.create_session(session_id=sid)
-
-                _cron_mark_active(sid)
-                try:
-                    reply = run_agent_turn(
-                        sid,
-                        f"[定时任务: {job.name}]\n\n{job.payload.message}",
-                        session_store=_session_store,
-                        context_builder=_context_builder,
-                        tool_registry=_tool_registry,
-                        llm_client=_llm_client,
-                    )
-                finally:
-                    _cron_mark_idle(sid)
-
-                return reply
-            except Exception as e:
-                return f"定时任务 '{job.name}' 执行失败: {e}"
-
-        return None
-
-    return dispatch
-
-
-# Active session tracking for cron deferral
-_active_cron_sessions: set[str] = set()
-
-
-def _cron_mark_active(session_key: str) -> None:
-    _active_cron_sessions.add(session_key)
-
-
-def _cron_mark_idle(session_key: str) -> None:
-    _active_cron_sessions.discard(session_key)
-
-
 # -- Approval handler for Gateway (blocks on threading.Event) ----------------
 
 def _gateway_approval_handler(req: ApprovalRequest) -> ApprovalRequest:
@@ -229,8 +311,13 @@ def _gateway_approval_handler(req: ApprovalRequest) -> ApprovalRequest:
     Uses ApprovalManager's thread-safe create() to register the request.
     """
     registered = _approval_manager.create(req.session_id, req.tool_name, req.tool_args)
+    _pet_state.approval_pending(req.session_id, req.tool_name)
     result = _approval_manager.wait(registered.approval_id, timeout=300)
-    return result or req
+    decided = result or req
+    _pet_state.approval_resolved(
+        req.session_id, decided.status == ApprovalStatus.APPROVED.value
+    )
+    return decided
 
 
 # ---------------------------------------------------------------------------
@@ -239,17 +326,63 @@ def _gateway_approval_handler(req: ApprovalRequest) -> ApprovalRequest:
 
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
-    import asyncio as _asyncio
+    global _qq_channel, _qq_task
 
-    loop = _asyncio.get_running_loop()
+    loop = asyncio.get_running_loop()
     _cron_service.start(loop=loop)
     _reflection_mgr.start()
     _compaction_worker.start_idle_compaction()
+
+    pet_settings = _pet_catalog.load_settings()
+    can_show_desktop = os.name == "nt" or bool(os.getenv("DISPLAY"))
+    if (
+        pet_settings.enabled
+        and pet_settings.launch_on_gateway_start
+        and can_show_desktop
+        and not os.getenv("PYTEST_CURRENT_TEST")
+    ):
+        try:
+            _pet_process.start()
+        except OSError:
+            logger.exception("桌面宠物启动失败")
+
+    # -- Start QQ channel if enabled -------------------------------------------
+    _qq_cfg = load_qq_config()
+    if _qq_cfg.enabled:
+        if not _qq_cfg.app_id or not _qq_cfg.client_secret:
+            print("[QQ] QQ_ENABLED=true 但 QQ_APP_ID / QQ_CLIENT_SECRET 未设置")
+            print("[QQ] 请前往 https://q.qq.com 创建机器人，获取 AppID 和 AppSecret")
+            print("[QQ] 写入 .env 后重启 gateway")
+        else:
+            _qq_channel = QQChannel(QQConfig(
+                enabled=True,
+                app_id=_qq_cfg.app_id,
+                client_secret=_qq_cfg.client_secret,
+                allow_from=list(_qq_cfg.allow_from),
+                markdown_support=_qq_cfg.markdown_support,
+                ack_message=_qq_cfg.ack_message,
+            ))
+            _qq_channel.set_message_handler(_qq_message_handler)
+            _qq_task = asyncio.create_task(_qq_channel.start())
+            print(f"[QQ] QQ 机器人已启动 (AppID: {_qq_cfg.app_id[:8]}...)")
+
     yield
+
+    # -- Stop QQ channel -------------------------------------------------------
+    if _qq_channel is not None:
+        await _qq_channel.stop()
+        _qq_channel = None
+    if _qq_task is not None and not _qq_task.done():
+        _qq_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await _qq_task
+        _qq_task = None
+
     _compaction_worker.stop_idle_compaction()
     _compaction_worker.wait(timeout=5.0)
     _reflection_mgr.stop()
     _cron_service.stop()
+    _pet_process.stop()
 
 
 app = FastAPI(
@@ -267,11 +400,183 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# -- Custom middleware ---------------------------------------------------------
+from claw.gateway.middleware import (
+    RateLimitMiddleware,
+    RequestLoggingMiddleware,
+    RequestSizeMiddleware,
+)
+
+app.add_middleware(RequestSizeMiddleware)
+app.add_middleware(RateLimitMiddleware)
+app.add_middleware(RequestLoggingMiddleware)
+
 # Web UI is served at the end of the file (after all API routes).
 _WEB_DIR = PROJECT_ROOT / "web"
 
 # Per-session AUTO mode flag (in-memory, resets on restart)
 _auto_mode: dict[str, bool] = {}
+
+# Active agent turns — tracks running turns for cancellation.
+# Key: session_id, Value: threading.Event (set when cancelled).
+_active_turns: dict[str, threading.Event] = {}
+_active_turns_lock = threading.Lock()
+
+
+def _register_active_turn(session_id: str) -> threading.Event:
+    """Register a new active turn and return its cancel event."""
+    event = threading.Event()
+    with _active_turns_lock:
+        _active_turns[session_id] = event
+    return event
+
+
+def _unregister_active_turn(session_id: str) -> None:
+    """Remove an active turn from tracking."""
+    with _active_turns_lock:
+        _active_turns.pop(session_id, None)
+
+
+def _cancel_active_turn(session_id: str) -> bool:
+    """Cancel the active turn for *session_id*. Returns True if found."""
+    with _active_turns_lock:
+        event = _active_turns.get(session_id)
+    if event is not None:
+        event.set()
+        return True
+    return False
+
+
+def _cancel_all_active_turns() -> int:
+    """Cancel all active turns. Returns the count cancelled."""
+    with _active_turns_lock:
+        events = list(_active_turns.values())
+        count = len(events)
+        for e in events:
+            e.set()
+    return count
+
+# QQ channel instance (started in lifespan if QQ_ENABLED=true)
+_qq_channel: QQChannel | None = None
+_qq_task: asyncio.Task | None = None
+
+
+# ---------------------------------------------------------------------------
+# QQ message handler — bridges QQ messages into the agent loop
+# ---------------------------------------------------------------------------
+
+# Map external QQ chat_ids to clean sequential session IDs.
+# Keyed by chat_id, value is the internal session_id.
+_qq_session_map: dict[str, str] = {}
+
+
+def _find_existing_qq_session(chat_id: str) -> str | None:
+    """Scan sessions on disk for a QQ session previously bound to *chat_id*.
+
+    After a gateway restart the in-memory ``_qq_session_map`` is lost,
+    but we store ``qq_chat_id`` in session metadata so we can recover.
+    """
+    # Legacy check: session stored directly under the raw chat_id hash
+    if _session_store.exists(chat_id):
+        return chat_id
+    # Scan all sessions for matching QQ metadata
+    for summary in _session_store.list_summaries():
+        sid = summary.session_id
+        try:
+            sess = _session_store.get(sid)
+            if sess.metadata.get("qq_chat_id") == chat_id:
+                return sid
+        except Exception:
+            continue
+    return None
+
+
+async def _qq_message_handler(
+    sender_id: str,
+    chat_id: str,
+    content: str,
+    media: list[str] | None,
+    metadata: dict[str, Any] | None,
+) -> str | None:
+    """Handle an inbound QQ message by running the agent turn.
+
+    Each QQ chat (C2C or group) gets its own session using the
+    standard ``session_NNN`` naming convention, consistent with
+    local/CLI sessions.
+    """
+    import asyncio as _asyncio
+
+    # Resolve or create a session ID for this chat
+    session_key = _qq_session_map.get(chat_id)
+    chat_type = (metadata or {}).get("chat_type", "c2c")
+    if session_key is None:
+        # Try to find an existing session for this chat_id on disk
+        existing = _find_existing_qq_session(chat_id)
+        if existing is not None:
+            session_key = existing
+        else:
+            # Create a new session — auto-generates session_NNN format
+            session = _session_store.create_session(
+                title=f"QQ 对话"
+            )
+            session_key = session.session_id
+            # Persist the QQ chat_id mapping so we can recover
+            # after a gateway restart.
+            session.metadata["qq_chat_id"] = chat_id
+            session.metadata["qq_chat_type"] = chat_type
+            _session_store.save(session)
+        _qq_session_map[chat_id] = session_key
+
+    # Update cron tool context (with correct channel and chat_type metadata)
+    _update_cron_context(
+        session_key, chat_id, channel="qq",
+        metadata={"chat_type": chat_type},
+    )
+
+    # Route slash commands directly (bypass LLM) — these run
+    # synchronously in the current thread, so set the session id here.
+    if _is_slash_command(content):
+        _set_turn_session_id(session_key)
+        try:
+            return _execute_slash_command(content, session_key)
+        finally:
+            _set_turn_session_id(None)
+
+    # Non-command: run agent turn in a thread. The thread-local
+    # session_id must be set INSIDE the worker thread.
+    def _run_qq_turn() -> str:
+        _set_turn_session_id(session_key)
+        try:
+            return run_agent_turn(
+                session_key,
+                content,
+                session_store=_session_store,
+                context_builder=_context_builder,
+                tool_registry=_tool_registry,
+                llm_client=_llm_client,
+                approval_handler=None,  # QQ: no interactive approval
+                compaction_worker=_compaction_worker,
+                auto_mode=_auto_mode.get(session_key, False),
+                unlimited_mode=_workspace_manager.is_unlimited(session_key),
+            )
+        finally:
+            _set_turn_session_id(None)
+
+    try:
+        reply = await _asyncio.to_thread(_run_qq_turn)
+
+        # Auto-title for QQ sessions
+        try:
+            sess = _session_store.get(session_key)
+            msgs = [{"role": m.role, "content": m.content} for m in sess.messages]
+            auto_title_if_first_turn(session_key, msgs, _session_store, _llm_client)
+        except Exception:
+            pass
+
+        return reply
+    except Exception as exc:
+        print(f"[qq] agent turn 异常: {exc}")
+        return "抱歉，处理你的消息时发生了内部错误。请重试。"
 
 
 # ---------------------------------------------------------------------------
@@ -414,12 +719,15 @@ async def _generic_error_handler(_request, exc: Exception):
 
 
 @app.post("/chat")
-def handle_chat(req: ChatRequest):
+async def handle_chat(req: ChatRequest):
     """Send a user message and get the assistant's reply.
 
     If approval is required for a tool call, this endpoint will block
     until the approval is decided (or timeout).  The frontend should
     show a loading indicator during this time.
+
+    The agent turn runs in a background thread via ``asyncio.to_thread``
+    so the event loop remains responsive to other requests (e.g. /stop).
     """
     # Resolve session
     if req.session_id:
@@ -433,37 +741,92 @@ def handle_chat(req: ChatRequest):
         session = _session_store.create_session()
         sid = session.session_id
 
-    # Set per-thread session id for tool handlers
-    _set_turn_session_id(sid)
+    # Defense in depth: WebUI normally sends slash commands to /command, but
+    # stale frontend bundles or alternate clients may post them to /chat.
+    # Never forward a recognized command to the LLM.
+    command = req.message.strip()
+    if _is_slash_command(command):
+        result_text = _execute_slash_command(command, sid)
+        session = _session_store.get(sid)
+        messages = visible_session_messages(session)
+        messages.extend([
+            {"role": "user", "content": command, "_command": True},
+            {"role": "assistant", "content": result_text, "_command": True},
+        ])
+        return {
+            "ok": True,
+            "type": "command",
+            "sessionId": sid,
+            "reply": result_text,
+            "messages": messages,
+            "autoMode": _auto_mode.get(sid, False),
+            "unlimitedMode": _workspace_manager.is_unlimited(sid),
+            "title": session.title,
+        }
+
+    # Register a cancel event so /stop can interrupt this turn
+    cancel_event = _register_active_turn(sid)
 
     reply: str
     try:
-        reply = run_agent_turn(
-            sid,
-            req.message,
-            session_store=_session_store,
-            context_builder=_context_builder,
-            tool_registry=_tool_registry,
-            llm_client=_llm_client,
-            approval_handler=_gateway_approval_handler,
-            skill_registry=_skill_registry,
-            compaction_worker=_compaction_worker,
-            auto_mode=_auto_mode.get(sid, False),
-        )
+        # Wrap in a callable so _set_turn_session_id runs inside the worker
+        # thread — threading.local() is not shared across threads.
+        def _run() -> str:
+            _set_turn_session_id(sid)
+            _update_cron_context(sid, req.session_id or "default")
+            _pet_state.start_turn(sid, req.message)
+            try:
+                return run_agent_turn(
+                    sid,
+                    req.message,
+                    session_store=_session_store,
+                    context_builder=_context_builder,
+                    tool_registry=_tool_registry,
+                    llm_client=_llm_client,
+                    approval_handler=_gateway_approval_handler,
+                    compaction_worker=_compaction_worker,
+                    auto_mode=_auto_mode.get(sid, False),
+                    unlimited_mode=_workspace_manager.is_unlimited(sid),
+                    event_callback=lambda event: _pet_state.handle_event(sid, event),
+                    cancel_event=cancel_event,
+                )
+            except Exception:
+                _pet_state.finish_turn(sid, failed=True)
+                raise
+            finally:
+                _set_turn_session_id(None)
+
+        reply = await asyncio.to_thread(_run)
     except Exception as exc:
         # Ensure a response is still returned even if the agent crashes
         print(f"[gateway] agent turn 异常: {exc}")
-        reply = "抱歉，处理你的消息时发生了内部错误。请重试。"
+        reply = _persist_agent_fallback(
+            sid, "抱歉，Agent 在执行工具时意外中止。已保留现有进度，请重试。"
+        )
     finally:
-        _set_turn_session_id(None)
+        _unregister_active_turn(sid)
 
     # Safely retrieve session messages for the response
-    messages: list[dict[str, str]] = []
+    messages: list[dict[str, Any]] = []
     try:
         session = _session_store.get(sid)
-        messages = [{"role": m.role, "content": m.content} for m in session.messages]
+        messages = visible_session_messages(session)
     except Exception as exc:
         print(f"[gateway] 获取 session 消息失败: {exc}")
+
+    # Auto-title: generate a title from the user's first message.
+    # Returns the new title (or None) so it can be included in the response
+    # for instant frontend updates without waiting for session-list refresh.
+    new_title = auto_title_if_first_turn(sid, messages, _session_store, _llm_client)
+
+    # If auto-title didn't trigger (e.g. short message), return the current
+    # session title so the frontend can still display it.
+    if new_title is None:
+        try:
+            current_session = _session_store.get(sid)
+            new_title = current_session.title
+        except Exception:
+            pass
 
     return {
         "ok": True,
@@ -472,18 +835,109 @@ def handle_chat(req: ChatRequest):
         "reply": reply,
         "messages": messages,
         "autoMode": _auto_mode.get(sid, False),
+        "unlimitedMode": _workspace_manager.is_unlimited(sid),
+        "title": new_title,
     }
+
+
+# ---------------------------------------------------------------------------
+# Routes — Stop (cancel running agent turn)
+# ---------------------------------------------------------------------------
+
+
+class StopRequest(BaseModel):
+    """Request body for the /stop endpoint."""
+
+    session_id: str | None = None
+    all: bool = False
+
+
+@app.post("/stop")
+def handle_stop(req: StopRequest):
+    """Cancel a running agent turn.
+
+    If ``all=True``, cancels all active turns across all sessions.
+    If ``session_id`` is provided, cancels only that session's turn.
+    Otherwise, cancels all active turns (same as ``all=True``).
+    """
+    if req.all or req.session_id is None:
+        count = _cancel_all_active_turns()
+        return {
+            "ok": True,
+            "cancelled": count,
+            "message": f"已终止 {count} 个正在运行的任务" if count > 0 else "当前没有正在运行的任务",
+        }
+
+    found = _cancel_active_turn(req.session_id)
+    return {
+        "ok": True,
+        "cancelled": 1 if found else 0,
+        "message": f"已终止 session `{req.session_id}` 的任务" if found else f"session `{req.session_id}` 当前没有正在运行的任务",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Slash command handler (shared by HTTP /command and QQ)
+# ---------------------------------------------------------------------------
+
+
+def _is_slash_command(text: str) -> bool:
+    """Check if *text* starts with a known slash command."""
+    from claw.cli.commands import is_command
+    return is_command(text)
+
+
+def _execute_slash_command(command: str, session_id: str) -> str:
+    """Execute a slash command via the shared CLI command handler.
+
+    Constructs a RuntimeState from the module-level globals and delegates
+    to ``commands.handle_command``.  Gateway-specific callbacks are wired
+    in so that /stop and /exit work correctly.
+    """
+    from claw.cli.commands import RuntimeState, handle_command
+
+    sid = session_id or "default"
+
+    def _stop_impl() -> str:
+        found = _cancel_active_turn(sid)
+        if found:
+            return "已终止当前任务"
+        count = _cancel_all_active_turns()
+        if count > 0:
+            return f"已终止 {count} 个正在运行的任务"
+        return "当前没有正在运行的任务"
+
+    def _exit_impl() -> str:
+        _auto_mode.pop(sid, None)
+        _workspace_manager.set_unlimited(sid, False)
+        return "bye."
+
+    state = RuntimeState(
+        session_store=_session_store,
+        memory_store=_memory_store,
+        llm_client=_llm_client,
+        current_session_id=sid,
+        workspace_manager=_workspace_manager,
+        approval_manager=_approval_manager,
+        reflection_manager=_reflection_mgr,
+        cron_service=_cron_service,
+        pet_catalog=_pet_catalog,
+        pet_process=_pet_process,
+        auto_mode=_auto_mode.get(sid, False),
+        stop_handler=_stop_impl,
+        exit_handler=_exit_impl,
+    )
+    result = handle_command(command, state, markdown=True)
+    if state.auto_mode:
+        _auto_mode[sid] = True
+    else:
+        _auto_mode.pop(sid, None)
+    return result
 
 
 # ---------------------------------------------------------------------------
 # Routes — Command endpoint
 # ---------------------------------------------------------------------------
-
-_COMMAND_PREFIXES = (
-    "/session", "/memory", "/compact", "/exit", "/cron",
-    "/workspace", "/approve", "/reject", "/approvals",
-    "/skill", "/reflect", "/help", "/auto",
-)
 
 
 class CommandRequest(BaseModel):
@@ -498,450 +952,42 @@ class CommandRequest(BaseModel):
 @app.post("/command")
 def handle_command(req: CommandRequest):
     """Execute a CLI-style command and return the result."""
+    result_text = _execute_slash_command(req.command, req.session_id or "default")
+
+    # Determine actions for WebUI
     root, *args = req.command.split()
     actions: list[str] = []
-    result_text = ""
     switch_to: str | None = None
     sid = req.session_id or "default"
 
-    # ---- /session ----------------------------------------------------------
-    if root == "/session":
-        sub = args[0] if args else ""
-        if sub == "new":
-            session = _session_store.create_session()
-            result_text = f"Created session: {session.session_id}"
-            actions = ["reload_sessions", "switch_session"]
-            switch_to = session.session_id
-        elif sub == "list":
-            summaries = _session_store.list_summaries()
-            if not summaries:
-                result_text = "Sessions: (empty)"
-            else:
-                lines = ["Sessions:"]
-                for s in summaries:
-                    marker = "*" if s.session_id == req.session_id else " "
-                    lines.append(
-                        f"{marker} {s.session_id}  {s.title}  "
-                        f"messages={s.message_count}  updated={s.updated_at}"
-                    )
-                result_text = "\n".join(lines)
-            actions = ["reload_sessions"]
-        elif sub == "switch":
-            if not args[1:]:
-                result_text = "用法: /session switch <sessionId>"
-            else:
-                target_sid = args[1]
-                if not _session_store.exists(target_sid):
-                    result_text = f"Session 不存在: {target_sid}"
-                else:
-                    result_text = f"Switched to session: {target_sid}"
-                    actions = ["switch_session"]
-                    switch_to = target_sid
-        elif sub == "rename":
-            if len(args) < 3:
-                result_text = "用法: /session rename <sessionId> <title>"
-            else:
-                try:
-                    _session_store.rename(args[1], " ".join(args[2:]))
-                    result_text = f"Renamed session {args[1]}"
-                    actions = ["reload_sessions"]
-                except SessionStoreError as exc:
-                    result_text = f"错误: {exc}"
-        elif sub == "delete":
-            if not args[1:]:
-                result_text = "用法: /session delete <sessionId>"
-            else:
-                target_sid = args[1]
-                if not _session_store.exists(target_sid):
-                    result_text = f"Session 不存在: {target_sid}"
-                else:
-                    try:
-                        _session_store.delete(target_sid)
-                        result_text = f"Deleted session: {target_sid}"
-                        actions = ["reload_sessions"]
-                        if req.session_id == target_sid:
-                            actions.append("switch_session")
-                            summaries = _session_store.list_summaries()
-                            switch_to = summaries[0].session_id if summaries else _session_store.ensure_default_session().session_id
-                    except SessionStoreError as exc:
-                        result_text = f"错误: {exc}"
-        else:
-            result_text = "用法: /session <new|list|switch|rename|delete> ..."
-
-    # ---- /memory -----------------------------------------------------------
-    elif root == "/memory":
-        sub = args[0] if args else ""
-        if sub == "add":
-            prefix = "/memory add "
-            if not req.command.startswith(prefix):
-                result_text = "用法: /memory add <content>"
-            else:
-                content = req.command[len(prefix):].strip()
-                if not content:
-                    result_text = "用法: /memory add <content>"
-                else:
-                    try:
-                        entry = _memory_store.add(content)
-                        result_text = f"Added memory: {entry.memory_id}"
-                    except Exception as exc:
-                        result_text = f"错误: {exc}"
-        elif sub == "list":
-            entries = _memory_store.list()
-            if not entries:
-                result_text = "Memory: (empty)"
-            else:
-                result_text = "Memory:\n" + "\n".join(
-                    f"  {e.memory_id}  {e.content}" for e in entries
-                )
-        elif sub == "delete":
-            if not args[1:]:
-                result_text = "用法: /memory delete <memoryId>"
-            else:
-                try:
-                    _memory_store.delete(args[1])
-                    result_text = f"Deleted memory: {args[1]}"
-                except Exception as exc:
-                    result_text = f"错误: {exc}"
-        else:
-            result_text = "用法: /memory <add|list|delete> ..."
-
-    # ---- /compact ----------------------------------------------------------
-    elif root == "/compact":
-        if not req.session_id or not _session_store.exists(req.session_id):
-            result_text = "没有当前 session，无法压缩"
-        else:
-            from claw.context.compaction import (
-                KEEP_RECENT_MESSAGES_MIN,
-                CompactionError,
-                compact_and_persist,
-            )
-            session = _session_store.get(req.session_id)
-            if len(session.messages) <= KEEP_RECENT_MESSAGES_MIN:
-                result_text = (
-                    f"当前 session 只有 {len(session.messages)} 条消息，"
-                    f"不超过保留窗口（{KEEP_RECENT_MESSAGES_MIN}），无需压缩。"
-                )
-            else:
-                try:
-                    outcome = compact_and_persist(session, _session_store, _compact_llm or _llm_client)
-                    r = outcome.result
-                    result_text = (
-                        f"Compacted session {session.session_id}.\n"
-                        f"Old messages: {r.old_message_count}\n"
-                        f"Recent messages: {r.recent_message_count}\n"
-                        f"Summary:\n{r.summary}"
-                    )
-                    actions = ["reload_messages"]
-                except CompactionError as exc:
-                    result_text = f"错误: {exc}"
-
-        # ---- /cron -------------------------------------------------------------
-    elif root in ("/cron", "/cron"):
-        sub = args[0] if args else "list"
-        if sub == "list":
-            try:
-                jobs = _cron_service.list_jobs(include_disabled=True)
-                if not jobs:
-                    result_text = "暂无定时作业。使用 cron 工具创建。"
-                else:
-                    lines = ["Cron 作业:"]
-                    for j in jobs:
-                        kind = j.payload.kind
-                        protected = " [系统]" if kind == "system_event" else ""
-                        enabled = "" if j.enabled else " [已禁用]"
-                        lines.append(
-                            f"  {j.id} {j.name}{protected}{enabled} "
-                            f"schedule={j.schedule.kind}"
-                        )
-                        if j.state.last_run_at_ms:
-                            lines.append(f"    上次: status={j.state.last_status}")
-                        if j.state.next_run_at_ms:
-                            lines.append(f"    下次: {j.state.next_run_at_ms}")
-                    result_text = "\n".join(lines)
-            except Exception as exc:
-                result_text = f"错误: {exc}"
-        elif sub == "disable":
-            if not args[1:]:
-                result_text = "用法: /cron disable <jobId>"
-            else:
-                job = _cron_service.enable_job(args[1], enabled=False)
-                if job is None:
-                    result_text = f"作业不存在: {args[1]}"
-                else:
-                    result_text = f"已禁用作业: {args[1]}"
-        elif sub == "enable":
-            if not args[1:]:
-                result_text = "用法: /cron enable <jobId>"
-            else:
-                job = _cron_service.enable_job(args[1], enabled=True)
-                if job is None:
-                    result_text = f"作业不存在: {args[1]}"
-                else:
-                    result_text = f"已启用作业: {args[1]}"
-        elif sub == "delete":
-            if not args[1:]:
-                result_text = "用法: /cron delete <jobId>"
-            else:
-                result = _cron_service.remove_job(args[1])
-                if result == "removed":
-                    result_text = f"已删除作业: {args[1]}"
-                elif result == "protected":
-                    result_text = f"无法删除受保护的系统作业: {args[1]}"
-                else:
-                    result_text = f"作业不存在: {args[1]}"
-        elif sub == "status":
-            status = _cron_service.status()
-            result_text = (
-                f"Cron 服务: {'运行中' if status['enabled'] else '已停止'}\n"
-                f"作业数: {status['jobs']}"
-            )
-        else:
-            result_text = "用法: /cron <list|status|disable|enable|delete> ..."
+    if root == "/session" and args and args[0] == "new":
+        actions = ["reload_sessions", "switch_session"]
+        session = _session_store.list_summaries()
+        if session:
+            switch_to = session[0].session_id
+    elif root == "/session" and args and args[0] in ("list", "rename", "delete"):
         actions = ["reload_sessions"]
-    # ---- /workspace (Step 8) -----------------------------------------------
-    elif root == "/workspace":
-        sub = args[0] if args else ""
-        if sub == "set":
-            path_str = " ".join(args[1:]) if args[1:] else ""
-            if not path_str:
-                result_text = "用法: /workspace set <路径>"
-            else:
-                try:
-                    resolved = _workspace_manager.set(sid, path_str)
-                    result_text = f"Workspace 已设置为: {resolved}"
-                    actions = ["reload_workspace"]
-                except WorkspaceError as exc:
-                    result_text = f"错误: {exc}"
-        elif sub == "show":
-            ws = _workspace_manager.get(sid)
-            if ws is None:
-                result_text = "当前 session 未设置 workspace。使用 /workspace set <路径> 来设置。"
-            else:
-                result_text = f"当前 workspace: {ws}"
-            actions = ["reload_workspace"]
-        elif sub == "unset":
-            _workspace_manager.unset(sid)
-            result_text = "Workspace 已取消设置。"
-            actions = ["reload_workspace"]
-        else:
-            result_text = "用法: /workspace <set|show|unset> ..."
-
-    # ---- /approvals --------------------------------------------------------
-    elif root == "/approvals":
-        pending = _approval_manager.get_pending()
-        if not pending:
-            result_text = "当前没有待审批的操作。"
-        else:
-            lines = ["待审批操作:"]
-            for r in pending:
-                args_safe = {
-                    k: (v[:80] + "..." if isinstance(v, str) and len(v) > 80 else v)
-                    for k, v in r.tool_args.items()
-                }
-                lines.append(
-                    f"  [{r.approval_id}] {r.tool_name} session={r.session_id}"
-                )
-                lines.append(f"    参数: {args_safe}")
-            lines.append("使用 /approve <id> 批准，/reject <id> [原因] 拒绝。")
-            result_text = "\n".join(lines)
-
-    # ---- /approve ----------------------------------------------------------
-    elif root == "/approve":
-        approval_id = args[0] if args else ""
-        if not approval_id:
-            pending = _approval_manager.get_pending()
-            if len(pending) == 1:
-                approval_id = pending[0].approval_id
-            else:
-                result_text = "用法: /approve <approvalId>"
-        if approval_id:
-            r = _approval_manager.approve(approval_id)
-            if r is None:
-                result_text = f"未找到审批请求: {approval_id}"
-            else:
-                result_text = f"已批准: [{r.approval_id}] {r.tool_name}"
-
-    # ---- /reject -----------------------------------------------------------
-    elif root == "/reject":
-        approval_id = args[0] if args else ""
-        if not approval_id:
-            pending = _approval_manager.get_pending()
-            if len(pending) == 1:
-                approval_id = pending[0].approval_id
-            else:
-                result_text = "用法: /reject <approvalId> [原因]"
-        if approval_id:
-            reason = " ".join(args[1:]) if len(args) > 1 else ""
-            r = _approval_manager.reject(approval_id, reason)
-            if r is None:
-                result_text = f"未找到审批请求: {approval_id}"
-            else:
-                reason_text = f"原因: {reason}" if reason else "未提供原因"
-                result_text = f"已拒绝: [{r.approval_id}] {r.tool_name} ({reason_text})"
-
-    # ---- /skill (Step 9) -------------------------------------------------
-    elif root == "/skill":
-        sub = args[0] if args else ""
-        if sub == "list":
-            skills = _skill_registry.list_skills()
-            if not skills:
-                result_text = "Skills: (empty)"
-            else:
-                lines = ["Skills:"]
-                for s in skills:
-                    lines.append(f"  {s.name}")
-                    lines.append(f"    {s.description}")
-                result_text = "\n".join(lines)
-        elif sub == "show":
-            if not args[1:]:
-                result_text = "用法: /skill show <skill-name>"
-            else:
-                skill = _skill_registry.get_skill(args[1])
-                if skill is None:
-                    result_text = f"未找到 skill: \"{args[1]}\""
-                else:
-                    lines = [
-                        f"Skill: {skill.name}",
-                        f"描述: {skill.description}",
-                        "",
-                        "使用说明:",
-                        skill.instructions[:1500],
-                    ]
-                    result_text = "\n".join(lines)
-        elif sub == "usage":
-            if not req.session_id:
-                result_text = "没有当前 session"
-            else:
-                session = _session_store.get(req.session_id)
-                records = session.skill_usage
-                if not records:
-                    result_text = "当前 session 暂无 skill 使用记录。"
-                else:
-                    lines = ["Skill 使用记录:"]
-                    for i, r in enumerate(records, 1):
-                        src = "显式调用" if r.get("source") == "explicit" else "模型自主"
-                        lines.append(
-                            f"  [{i}] {r.get('skillName','?')} | {src} | {r.get('usedAt','?')}"
-                        )
-                    result_text = "\n".join(lines)
-        else:
-            result_text = "用法: /skill <list|show|usage|<skill-name> <task>> ..."
-
-    # ---- /exit (web: just clear session state) ----------------------------
-    # ---- /reflect -----------------------------------------------------------
-    elif root == "/reflect":
-        sub = args[0] if args else ""
-        if sub == "status":
-            config = _reflection_mgr.get_config()
-            last_run = config.get("lastRunAt") or "从未"
-            history = config.get("runHistory", [])
-            last_result = ""
-            if history:
-                last = history[-1]
-                last_result = (
-                    f" | 上次: {last.get('runAt','?')} "
-                    f"检查 {last.get('sessionsReviewed',0)} session "
-                    f"提取 {last.get('factsExtracted',0)} 条"
-                )
-            result_text = (
-                f"每日反思: {'✅ 启用' if config.get('enabled') else '❌ 禁用'} "
-                f"| 时间: {config.get('time','?')} "
-                f"| 上次执行: {last_run}{last_result}"
-            )
-        elif sub == "enable":
-            _reflection_mgr.update_config(enabled=True)
-            result_text = "✅ 每日记忆反思已启用。"
-        elif sub == "disable":
-            _reflection_mgr.update_config(enabled=False)
-            result_text = "❌ 每日记忆反思已禁用。"
-        elif sub == "time":
-            if len(args) >= 2:
-                _reflection_mgr.update_config(time=args[1])
-                result_text = f"反思时间已设置为 {args[1]}。"
-            else:
-                result_text = "用法: /reflect time <HH:MM>"
-        elif sub == "now":
-            result = _reflection_mgr.run_now()
-            if result.get("ok"):
-                result_text = (
-                    f"即时反思完成。检查了 {result.get('sessionsReviewed', 0)} session，"
-                    f"提取了 {result.get('factsExtracted', 0)} 条记忆。"
-                )
-            else:
-                result_text = f"反思失败: {result.get('error', '未知错误')}"
-        else:
-            result_text = "用法: /reflect <status|enable|disable|time|now>"
-
+    elif root in ("/workspace", "/cron"):
+        actions = ["reload_sessions"]
+    elif root == "/pet" and (not args or args[0] in ("settings", "config")):
+        actions = ["open_pet_settings"]
     elif root == "/exit":
-        result_text = "bye."
         actions = ["clear_session"]
-
     elif root == "/auto":
-        sub = args[0] if args else "toggle"
-        current = _auto_mode.get(sid, False)
-        if sub in ("on", "enable", "1"):
-            _auto_mode[sid] = True
-            result_text = "AUTO 模式已开启。Agent 在 workspace 内的写操作和 shell 命令将自动执行，无需逐一审批。"
-        elif sub in ("off", "disable", "0"):
-            _auto_mode[sid] = False
-            result_text = "AUTO 模式已关闭。Agent 的写操作和 shell 命令恢复审批。"
-        else:  # toggle
-            _auto_mode[sid] = not current
-            state_text = "开启" if _auto_mode[sid] else "关闭"
-            result_text = f"AUTO 模式已{state_text}。"
         actions = ["reload_auto_mode"]
-
-    elif root == "/help":
-        result_text = (
-            "SJTUClaw 可用指令：\n\n"
-            "  /help                    显示此帮助信息\n"
-            "  /session <sub> ...       会话管理\n"
-            "    new                      创建新会话\n"
-            "    list                     列出所有会话\n"
-            "    switch <id>              切换到指定会话\n"
-            "    rename <id> <title>      重命名会话\n"
-            "    delete <id>              删除会话\n"
-            "  /memory <sub> ...        长期记忆管理\n"
-            "    add <内容>               添加记忆\n"
-            "    list [--category <类别>] 列出记忆\n"
-            "    search <关键词>          搜索记忆\n"
-            "    delete <memoryId>        删除记忆\n"
-            "    stats                    记忆统计\n"
-            "  /compact                 手动压缩当前会话历史\n"
-            "  /workspace <sub> ...     工作区路径管理\n"
-            "    set <路径>               设置工作区路径\n"
-            "    show                     查看当前工作区\n"
-            "    unset                    取消工作区设置\n"
-            "  /cron <sub> ...          定时作业管理 (nanobot 兼容)\n"
-            "    list                     列出所有作业\n"
-            "    status                   服务状态\n"
-            "    delete <taskId>          删除已完成任务\n"
-            "  /skill <sub> ...         Skill 管理\n"
-            "    list                     列出可用 Skills\n"
-            "    show <name>              查看 Skill 详情\n"
-            "    usage                    查看使用记录\n"
-            "    <name> <任务描述>        使用指定 Skill 执行任务\n"
-            "  /approvals               查看待审批操作\n"
-            "  /approve [approvalId]    批准操作\n"
-            "  /reject [approvalId]     拒绝操作\n"
-            "  /reflect <sub> ...       每日记忆反思\n"
-            "    status                   查看反思状态\n"
-            "    enable/disable           启用/禁用\n"
-            "    time <HH:MM>             设置执行时间\n"
-            "    now                      立即执行\n"
-            "  /auto [on|off]          AUTO 模式：开启后 workspace 内操作自动批准\n"
-            "  /exit                    退出当前会话\n\n"
-            "在 Web UI 中也可以直接发送消息，Agent 会自动处理。"
-        )
-
-    else:
-        result_text = f"未知命令: {root}（输入 /help 查看可用指令）"
+    elif root == "/compact":
+        actions = ["reload_messages"]
+    elif root == "/unlimited":
+        actions = ["reload_unlimited_mode"]
 
     resp: dict = {
         "ok": True,
         "type": "command",
+        "format": "markdown",
         "result": result_text,
         "actions": actions,
+        "autoMode": _auto_mode.get(sid, False),
+        "unlimitedMode": _workspace_manager.is_unlimited(sid),
     }
     if switch_to:
         resp["switchToSessionId"] = switch_to
@@ -989,8 +1035,10 @@ def get_messages(session_id: str):
     return {
         "ok": True,
         "sessionId": session_id,
-        "messages": [{"role": m.role, "content": m.content} for m in session.messages],
+        "messages": visible_session_messages(session),
         "summary": session.summary,
+        "autoMode": _auto_mode.get(session_id, False),
+        "unlimitedMode": _workspace_manager.is_unlimited(session_id),
     }
 
 
@@ -1146,6 +1194,159 @@ def reject_request(approval_id: str, body: RejectRequest | None = None):
     return {"ok": True, "approval": req.to_dict()}
 
 
+# -- Desktop pet -------------------------------------------------------------
+
+class PetSettingsRequest(BaseModel):
+    enabled: bool | None = None
+    selected_pet_id: str | None = Field(default=None, alias="selectedPetId")
+    launch_on_gateway_start: bool | None = Field(
+        default=None, alias="launchOnGatewayStart"
+    )
+
+
+class PetPositionRequest(BaseModel):
+    x: int
+    y: int
+
+
+def _public_pet(pet: dict[str, Any] | None) -> dict[str, Any] | None:
+    if pet is None:
+        return None
+    result = {key: value for key, value in pet.items() if key != "spritesheetPath"}
+    result["spritesheetUrl"] = f"/pet/pets/{pet['id']}/spritesheet"
+    return result
+
+
+@app.get("/pet/settings")
+def get_pet_settings():
+    settings = _pet_catalog.load_settings()
+    return {
+        "ok": True,
+        "settings": settings.to_dict(),
+        "running": _pet_process.running,
+    }
+
+
+@app.put("/pet/settings")
+def update_pet_settings(req: PetSettingsRequest):
+    before = _pet_catalog.load_settings()
+    try:
+        settings = _pet_catalog.update_settings(
+            enabled=req.enabled,
+            selected_pet_id=req.selected_pet_id,
+            launch_on_gateway_start=req.launch_on_gateway_start,
+        )
+    except PetCatalogError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    selected_changed = settings.selected_pet_id != before.selected_pet_id
+    if not settings.enabled:
+        _pet_process.stop()
+    elif selected_changed:
+        _pet_process.stop()
+        _pet_process.start()
+    elif not _pet_process.running:
+        _pet_process.start()
+    return {
+        "ok": True,
+        "settings": settings.to_dict(),
+        "running": _pet_process.running,
+    }
+
+
+@app.get("/pet/pets")
+def list_pets():
+    return {"ok": True, "pets": [_public_pet(pet) for pet in _pet_catalog.list_pets()]}
+
+
+@app.get("/pet/pets/{pet_id}/spritesheet")
+def get_pet_spritesheet(pet_id: str):
+    pet = _pet_catalog.get_pet(pet_id)
+    if pet is None:
+        raise HTTPException(status_code=404, detail=f"宠物不存在: {pet_id}")
+    return FileResponse(pet["spritesheetPath"])
+
+
+@app.post("/pet/pets")
+async def install_pet(
+    spritesheet: UploadFile = File(...),
+    pet_id: str = Form(..., alias="petId"),
+    display_name: str = Form(..., alias="displayName"),
+    description: str = Form(""),
+    sprite_version_number: int | None = Form(None, alias="spriteVersionNumber"),
+):
+    try:
+        pet = _pet_catalog.install(
+            pet_id=pet_id,
+            display_name=display_name,
+            description=description,
+            spritesheet=spritesheet.file,
+            filename=spritesheet.filename or "spritesheet.webp",
+            sprite_version_number=sprite_version_number,
+        )
+    except PetCatalogError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    finally:
+        await spritesheet.close()
+    return {"ok": True, "pet": _public_pet(pet)}
+
+
+@app.delete("/pet/pets/{pet_id}")
+def delete_pet(pet_id: str):
+    selected = _pet_catalog.load_settings().selected_pet_id == pet_id
+    try:
+        _pet_catalog.remove(pet_id)
+    except PetCatalogError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if selected and _pet_process.running:
+        _pet_process.stop()
+        _pet_process.start()
+    return {"ok": True}
+
+
+@app.post("/pet/open")
+def open_pet():
+    settings = _pet_catalog.update_settings(enabled=True)
+    _pet_process.start()
+    return {"ok": True, "settings": settings.to_dict(), "running": _pet_process.running}
+
+
+@app.post("/pet/close")
+def close_pet():
+    settings = _pet_catalog.update_settings(enabled=False)
+    _pet_process.stop()
+    return {"ok": True, "settings": settings.to_dict(), "running": False}
+
+
+@app.get("/pet/state")
+def get_pet_state():
+    settings = _pet_catalog.load_settings()
+    selected = _pet_catalog.get_pet(settings.selected_pet_id)
+    return {
+        "ok": True,
+        "state": _pet_state.snapshot(),
+        "approvals": [request.to_dict() for request in _approval_manager.get_pending()],
+        "selectedPet": _public_pet(selected),
+        "settings": settings.to_dict(),
+    }
+
+
+@app.post("/pet/runtime/position")
+def save_pet_position(req: PetPositionRequest):
+    settings = _pet_catalog.update_settings(
+        position_x=req.x,
+        position_y=req.y,
+        update_position=True,
+    )
+    return {"ok": True, "position": settings.to_dict()["position"]}
+
+
+@app.post("/pet/runtime/closed")
+def pet_runtime_closed():
+    settings = _pet_catalog.update_settings(enabled=False)
+    return {"ok": True, "settings": settings.to_dict()}
+
+
 # -- Download ----------------------------------------------------------------
 
 @app.get("/downloads")
@@ -1186,51 +1387,38 @@ def serve_download(download_id: str):
 
 
 @app.get("/skills")
-def list_skills_endpoint():
-    """List all available skills (lightweight index)."""
-    skills = _skill_registry.list_skills()
+def list_skills():
+    """List all available skills."""
+    skills = _skill_registry.list_skills(filter_unavailable=False)
     return {
         "ok": True,
         "skills": [
             {
                 "name": s.name,
                 "description": s.description,
-                "hasAssets": len(s.assets) > 0,
-                "hasReferences": len(s.references) > 0,
+                "hasAssets": bool(s.assets),
+                "hasReferences": bool(s.references),
             }
             for s in skills
         ],
     }
 
 
-@app.get("/skills/{skill_name}")
-def get_skill_detail(skill_name: str):
-    """Get full details of a specific skill."""
-    skill = _skill_registry.get_skill(skill_name)
+@app.get("/skills/{name}")
+def get_skill_detail(name: str):
+    """Get full details for a single skill."""
+    skill = _skill_registry.get_skill(name)
     if skill is None:
-        raise HTTPException(status_code=404, detail=f"Skill 不存在: {skill_name}")
+        raise HTTPException(status_code=404, detail=f"Skill not found: {name}")
     return {
         "ok": True,
         "skill": {
             "name": skill.name,
             "description": skill.description,
             "instructions": skill.instructions,
-            "assets": [str(a.relative_to(skill.directory)) for a in skill.assets],
-            "references": [str(r.relative_to(skill.directory)) for r in skill.references],
+            "assets": [str(p) for p in skill.assets],
+            "references": [str(p) for p in skill.references],
         },
-    }
-
-
-@app.get("/sessions/{session_id}/skill-usage")
-def get_skill_usage(session_id: str):
-    """Get skill usage records for a session."""
-    if not _session_store.exists(session_id):
-        raise HTTPException(status_code=404, detail=f"Session 不存在: {session_id}")
-    session = _session_store.get(session_id)
-    return {
-        "ok": True,
-        "sessionId": session_id,
-        "records": session.skill_usage,
     }
 
 
@@ -1287,6 +1475,10 @@ def delete_session(session_id: str):
     if not _session_store.exists(session_id):
         raise HTTPException(status_code=404, detail=f"Session 不存在: {session_id}")
     _session_store.delete(session_id)
+    # Clean up workspace binding and unlimited mode
+    _workspace_manager.unset(session_id)
+    _workspace_manager.set_unlimited(session_id, False)
+    # Clean up attachments directory
     att_dir = _attachments_dir(session_id)
     if att_dir.exists():
         shutil.rmtree(str(att_dir), ignore_errors=True)
@@ -1449,7 +1641,7 @@ def _write_prompt_file(filename: str, content: str) -> None:
 
 
 # ==========================================================================
-# Cron management (nanobot-compatible)
+# Cron management
 # ==========================================================================
 
 
@@ -1468,14 +1660,14 @@ def create_cron_job(req: CreateCronJobRequest):
     """Create a new cron job."""
     from zoneinfo import ZoneInfo
 
-    from claw.cron.types import CronSchedule
+    from claw.scheduler.types import CronSchedule
 
     # Build schedule
     delete_after = False
     if req.every_seconds:
         schedule = CronSchedule(kind="every", every_ms=req.every_seconds * 1000)
     elif req.cron_expr:
-        effective_tz = req.tz or "UTC"
+        effective_tz = req.tz or "Asia/Shanghai"
         try:
             ZoneInfo(effective_tz)
         except Exception:
@@ -1490,7 +1682,7 @@ def create_cron_job(req: CreateCronJobRequest):
                 detail=f"无效的 ISO 日期时间格式: {req.at}",
             )
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=ZoneInfo("UTC"))
+            dt = dt.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
         at_ms = int(dt.timestamp() * 1000)
         schedule = CronSchedule(kind="at", at_ms=at_ms)
         delete_after = True
@@ -1613,6 +1805,181 @@ def _cron_job_to_dict(job) -> dict:
         "createdAtMs": job.created_at_ms,
         "updatedAtMs": job.updated_at_ms,
     }
+
+
+# ==========================================================================
+# QQ channel status endpoint
+# ==========================================================================
+
+
+@app.get("/qq/status")
+def qq_status():
+    """Get QQ channel status."""
+    global _qq_channel
+    if _qq_channel is None:
+        return {
+            "ok": True,
+            "enabled": False,
+            "running": False,
+            "message": "QQ 通道未启用。在 .env 中设置 QQ_ENABLED=true 并配置 QQ_APP_ID / QQ_APP_SECRET。",
+        }
+    return {
+        "ok": True,
+        "enabled": True,
+        "running": _qq_channel.is_running,
+        "config": _qq_channel.config.to_dict(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# SSE streaming chat endpoint — real-time tool call visibility
+# ---------------------------------------------------------------------------
+
+
+def _event_to_sse(event: TurnEvent) -> str:
+    """Serialize a TurnEvent to an SSE data line."""
+    data = {"type": type(event).__name__}
+    for field_name, value in event.__dict__.items():
+        if value is not None and value != "" and value != [] and value != {}:
+            data[field_name] = value
+    return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+@app.post("/chat/stream")
+async def handle_chat_stream(req: ChatRequest):
+    """Send a user message and stream agent turn events via SSE.
+
+    Events emitted:
+      - ``ThinkingEvent`` — LLM is processing (iteration number)
+      - ``ToolCallStartEvent`` — tool execution begins (name, args, call_id)
+      - ``ToolCallEndEvent`` — tool execution completes (ok, result, error, duration_ms)
+      - ``FinalEvent`` — agent turn complete with final reply
+      - ``ErrorEvent`` — non-fatal error during turn
+    """
+    # Resolve session
+    if req.session_id:
+        if not _session_store.exists(req.session_id):
+            raise HTTPException(
+                status_code=404,
+                detail=f"Session 不存在: {req.session_id}",
+            )
+        sid = req.session_id
+    else:
+        session = _session_store.create_session()
+        sid = session.session_id
+
+    # Same fail-safe as /chat: recognized commands are executed locally and
+    # represented as a short SSE response without starting an agent turn.
+    command = req.message.strip()
+    if _is_slash_command(command):
+        result_text = _execute_slash_command(command, sid)
+
+        async def _command_events():
+            yield _event_to_sse(FinalEvent(content=result_text))
+            yield f"data: {json.dumps({'type': '_session_info', 'sessionId': sid, 'autoMode': _auto_mode.get(sid, False), 'unlimitedMode': _workspace_manager.is_unlimited(sid)}, ensure_ascii=False)}\n\n"
+            yield "data: {\"type\": \"_done\"}\n\n"
+
+        return StreamingResponse(
+            _command_events(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    # Per-session event queue (thread-safe)
+    event_queue: queue.Queue = queue.Queue()
+    done = threading.Event()
+
+    def _event_callback(event: TurnEvent) -> None:
+        _pet_state.handle_event(sid, event)
+        event_queue.put(event)
+
+    def _run_turn() -> None:
+        """Run the agent turn in a background thread, emitting events."""
+        _set_turn_session_id(sid)
+        _update_cron_context(sid, req.session_id or "default")
+        _pet_state.start_turn(sid, req.message)
+        try:
+            reply = run_agent_turn(
+                sid,
+                req.message,
+                session_store=_session_store,
+                context_builder=_context_builder,
+                tool_registry=_tool_registry,
+                llm_client=_llm_client,
+                approval_handler=_gateway_approval_handler,
+                compaction_worker=_compaction_worker,
+                auto_mode=_auto_mode.get(sid, False),
+                unlimited_mode=_workspace_manager.is_unlimited(sid),
+                event_callback=_event_callback,
+            )
+            # The FinalEvent is emitted inside run_agent_turn, but we
+            # also send a session_id + autoMode info event
+            event_queue.put({"type": "_session_info", "sessionId": sid, "autoMode": _auto_mode.get(sid, False), "unlimitedMode": _workspace_manager.is_unlimited(sid)})
+
+            # Auto-title
+            try:
+                session_obj = _session_store.get(sid)
+                msgs = [{"role": m.role, "content": m.content} for m in session_obj.messages]
+                new_title = auto_title_if_first_turn(sid, msgs, _session_store, _llm_client)
+                if new_title:
+                    event_queue.put({"type": "_title", "title": new_title})
+            except Exception:
+                pass
+        except Exception as exc:
+            _pet_state.finish_turn(sid, failed=True)
+            logger.exception("流式 Agent turn 异常: session=%s", sid)
+            fallback = _persist_agent_fallback(
+                sid, "抱歉，Agent 在执行工具时意外中止。已保留现有进度，请重试。"
+            )
+            event_queue.put(ErrorEvent(error=f"Agent turn 异常: {exc}"))
+            event_queue.put(FinalEvent(content=fallback))
+        finally:
+            _set_turn_session_id(None)
+            done.set()
+            event_queue.put(None)  # sentinel
+
+    # Run the agent turn in a thread
+    loop = asyncio.get_running_loop()
+    thread = threading.Thread(target=_run_turn, daemon=True)
+    thread.start()
+
+    async def _event_generator():
+        """Yield SSE events from the queue until done."""
+        while True:
+            # Non-blocking check of the queue
+            try:
+                event = await loop.run_in_executor(None, lambda: event_queue.get(timeout=0.1))
+            except queue.Empty:
+                if done.is_set():
+                    break
+                # Send a keepalive comment to prevent proxy timeout
+                yield ": keepalive\n\n"
+                continue
+
+            if event is None:  # sentinel
+                break
+
+            if isinstance(event, dict):
+                # Internal info events
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+            else:
+                yield _event_to_sse(event)
+
+        yield "data: {\"type\": \"_done\"}\n\n"
+
+    return StreamingResponse(
+        _event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # disable nginx buffering
+        },
+    )
 
 
 # ---------------------------------------------------------------------------

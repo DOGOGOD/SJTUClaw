@@ -19,6 +19,7 @@ import webbrowser
 import uvicorn
 
 from claw.config import PROJECT_ROOT
+from claw.utils import force_utf8_stdio
 
 
 def _webui_exists() -> bool:
@@ -28,6 +29,7 @@ def _webui_exists() -> bool:
 
 
 def main() -> int:
+    force_utf8_stdio()
     host = os.getenv("GATEWAY_HOST", "127.0.0.1")
     port_str = os.getenv("GATEWAY_PORT", "8000")
     try:
@@ -39,7 +41,7 @@ def main() -> int:
     url = f"http://{host}:{port}"
 
     print("=" * 56)
-    print("  🦞  SJTUClaw Gateway")
+    print("  🐾  SJTUClaw Gateway")
     print("=" * 56)
     print(f"  地址: {url}")
     if _webui_exists():

@@ -53,6 +53,16 @@ _SAFETY_BUFFER = 1024  # extra headroom for tokenizer estimation drift
 _ARCHIVE_SUMMARY_MAX_CHARS = 8000
 _RAW_ARCHIVE_MAX_CHARS = 16000
 
+# Tool output pruning: replace large tool results with a placeholder
+# before sending to the LLM summarizer (cheap pre-pass).
+_PRUNED_TOOL_PLACEHOLDER = "[旧工具输出已清除以节省上下文空间]"
+_TOOL_RESULT_PRUNE_THRESHOLD = 500  # chars — prune tool results longer than this
+
+# Summary failure cooldown: after a failure, wait this long before
+# attempting compaction again (prevents tight retry loops).
+_SUMMARY_FAILURE_COOLDOWN_S = 600  # 10 minutes
+_last_compaction_failure_ts: float = 0.0  # module-level cooldown tracker
+
 # ---------------------------------------------------------------------------
 # Compaction system instruction
 # ---------------------------------------------------------------------------
@@ -72,8 +82,18 @@ _COMPACTION_SYSTEM_INSTRUCTION = (
     "- 重复表达\n"
     "- 无关细节\n"
     "- 没有继续使用价值的中间过程\n\n"
-    "不需要固定格式，但必须简洁、可读，适合直接作为后续对话的上下文。"
-    "只输出摘要正文本身，不要输出多余的说明、标题或前后缀。"
+    "请使用以下结构化格式输出摘要（如果某部分没有内容则省略该部分）：\n\n"
+    "## 当前任务\n"
+    "（简述当前正在进行的主要任务，1-2 句话）\n\n"
+    "## 已完成\n"
+    "（列出已完成的步骤和结果，用要点格式）\n\n"
+    "## 待解决\n"
+    "（列出尚未解决的问题和待办事项）\n\n"
+    "## 关键事实\n"
+    "（影响后续决策的关键信息：用户偏好、约束条件、重要发现）\n\n"
+    "## 相关文件\n"
+    "（提到过的文件路径，用于上下文连续性）\n\n"
+    "只输出摘要正文本身，不要输出多余的说明或前后缀。"
 )
 
 
@@ -178,7 +198,18 @@ def needs_compaction(
 
     Both triggers are gated by ``KEEP_RECENT_MESSAGES_MIN`` — a session
     with very few messages is never compacted, regardless of token count.
+
+    A **failure cooldown** prevents retrying compaction too quickly
+    after a recent LLM summarization failure.
     """
+    # Cooldown check: skip if we recently failed
+    global _last_compaction_failure_ts
+    if _last_compaction_failure_ts > 0:
+        import time as _time
+        elapsed = _time.time() - _last_compaction_failure_ts
+        if elapsed < _SUMMARY_FAILURE_COOLDOWN_S:
+            return False
+
     unconsolidated = session.get_unconsolidated_messages()
     if len(unconsolidated) <= KEEP_RECENT_MESSAGES_MIN:
         return False
@@ -583,7 +614,20 @@ def _build_compaction_request(
     else:
         summary_block = "已有摘要：（无）"
 
-    transcript_lines = [f"{m.role}: {m.content}" for m in old_messages]
+    # Tool output pruning: replace large tool
+    # results with a placeholder before sending to the summarizer.
+    # This is a cheap pre-pass that dramatically reduces token cost
+    # without losing the structural context of the conversation.
+    transcript_lines: list[str] = []
+    for m in old_messages:
+        content = m.content
+        if (
+            m.role == "tool"
+            and len(content) > _TOOL_RESULT_PRUNE_THRESHOLD
+        ):
+            content = _PRUNED_TOOL_PLACEHOLDER
+        transcript_lines.append(f"{m.role}: {content}")
+
     transcript_block = "需要合并进摘要的较早对话：\n" + "\n".join(transcript_lines)
 
     user_content = f"{summary_block}\n\n{transcript_block}"
@@ -608,10 +652,20 @@ def _llm_archive(
 ) -> str:
     """Call the LLM to produce a summary of *messages*, merged with
     *existing_summary*."""
-    formatted = "\n".join(
-        f"[{m.role}] {m.content[:500]}{'...' if len(m.content) > 500 else ''}"
-        for m in messages
-    )
+    global _last_compaction_failure_ts
+    import time as _time
+
+    # Tool output pruning: replace large tool results with placeholder
+    formatted_parts: list[str] = []
+    for m in messages:
+        content = m.content
+        if m.role == "tool" and len(content) > _TOOL_RESULT_PRUNE_THRESHOLD:
+            content = _PRUNED_TOOL_PLACEHOLDER
+        else:
+            content = f"{content[:500]}{'...' if len(content) > 500 else ''}"
+        formatted_parts.append(f"[{m.role}] {content}")
+
+    formatted = "\n".join(formatted_parts)
     # Truncate to a reasonable size for the LLM call
     if len(formatted) > _ARCHIVE_SUMMARY_MAX_CHARS * 2:
         formatted = formatted[:_ARCHIVE_SUMMARY_MAX_CHARS * 2]
@@ -624,10 +678,13 @@ def _llm_archive(
             {"role": "user", "content": f"{existing_block}\n\n对话内容：\n{formatted}"},
         ])
     except LLMError as exc:
+        # Record failure timestamp for cooldown tracking
+        _last_compaction_failure_ts = _time.time()
         raise CompactionError(f"LLM 调用失败: {exc}") from exc
 
     result = (response or "").strip()
     if not result:
+        _last_compaction_failure_ts = _time.time()
         raise CompactionError("LLM 返回的摘要为空")
 
     return result

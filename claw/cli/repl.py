@@ -12,9 +12,9 @@ from claw.approval.manager import ApprovalManager, ApprovalRequest
 from claw.cli.commands import RuntimeState, handle_command, is_command
 from claw.context.builder import ContextBuilder
 from claw.llm.client import LLMClient, LLMError
-from claw.memory.history_log import HistoryLog
 from claw.memory.store import MemoryStore
 from claw.session.store import SessionStore
+from claw.session.title import auto_title_if_first_turn
 from claw.tools.base import ToolRegistry
 from claw.tools import register_all_tools
 from claw.workspace.manager import WorkspaceManager
@@ -36,8 +36,9 @@ def run_repl(
     reflection_manager=None,
     compaction_worker=None,
     llm_config=None,
-    history_log: HistoryLog | None = None,
     cron_service=None,
+    pet_catalog=None,
+    pet_process=None,
 ) -> None:
     """Run the interactive multi-turn conversation loop."""
     initial_session = session_store.ensure_default_session()
@@ -49,41 +50,32 @@ def run_repl(
         workspace_manager=workspace_manager,
         approval_manager=approval_manager,
         tool_registry=tool_registry,
-        skill_registry=skill_registry,
         reflection_manager=reflection_manager,
         compaction_worker=compaction_worker,
         llm_config=llm_config,
-        history_log=history_log,
         cron_service=cron_service,
+        pet_catalog=pet_catalog,
+        pet_process=pet_process,
     )
 
     # Register advanced tools with the current session id provider
     if workspace_manager is not None:
-        from claw.tools.base import ToolRegistry as TR
-
-        fresh_registry = TR()
+        fresh_registry = ToolRegistry()
         register_all_tools(
             fresh_registry,
             workspace_manager=workspace_manager,
             session_id_provider=lambda: state.current_session_id,
-            sessions_dir=session_store._sessions_dir,
+            sessions_dir=session_store.sessions_dir,
             include_skill_tool=skill_registry is not None,
+            skill_registry=skill_registry,
             include_memory_tools=True,
             memory_store=memory_store,
         )
-        tool_registry._tools.clear()
+        tool_registry.clear()
         for name in fresh_registry.list_tool_names():
-            tool_registry.register(fresh_registry._tools[name])
-    elif skill_registry is not None:
-        # Register use_skill tool even without workspace
-        from claw.tools.skills import create_use_skill_tool
+            tool_registry.register(fresh_registry.get_tool(name))
 
-        try:
-            tool_registry.register(create_use_skill_tool())
-        except Exception:
-            pass
-
-    # Register memory tools regardless of workspace (they don't depend on it)
+    # Register memory + cron + skill tools when workspace not available
     if workspace_manager is None:
         from claw.tools.memory_tools import create_recall_tool, create_remember_tool
 
@@ -98,7 +90,25 @@ def run_repl(
         except Exception:
             pass
 
-    # Register cron tool if available (nanobot-compatible)
+        # Skill tools
+        if skill_registry is not None:
+            from claw.tools.skills_tool import create_skills_list_tool, create_skill_view_tool
+            from claw.tools.skill_manager_tool import create_skill_manage_tool
+
+            try:
+                tool_registry.register(create_skills_list_tool(skill_registry))
+            except Exception:
+                pass
+            try:
+                tool_registry.register(create_skill_view_tool(skill_registry))
+            except Exception:
+                pass
+            try:
+                tool_registry.register(create_skill_manage_tool(skill_registry))
+            except Exception:
+                pass
+
+    # Register cron tool if available
     if cron_service is not None:
         from claw.tools.cron_tool import CronTool
 
@@ -110,17 +120,12 @@ def run_repl(
         )
         tool_registry.register(cron_tool)
 
-    # Update context builder with skill registry
-    if skill_registry is not None:
-        context_builder.set_skill_registry(skill_registry)
-
     # Build the approval handler for CLI
     def _cli_approval_handler(req: ApprovalRequest) -> ApprovalRequest:
         if approval_manager is None:
             return req
 
-        approval_manager._requests[req.approval_id] = req
-        approval_manager._events[req.approval_id] = __import__("threading").Event()
+        approval_manager.register(req)
 
         args_safe = {
             k: (v[:200] + "..." if isinstance(v, str) and len(v) > 200 else v)
@@ -185,18 +190,7 @@ def run_repl(
             break
 
         if is_command(user_input):
-            result = handle_command(user_input, state)
-
-            # Check for skill invocation sentinel
-            if result.startswith("__SKILL_INVOKE__|"):
-                _, skill_name, task = result.split("|", 2)
-                _handle_skill_invoke(
-                    skill_name, task, state, client,
-                    context_builder, tool_registry,
-                    _cli_approval_handler if approval_manager else None,
-                )
-            else:
-                print(result)
+            print(handle_command(user_input, state))
             print()
             continue
 
@@ -207,7 +201,6 @@ def run_repl(
             context_builder,
             tool_registry,
             approval_handler=_cli_approval_handler if approval_manager else None,
-            skill_registry=skill_registry,
         )
 
     # -- Cleanup -----------------------------------------------------------
@@ -218,45 +211,6 @@ def run_repl(
     _print_goodbye()
 
 
-def _handle_skill_invoke(
-    skill_name: str,
-    task: str,
-    state: RuntimeState,
-    client: LLMClient,
-    context_builder: ContextBuilder,
-    tool_registry: ToolRegistry,
-    approval_handler,
-) -> None:
-    """Handle explicit /skill <name> <task> invocation."""
-    print(f"[skill] 显式调用 skill: {skill_name}")
-    print(f"  任务: {task[:200]}{'...' if len(task) > 200 else ''}")
-    print()
-
-    try:
-        reply = run_agent_turn(
-            state.current_session_id,
-            task,
-            session_store=state.session_store,
-            context_builder=context_builder,
-            tool_registry=tool_registry,
-            llm_client=client,
-            approval_handler=approval_handler,
-            skill_registry=state.skill_registry,
-            skill_source="explicit",
-            skill_name=skill_name,
-            compaction_worker=state.compaction_worker,
-            llm_config=state.llm_config,
-        )
-    except LLMError as exc:
-        _print_error(exc)
-        return
-
-    if reply:
-        _print_assistant_reply(reply)
-
-    print()
-
-
 def _handle_chat_turn(
     user_input: str,
     state: RuntimeState,
@@ -265,7 +219,6 @@ def _handle_chat_turn(
     tool_registry: ToolRegistry,
     *,
     approval_handler=None,
-    skill_registry=None,
 ) -> None:
     """Process one user message through the unified agent loop."""
     try:
@@ -277,11 +230,12 @@ def _handle_chat_turn(
             tool_registry=tool_registry,
             llm_client=client,
             approval_handler=approval_handler,
-            skill_registry=skill_registry,
-            skill_source="",
-            skill_name="",
             compaction_worker=state.compaction_worker,
-            llm_config=state.llm_config,
+            auto_mode=state.auto_mode,
+            unlimited_mode=(
+                state.workspace_manager.is_unlimited(state.current_session_id)
+                if state.workspace_manager else False
+            ),
         )
     except LLMError as exc:
         _print_error(exc)
@@ -290,7 +244,23 @@ def _handle_chat_turn(
     if reply:
         _print_assistant_reply(reply)
 
+    _maybe_auto_title(state, client)
     print()
+
+
+def _maybe_auto_title(state: RuntimeState, client: LLMClient) -> None:
+    """Generate and apply an automatic session title after the first turn."""
+    try:
+        session = state.session_store.get(state.current_session_id)
+    except Exception:
+        return
+
+    messages = [{"role": m.role, "content": m.content} for m in session.messages]
+    new_title = auto_title_if_first_turn(
+        state.current_session_id, messages, state.session_store, client
+    )
+    if new_title:
+        print(f"  [会话标题] {new_title}")
 
 
 def _print_load_warnings(

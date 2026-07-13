@@ -17,8 +17,8 @@ from pathlib import Path
 def test_cron_job_lifecycle():
     """A cron job is created, the timer fires, the callback is invoked,
     and the job state is correctly updated."""
-    from claw.cron.service import CronService
-    from claw.cron.types import CronSchedule
+    from claw.scheduler.service import CronService
+    from claw.scheduler.types import CronSchedule
 
     tmp = tempfile.mkdtemp()
     try:
@@ -75,32 +75,32 @@ def test_cron_job_lifecycle():
 
 
 def test_system_job_protection():
-    """System jobs (Dream, Heartbeat) cannot be removed by users."""
-    from claw.cron.service import CronService
-    from claw.cron.types import CronJob, CronPayload, CronSchedule
+    """System jobs (Heartbeat) cannot be removed by users."""
+    from claw.scheduler.service import CronService
+    from claw.scheduler.types import CronJob, CronPayload, CronSchedule
 
     tmp = tempfile.mkdtemp()
     try:
         store_path = Path(tmp) / "jobs.json"
         srv = CronService(store_path)
 
-        # Register Dream as system job
+        # Register Heartbeat as system job
         srv.register_system_job(CronJob(
-            id="dream", name="dream",
-            schedule=CronSchedule(kind="every", every_ms=7200000),
+            id="heartbeat", name="heartbeat",
+            schedule=CronSchedule(kind="every", every_ms=1800000),
             payload=CronPayload(kind="system_event"),
         ))
 
         # Try to remove it
-        result = srv.remove_job("dream")
+        result = srv.remove_job("heartbeat")
         assert result == "protected", f"Expected 'protected', got '{result}'"
 
         # Disable and re-enable should work
-        job = srv.enable_job("dream", enabled=False)
+        job = srv.enable_job("heartbeat", enabled=False)
         assert job is not None
         assert job.enabled is False
 
-        job = srv.enable_job("dream", enabled=True)
+        job = srv.enable_job("heartbeat", enabled=True)
         assert job is not None
         assert job.enabled is True
 
@@ -117,8 +117,8 @@ def test_system_job_protection():
 
 def test_cron_tool_agent_flow():
     """Simulate an agent using the CronTool to manage jobs."""
-    from claw.cron.service import CronService
-    from claw.cron.types import CronJob, CronPayload, CronSchedule
+    from claw.scheduler.service import CronService
+    from claw.scheduler.types import CronJob, CronPayload, CronSchedule
     from claw.tools.cron_tool import CronTool
 
     tmp = tempfile.mkdtemp()
@@ -151,11 +151,11 @@ def test_cron_tool_agent_flow():
 
         # Agent tries to remove a system job (should fail)
         srv.register_system_job(CronJob(
-            id="dream", name="dream",
-            schedule=CronSchedule(kind="every", every_ms=7200000),
+            id="heartbeat", name="heartbeat",
+            schedule=CronSchedule(kind="every", every_ms=1800000),
             payload=CronPayload(kind="system_event"),
         ))
-        result = tool.execute_sync({"action": "remove", "job_id": "dream"})
+        result = tool.execute_sync({"action": "remove", "job_id": "heartbeat"})
         assert not result.ok
         assert "Cannot remove" in result.error
 
@@ -166,100 +166,14 @@ def test_cron_tool_agent_flow():
 
 
 # ---------------------------------------------------------------------------
-# Test 4: Dream and Heartbeat callbacks
-# ---------------------------------------------------------------------------
-
-
-def test_dream_callback():
-    """Dream callback processes history entries correctly."""
-    from claw.cron.callbacks import DreamCallback
-    from claw.cron.types import CronJob, CronPayload, CronSchedule
-    from claw.memory.history_log import HistoryLog
-    from claw.config import MEMORY_DIR
-
-    tmp = tempfile.mkdtemp()
-    try:
-        # Create workspace structure
-        ws_root = Path(tmp) / "workspace"
-        ws_root.mkdir(parents=True, exist_ok=True)
-
-        # History log lives in the workspace memory dir
-        history_dir = ws_root / "memory"
-        history_dir.mkdir(parents=True, exist_ok=True)
-        history_log = HistoryLog(history_dir)
-
-        # Write some test history
-        history_log.append("User discussed project architecture", event_type="summary")
-        history_log.append("Agent suggested using PostgreSQL", event_type="decision")
-        history_log.append("User confirmed database choice", event_type="fact")
-
-        # Create a mock LLM client that returns a simple edit suggestion
-        class MockLLM:
-            def chat(self, messages):
-                return """分析完毕。对话中提取到以下值得长期记忆的信息：
-
-```edit:MEMORY.md
-<<<<<<< ORIGINAL
-(empty)
-=======
-## 项目架构
-- 数据库: PostgreSQL
-- 项目正在讨论架构方案
->>>>>>> UPDATED
-```
-
-```edit:USER.md
-<<<<<<< ORIGINAL
-(empty)
-=======
-## 偏好
-- 用户确认使用 PostgreSQL
->>>>>>> UPDATED
-```
-"""
-
-        # Create workspace memory files with (empty) placeholder
-        (ws_root / "SOUL.md").write_text("(empty)", encoding="utf-8")
-        (ws_root / "USER.md").write_text("(empty)", encoding="utf-8")
-        (history_dir / "MEMORY.md").write_text("(empty)", encoding="utf-8")
-
-        dream_cb = DreamCallback(
-            history_dir, history_log, MockLLM(), ws_root,
-        )
-
-        job = CronJob(
-            id="dream", name="dream",
-            schedule=CronSchedule(kind="every", every_ms=7200000),
-            payload=CronPayload(kind="system_event"),
-        )
-
-        import asyncio
-        result = asyncio.run(dream_cb(job))
-
-        # Read back the edited files
-        soul_content = (ws_root / "SOUL.md").read_text(encoding="utf-8")
-        user_content = (ws_root / "USER.md").read_text(encoding="utf-8")
-        memory_content = (history_dir / "MEMORY.md").read_text(encoding="utf-8")
-
-        # The dream should have parsed the edit blocks and applied them
-        print(f"  [PASS] Dream callback processed {history_log.count()} entries")
-        print(f"         SOUL.md: {len(soul_content)} chars")
-        print(f"         USER.md: {len(user_content)} chars")
-        print(f"         MEMORY.md: {len(memory_content)} chars")
-    finally:
-        import shutil
-        shutil.rmtree(tmp, ignore_errors=True)
-
-
-# ---------------------------------------------------------------------------
-# Test 5: Heartbeat callback (HEARTBEAT.md)
+# Test 4: Heartbeat callback (HEARTBEAT.md)
 # ---------------------------------------------------------------------------
 
 
 def test_heartbeat_callback():
     """Heartbeat reads HEARTBEAT.md and dispatches when there are tasks."""
-    from claw.cron.callbacks import HeartbeatCallback
-    from claw.cron.types import CronJob, CronPayload, CronSchedule
+    from claw.scheduler.callbacks import HeartbeatCallback
+    from claw.scheduler.types import CronJob, CronPayload, CronSchedule
 
     tmp = tempfile.mkdtemp()
     try:
@@ -313,22 +227,14 @@ def test_heartbeat_callback():
 
 
 def test_config_loading():
-    """Dream and Heartbeat configs load correctly from defaults."""
-    from claw.config import load_dream_config, load_heartbeat_config
-
-    dc = load_dream_config()
-    assert dc.enabled is True
-    assert dc.interval_h == 2
-    schedule = dc.build_schedule()
-    assert schedule.kind == "every"
-    assert schedule.every_ms == 7200000  # 2 hours
+    """Heartbeat configs load correctly from defaults."""
+    from claw.config import load_heartbeat_config
 
     hc = load_heartbeat_config()
     assert hc.enabled is True
     assert hc.interval_s == 1800  # 30 minutes
 
-    print(f"  [PASS] Config loading: Dream every {dc.describe_schedule()}, "
-          f"Heartbeat every {hc.interval_s}s")
+    print(f"  [PASS] Config loading: Heartbeat every {hc.interval_s}s")
 
 
 # ---------------------------------------------------------------------------
@@ -338,8 +244,8 @@ def test_config_loading():
 
 def test_oneshot_jobs():
     """One-shot at-jobs fire once and then auto-delete."""
-    from claw.cron.service import CronService, _now_ms
-    from claw.cron.types import CronSchedule
+    from claw.scheduler.service import CronService, _now_ms
+    from claw.scheduler.types import CronSchedule
 
     tmp = tempfile.mkdtemp()
     try:
@@ -390,8 +296,8 @@ def test_oneshot_jobs():
 
 def test_action_log():
     """Jobs added while service is stopped appear after start."""
-    from claw.cron.service import CronService
-    from claw.cron.types import CronSchedule
+    from claw.scheduler.service import CronService
+    from claw.scheduler.types import CronSchedule
 
     tmp = tempfile.mkdtemp()
     try:
@@ -443,7 +349,6 @@ if __name__ == "__main__":
         ("CronJob lifecycle", test_cron_job_lifecycle),
         ("System job protection", test_system_job_protection),
         ("CronTool agent flow", test_cron_tool_agent_flow),
-        ("Dream callback", test_dream_callback),
         ("Heartbeat callback", test_heartbeat_callback),
         ("Config loading", test_config_loading),
         ("One-shot jobs", test_oneshot_jobs),

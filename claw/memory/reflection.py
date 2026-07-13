@@ -112,8 +112,7 @@ class ReflectionConfig:
 # ---------------------------------------------------------------------------
 
 
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+from claw.utils import now_iso as _now_iso
 
 
 def _time_matches(configured_time: str) -> bool:

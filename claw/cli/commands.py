@@ -24,6 +24,7 @@ from claw.workspace.manager import WorkspaceManager, WorkspaceError
 _COMMAND_PREFIXES = (
     "/session", "/memory", "/compact", "/workspace", "/approve", "/reject",
     "/approvals", "/skill", "/reflect", "/cron", "/help", "/auto",
+    "/unlimited", "/pet", "/stop", "/exit",
 )
 
 _HELP_TEXT = (
@@ -42,6 +43,11 @@ _HELP_TEXT = (
     "    update <id> <新内容>     更新记忆\n"
     "    delete <id>              删除记忆\n"
     "    stats                    记忆统计\n"
+    "  /reflect <sub> ...       每日记忆反思\n"
+    "    status                   查看反思状态\n"
+    "    enable / disable         启用/禁用\n"
+    "    time <HH:MM>             设置执行时间\n"
+    "    now                      立即执行\n"
     "  /compact                 手动压缩当前会话历史\n"
     "  /workspace <sub> ...     工作区路径管理\n"
     "    set <路径>               设置工作区路径\n"
@@ -55,19 +61,105 @@ _HELP_TEXT = (
     "    show <name>              查看 Skill 详情\n"
     "    usage                    查看使用记录\n"
     "    <name> <任务描述>        使用指定 Skill 执行任务\n"
-    "  /reflect <sub> ...       每日记忆反思\n"
-    "    status                   查看反思状态\n"
-    "    enable / disable         启用/禁用\n"
-    "    time <HH:MM>             设置执行时间\n"
-    "    now                      立即执行\n"
     "  /cron <sub> ...          定时作业管理 (nanobot 兼容)\n"
     "    list                     列出所有作业\n"
     "    status                   服务状态\n"
     "    disable <jobId>          禁用作业\n"
     "    enable <jobId>           启用作业\n"
     "    delete <jobId>           删除作业\n"
+    "  /pet <sub> ...           桌面宠物管理\n"
+    "    status                   查看运行状态和当前角色\n"
+    "    list                     列出可用宠物\n"
+    "    open / close             开启或关闭宠物\n"
+    "    select <petId>           选择宠物角色\n"
+    "    autostart <on|off>       设置是否随 Gateway 启动\n"
+    "  /auto                    查看 AUTO 状态和可用指令\n"
+    "    status                  查看当前状态\n"
+    "    on / off                开启 / 关闭 AUTO 模式\n"
+    "    toggle                  切换 AUTO 模式\n"
+    "  /unlimited               查看 UNLIMITED 状态和可用指令\n"
+    "    status                   查看当前状态\n"
+    "    on / off                 开启 / 关闭 UNLIMITED 模式\n"
+    "    toggle                   切换 UNLIMITED 模式\n"
+    "  /stop                    终止当前正在运行的 Agent 任务\n"
     "  /exit                    退出当前会话\n"
 )
+
+_HELP_MARKDOWN = """# SJTUClaw 可用指令
+
+## 基础操作
+
+- `/help`：显示此帮助信息
+- `/compact`：手动压缩当前会话历史
+- `/stop`：终止当前正在运行的 Agent 任务
+- `/exit`：退出当前会话
+
+## 会话管理
+
+- `/session new`：创建新会话
+- `/session list`：列出所有会话
+- `/session switch <id>`：切换到指定会话
+- `/session rename <id> <title>`：重命名会话
+- `/session delete <id>`：删除会话
+
+## 长期记忆与反思
+
+- `/memory add [--category <c>] [--tags <t>] [--importance <1-5>] <内容>`：添加记忆
+- `/memory list [--category <类别>]`：列出记忆
+- `/memory search <关键词>`：搜索记忆
+- `/memory update <id> <新内容>`：更新记忆
+- `/memory delete <id>`：删除记忆
+- `/memory stats`：查看记忆统计
+- `/reflect status`：查看每日记忆反思状态
+- `/reflect enable` / `/reflect disable`：启用或禁用反思
+- `/reflect time <HH:MM>`：设置执行时间
+- `/reflect now`：立即执行
+
+## Workspace 与审批
+
+- `/workspace set <路径>`：设置工作区路径
+- `/workspace show`：查看当前工作区
+- `/workspace unset`：取消工作区设置
+- `/approvals`：查看待审批操作
+- `/approve [approvalId]`：批准操作
+- `/reject [approvalId] [原因]`：拒绝操作
+
+## Agent 模式
+
+- `/auto`：查看 AUTO 状态和可用指令
+  - `/auto status`：查看当前状态
+  - `/auto on` / `/auto off`：开启或关闭 AUTO 模式
+  - `/auto toggle`：切换 AUTO 模式
+- `/unlimited`：查看 UNLIMITED 状态和可用指令
+  - `/unlimited status`：查看当前状态
+  - `/unlimited on` / `/unlimited off`：开启或关闭 UNLIMITED 模式
+  - `/unlimited toggle`：切换 UNLIMITED 模式
+
+> **安全提示：** AUTO 模式只会自动批准 workspace 内的操作。UNLIMITED 模式下涉及 workspace 外部的写入、覆盖、删除和 Shell 操作仍需用户明确审批。
+
+## Skill 管理
+
+- `/skill list`：列出可用 Skills
+- `/skill show <name>`：查看 Skill 详情
+- `/skill usage`：查看使用记录
+- `/skill <name> <任务描述>`：使用指定 Skill 执行任务
+
+## 定时作业
+
+- `/cron list`：列出所有作业
+- `/cron status`：查看服务状态
+- `/cron disable <jobId>`：禁用作业
+- `/cron enable <jobId>`：启用作业
+- `/cron delete <jobId>`：删除作业
+
+## 桌面宠物
+
+- `/pet` 或 `/pet status`：查看宠物状态
+- `/pet list`：列出可用宠物
+- `/pet open` / `/pet close`：开启或关闭宠物
+- `/pet select <petId>`：选择宠物角色
+- `/pet autostart on` / `/pet autostart off`：设置是否随 Gateway 启动
+"""
 
 
 @dataclass
@@ -87,8 +179,15 @@ class RuntimeState:
     llm_config: object | None = None
     history_log: object | None = None
     cron_service: object | None = None
+    pet_catalog: object | None = None
+    pet_process: object | None = None
     # Track the current pending approval for the active agent turn
     pending_approval_id: str | None = None
+    # AUTO mode — skip approval for write/shell tools
+    auto_mode: bool = False
+    # Optional callbacks for gateway integration
+    stop_handler: Callable[[], str] | None = None  # () -> result text
+    exit_handler: Callable[[], str] | None = None  # () -> result text
 
 
 def is_command(user_input: str) -> bool:
@@ -99,33 +198,78 @@ def is_command(user_input: str) -> bool:
     )
 
 
-def handle_command(user_input: str, state: RuntimeState) -> str:
+def handle_command(user_input: str, state: RuntimeState, *, markdown: bool = False) -> str:
     """Handle a command and return the text to print."""
     root, *args = user_input.split()
 
+    def finish(result: str) -> str:
+        return _format_command_markdown(result) if markdown else result
+
     if root == "/session":
-        return _handle_session_command(args, state)
+        return finish(_handle_session_command(args, state))
     if root == "/memory":
-        return _handle_memory_command(user_input, args, state)
+        return finish(_handle_memory_command(user_input, args, state))
     if root == "/compact":
-        return _handle_compact_command(state)
+        return finish(_handle_compact_command(state))
     if root == "/workspace":
-        return _handle_workspace_command(args, state)
+        return finish(_handle_workspace_command(args, state))
     if root == "/approvals":
-        return _handle_approvals_list(state)
+        return finish(_handle_approvals_list(state))
     if root == "/approve":
-        return _handle_approve(args, state)
+        return finish(_handle_approve(args, state))
     if root == "/reject":
-        return _handle_reject(user_input, args, state)
+        return finish(_handle_reject(user_input, args, state))
     if root == "/skill":
-        return _handle_skill_command(user_input, args, state)
+        return finish(_handle_skill_command(user_input, args, state))
     if root == "/reflect":
-        return _handle_reflect_command(args, state)
+        return finish(_handle_reflect_command(args, state))
     if root == "/cron":
-        return _handle_cron_command(args, state)
+        return finish(_handle_cron_command(args, state))
+    if root == "/pet":
+        return finish(_handle_pet_command(args, state))
+    if root == "/auto":
+        return finish(_handle_auto_command(args, state, markdown=markdown))
+    if root == "/unlimited":
+        return finish(_handle_unlimited_command(args, state, markdown=markdown))
     if root == "/help":
-        return _HELP_TEXT
-    return f"未知命令: {root}（输入 /help 查看可用指令）"
+        return _HELP_MARKDOWN if markdown else _HELP_TEXT
+    if root == "/stop":
+        return finish(_handle_stop_command(state))
+    if root == "/exit":
+        return finish(_handle_exit_command(state))
+    return finish(f"未知命令: {root}（输入 /help 查看可用指令）")
+
+
+def _format_command_markdown(result: str) -> str:
+    """Turn terminal-oriented command output into readable WebUI Markdown."""
+    if not result or result.startswith("__SKILL_INVOKE__"):
+        return result
+    if result.lstrip().startswith(("# ", "## ", "### ", "> ")):
+        return result
+
+    lines = result.splitlines()
+    formatted: list[str] = []
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped:
+            formatted.append("")
+            continue
+        if stripped.startswith("用法:") or stripped.startswith("用法："):
+            usage = stripped.split(":", 1)[-1].strip() if ":" in stripped else stripped.split("：", 1)[-1].strip()
+            formatted.append(f"**用法：** `{usage}`")
+            continue
+        if index == 0 and len(lines) > 1 and stripped.endswith((":", "：")):
+            formatted.append(f"### {stripped[:-1]}")
+            formatted.append("")
+            continue
+        indent = len(line) - len(line.lstrip())
+        if indent >= 4:
+            formatted.append(f"  - {stripped}")
+        elif indent >= 1:
+            formatted.append(f"- {stripped}")
+        else:
+            formatted.append(line)
+    return "\n".join(formatted)
 
 
 # -- /session ---------------------------------------------------------------
@@ -767,3 +911,216 @@ def _handle_cron_command(args: list[str], state: RuntimeState) -> str:
         return f"作业不存在: {args[1]}"
 
     return f"用法: /cron <list|status|disable|enable|delete> ..."
+
+
+# -- /pet -------------------------------------------------------------------
+
+
+def _handle_pet_command(args: list[str], state: RuntimeState) -> str:
+    """Inspect and manage the desktop pet from CLI and WebUI."""
+    if state.pet_catalog is None or state.pet_process is None:
+        return "桌面宠物服务未初始化，请通过 sjtuclaw gateway 使用此功能。"
+
+    catalog = state.pet_catalog
+    process = state.pet_process
+    sub = args[0].lower() if args else "status"
+
+    if sub in ("status", "show", "settings", "config", "help", "?"):
+        settings = catalog.load_settings()
+        pet = catalog.get_pet(settings.selected_pet_id)
+        name = pet.get("displayName", settings.selected_pet_id) if pet else settings.selected_pet_id
+        return (
+            "桌面宠物状态：\n"
+            f"  窗口: {'正在运行' if process.running else '已关闭'}\n"
+            f"  功能: {'已启用' if settings.enabled else '已关闭'}\n"
+            f"  当前角色: {name} ({settings.selected_pet_id})\n"
+            f"  随 Gateway 启动: {'是' if settings.launch_on_gateway_start else '否'}\n\n"
+            "用法: /pet <status|list|open|close|select|autostart>"
+        )
+
+    if sub == "list":
+        settings = catalog.load_settings()
+        pets = catalog.list_pets()
+        if not pets:
+            return "暂无可用宠物。"
+        lines = ["可用宠物："]
+        for pet in pets:
+            selected = " [当前]" if pet["id"] == settings.selected_pet_id else ""
+            source = "内置" if pet.get("readOnly") else "自定义"
+            lines.append(
+                f"  {pet['id']}  {pet['displayName']}  v{pet['spriteVersionNumber']}  {source}{selected}"
+            )
+        return "\n".join(lines)
+
+    if sub in ("open", "on", "enable"):
+        catalog.update_settings(enabled=True)
+        started = process.start()
+        if process.running:
+            return "桌面宠物已开启。"
+        return "已提交桌面宠物启动请求。" if started else "桌面宠物已经在运行。"
+
+    if sub in ("close", "off", "disable"):
+        catalog.update_settings(enabled=False)
+        process.stop()
+        return "桌面宠物已关闭。"
+
+    if sub == "select":
+        if len(args) < 2:
+            return "用法: /pet select <petId>"
+        pet_id = args[1]
+        try:
+            settings = catalog.update_settings(selected_pet_id=pet_id)
+        except ValueError as exc:
+            return f"选择失败: {exc}"
+        if process.running:
+            process.stop()
+            process.start()
+        pet = catalog.get_pet(settings.selected_pet_id)
+        name = pet.get("displayName", pet_id) if pet else pet_id
+        return f"已选择宠物: {name} ({pet_id})"
+
+    if sub == "autostart":
+        if len(args) < 2 or args[1].lower() not in ("on", "off"):
+            return "用法: /pet autostart <on|off>"
+        enabled = args[1].lower() == "on"
+        catalog.update_settings(launch_on_gateway_start=enabled)
+        return f"随 Gateway 启动已{'开启' if enabled else '关闭'}。"
+
+    return "用法: /pet <status|list|open|close|select|autostart>"
+
+# -- /auto ------------------------------------------------------------------
+
+
+def _handle_auto_command(
+    args: list[str], state: RuntimeState, *, markdown: bool = False
+) -> str:
+    """Inspect or explicitly change AUTO mode."""
+    sub = args[0].lower() if args else "status"
+
+    if sub in ("status", "show", "help", "?"):
+        state_text = "已开启" if state.auto_mode else "已关闭"
+        if markdown:
+            return (
+                f"## AUTO 模式\n\n"
+                f"**当前状态：{state_text}**\n\n"
+                "### 可用指令\n\n"
+                "- `/auto on`：开启 AUTO 模式\n"
+                "- `/auto off`：关闭 AUTO 模式\n"
+                "- `/auto toggle`：切换 AUTO 模式\n"
+                "- `/auto status`：查看当前状态\n\n"
+                "> AUTO 模式会自动批准 workspace 内的写入和 Shell 操作。"
+                "UNLIMITED 模式下涉及非 workspace 区域的危险操作仍需用户明确审批。"
+            )
+        return (
+            f"AUTO 模式当前{state_text}。\n\n"
+            "可用指令：\n"
+            "  /auto on      开启 AUTO 模式\n"
+            "  /auto off     关闭 AUTO 模式\n"
+            "  /auto toggle  切换 AUTO 模式\n"
+            "  /auto status  查看当前状态\n\n"
+            "AUTO 模式会自动批准 workspace 内的写入和 Shell 操作；"
+            "UNLIMITED 模式下涉及非 workspace 区域的危险操作仍需用户明确审批。"
+        )
+
+    if sub in ("on", "enable", "1"):
+        state.auto_mode = True
+        return "AUTO 模式已开启。Agent 在 workspace 内的写操作和 Shell 命令将自动执行，无需逐一审批。"
+    elif sub in ("off", "disable", "0"):
+        state.auto_mode = False
+        return "AUTO 模式已关闭。Agent 的写操作和 shell 命令恢复审批。"
+    elif sub == "toggle":
+        state.auto_mode = not state.auto_mode
+        state_text = "开启" if state.auto_mode else "关闭"
+        return f"AUTO 模式已{state_text}。"
+
+    return (
+        f"未知的 AUTO 子指令：{sub}\n"
+        "请使用 /auto 查看帮助，或使用 /auto on、/auto off、/auto toggle。"
+    )
+
+
+# -- /unlimited -------------------------------------------------------------
+
+
+def _handle_unlimited_command(
+    args: list[str], state: RuntimeState, *, markdown: bool = False
+) -> str:
+    """Show or change UNLIMITED mode for the current session."""
+    if state.workspace_manager is None:
+        return "Workspace manager 未初始化，无法使用此功能。"
+    sid = state.current_session_id
+    sub = args[0].lower() if args else "help"
+
+    def _help() -> str:
+        enabled = state.workspace_manager.is_unlimited(sid)
+        status = "已开启" if enabled else "已关闭"
+        if markdown:
+            return (
+                "## UNLIMITED 模式\n\n"
+                f"**当前状态：{status}**\n\n"
+                "### 可用指令\n\n"
+                "- `/unlimited status`：查看当前状态\n"
+                "- `/unlimited on`：开启模式，允许访问 workspace 之外的路径\n"
+                "- `/unlimited off`：关闭模式，恢复 workspace 边界限制\n"
+                "- `/unlimited toggle`：切换当前模式\n\n"
+                "> **安全规则：** UNLIMITED 只解除路径限制；写入、覆盖、删除和 "
+                "Shell 操作仍必须由用户逐次审批，AUTO 模式不能绕过审批。"
+            )
+        return (
+            f"UNLIMITED 模式当前{status}。\n\n"
+            "可用指令：\n"
+            "- `/unlimited status`：查看当前状态\n"
+            "- `/unlimited on`：开启模式，允许访问 workspace 之外的路径\n"
+            "- `/unlimited off`：关闭模式，恢复 workspace 边界限制\n"
+            "- `/unlimited toggle`：切换当前模式\n\n"
+            "安全规则：UNLIMITED 只解除路径限制；写入、覆盖、删除和 shell 操作"
+            "仍必须由用户逐次审批，AUTO 模式不能绕过审批。"
+        )
+
+    if sub in ("help", "status", "show"):
+        return _help()
+    if sub in ("on", "enable", "1"):
+        state.workspace_manager.set_unlimited(sid, True)
+        return (
+            "UNLIMITED 模式已开启。\n"
+            "Agent 现在可以读取、写入、删除任意路径的文件，"
+            "不受 workspace 限制。写入、删除和 shell 操作仍需逐次审批，"
+            "AUTO 模式不会跳过这些审批。\n"
+            "输入 /unlimited off 关闭。"
+        )
+    elif sub in ("off", "disable", "0"):
+        state.workspace_manager.set_unlimited(sid, False)
+        return "UNLIMITED 模式已关闭。Agent 的操作将恢复到 workspace 限制。"
+    elif sub == "toggle":
+        unlimited = state.workspace_manager.is_unlimited(sid)
+        if unlimited:
+            state.workspace_manager.set_unlimited(sid, False)
+            return "UNLIMITED 模式已关闭。Agent 的操作将恢复到 workspace 限制。"
+        else:
+            state.workspace_manager.set_unlimited(sid, True)
+            return (
+                "UNLIMITED 模式已开启。\n"
+                "Agent 现在可以读取、写入、删除任意路径的文件，"
+                "不受 workspace 限制。危险操作仍需逐次审批。"
+            )
+    return f"未知的 UNLIMITED 指令: {sub}\n\n{_help()}"
+
+
+# -- /stop ------------------------------------------------------------------
+
+
+def _handle_stop_command(state: RuntimeState) -> str:
+    """Stop the currently running agent turn."""
+    if state.stop_handler is not None:
+        return state.stop_handler()
+    return "没有正在运行的任务。"
+
+
+# -- /exit ------------------------------------------------------------------
+
+
+def _handle_exit_command(state: RuntimeState) -> str:
+    """Exit the current session."""
+    if state.exit_handler is not None:
+        return state.exit_handler()
+    return "再见！"

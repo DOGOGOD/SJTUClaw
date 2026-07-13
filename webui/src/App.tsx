@@ -7,35 +7,34 @@ import { SettingsView } from "@/components/settings/SettingsView";
 import { ThemeProvider, useTheme } from "@/hooks/useTheme";
 import { useSessions } from "@/hooks/useSessions";
 import { cn } from "@/lib/utils";
-import { fetchMessages, sendMessage, sendCommand, uploadAttachment, renameSession, fetchApprovals, approveApproval, rejectApproval } from "@/lib/api";
+import { isSlashCommand } from "@/lib/commands";
+import { fetchMessages, sendMessage, sendCommand, stopChat, uploadAttachment, renameSession, fetchApprovals, approveApproval, rejectApproval } from "@/lib/api";
 import type { ApprovalInfo } from "@/lib/types";
 import type { ChatMessage, SettingsSection, ShellView } from "@/lib/types";
 
-const SIDEBAR_WIDTH = 272;
+const SIDEBAR_WIDTH = 288;
 const SIDEBAR_COLLAPSED_WIDTH = 0;
 
 function Shell() {
   const { theme, toggle: toggleTheme } = useTheme();
-  const { sessions, loading: sessionsLoading, refresh: refreshSessions, createChat, deleteChat } = useSessions();
+  const { sessions, loading: sessionsLoading, refresh: refreshSessions, createChat, deleteChat, updateTitle } = useSessions();
 
-  // Routing state
   const [view, setView] = useState<ShellView>("chat");
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   const [settingsSection, setSettingsSection] = useState<SettingsSection>("prompt");
 
-  // Chat state
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [messagesLoading, setMessagesLoading] = useState(false);
   const [sending, setSending] = useState(false);
 
-  // UI state
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
   const [isMobile, setIsMobile] = useState(false);
   const [pendingApproval, setPendingApproval] = useState<ApprovalInfo | null>(null);
   const [autoMode, setAutoMode] = useState(false);
+  const [unlimitedMode, setUnlimitedMode] = useState(false);
+  const freshlyCreatedSessionRef = useRef<string | null>(null);
 
-  // Detect mobile
   useEffect(() => {
     const check = () => setIsMobile(window.innerWidth < 768);
     check();
@@ -43,10 +42,14 @@ function Shell() {
     return () => window.removeEventListener("resize", check);
   }, []);
 
-  // Load messages when session changes (with cancellation to prevent races)
   useEffect(() => {
     if (!activeSessionId) {
       setMessages([]);
+      setMessagesLoading(false);
+      return;
+    }
+    if (freshlyCreatedSessionRef.current === activeSessionId) {
+      freshlyCreatedSessionRef.current = null;
       setMessagesLoading(false);
       return;
     }
@@ -57,6 +60,8 @@ function Shell() {
         if (cancelled) return;
         if (d.ok) {
           setMessages(d.messages || []);
+          if (d.autoMode !== undefined) setAutoMode(!!d.autoMode);
+          if (d.unlimitedMode !== undefined) setUnlimitedMode(!!d.unlimitedMode);
         } else {
           setMessages([]);
         }
@@ -66,13 +71,10 @@ function Shell() {
         console.error("Failed to load messages", e);
         setMessages([]);
       })
-      .finally(() => {
-        if (!cancelled) setMessagesLoading(false);
-      });
+      .finally(() => { if (!cancelled) setMessagesLoading(false); });
     return () => { cancelled = true; };
   }, [activeSessionId]);
 
-  // Navigation
   const navigateToChat = useCallback((sessionId: string | null) => {
     setView("chat");
     setActiveSessionId(sessionId);
@@ -85,181 +87,185 @@ function Shell() {
     setMobileSidebarOpen(false);
   }, []);
 
-  // Actions
-  const handleNewChat = useCallback(async () => {
-    try {
-      const d = await createChat();
-      if (d.sessionId) {
-        navigateToChat(d.sessionId);
-      }
-    } catch (e) {
-      console.error("Failed to create chat", e);
-    }
-  }, [createChat, navigateToChat]);
+  const handleNewChat = useCallback(() => {
+    if (sending) return;
+    navigateToChat(null);
+  }, [navigateToChat, sending]);
 
-  const handleSelectSession = useCallback(
-    (sessionId: string) => {
-      navigateToChat(sessionId);
-    },
-    [navigateToChat]
-  );
+  const handleSelectSession = useCallback((sessionId: string) => {
+    if (sending) return;
+    navigateToChat(sessionId);
+  }, [navigateToChat, sending]);
 
-  const handleDeleteSession = useCallback(
-    async (sessionId: string) => {
-      await deleteChat(sessionId);
-      if (activeSessionId === sessionId) {
-        navigateToChat(null);
-      }
-    },
-    [deleteChat, activeSessionId, navigateToChat]
-  );
+  const handleDeleteSession = useCallback(async (sessionId: string) => {
+    await deleteChat(sessionId);
+    if (activeSessionId === sessionId) navigateToChat(null);
+  }, [deleteChat, activeSessionId, navigateToChat]);
 
-  const handleRenameSession = useCallback(
-    async (sessionId: string) => {
-      const title = prompt("新标题：");
-      if (!title?.trim()) return;
+  const handleRenameSession = useCallback(async (sessionId: string) => {
+    const title = prompt("请输入新标题");
+    if (!title?.trim()) return;
+    try { await renameSession(sessionId, title.trim()); await refreshSessions(); } catch {}
+  }, [refreshSessions]);
+
+  const handleSend = useCallback(async (message: string) => {
+    setSending(true);
+    let sessionId = activeSessionId;
+    if (!sessionId) {
       try {
-        await renameSession(sessionId, title.trim());
-        await refreshSessions();
-      } catch {}
-    },
-    [refreshSessions]
-  );
-
-  const handleSend = useCallback(
-    async (message: string) => {
-      if (!activeSessionId) return;
-      setSending(true);
-      const userMsg: ChatMessage = { role: "user", content: message };
-      setMessages((prev) => [...prev, userMsg]);
-
-      const isCommand = /^\/(session|memory|compact|exit|task|workspace|approve|reject|approvals|reflect|skill|help|auto)\b/.test(message);
-
-      // Poll for approvals in parallel while waiting for /chat to return.
-      // This breaks the deadlock: /chat blocks waiting for approval, but
-      // polling runs concurrently so the frontend can show & act on approvals.
-      let pollTimer: ReturnType<typeof setInterval> | null = null;
-      const stopPolling = () => {
-        if (pollTimer !== null) { clearInterval(pollTimer); pollTimer = null; }
-      };
-
-      if (!isCommand) {
-        pollTimer = setInterval(async () => {
-          try {
-            const ad = await fetchApprovals(activeSessionId);
-            if (ad.approvals?.length > 0) {
-              setPendingApproval(ad.approvals[0]);
-            }
-          } catch {}
-        }, 1500);
-      }
-
-      try {
-        let ok = false;
-        if (isCommand) {
-          const d = await sendCommand({ sessionId: activeSessionId, command: message });
-          if (d.ok && d.result) {
-            setMessages((prev) => [...prev, { role: "assistant", content: d.result }]);
-            // Track auto mode from command responses
-            if (message.startsWith("/auto") && d.result.includes("已开启")) {
-              setAutoMode(true);
-            } else if (message.startsWith("/auto") && d.result.includes("已关闭")) {
-              setAutoMode(false);
-            }
-            ok = true;
-          }
-        } else {
-          const d = await sendMessage({ sessionId: activeSessionId, message });
-          if (d.ok && d.reply) {
-            setMessages((prev) => [...prev, { role: "assistant", content: d.reply }]);
-            ok = true;
-          }
-          // Track auto mode from chat response
-          if ((d as any).autoMode !== undefined) {
-            setAutoMode(!!(d as any).autoMode);
-          }
+        const created = await createChat();
+        if (!created.sessionId) {
+          setSending(false);
+          return;
         }
-        if (!ok) {
-          setMessages((prev) => prev.slice(0, -1));
-        }
-        if (ok) await refreshSessions();
+        sessionId = created.sessionId;
+        freshlyCreatedSessionRef.current = sessionId;
+        navigateToChat(sessionId);
       } catch (e) {
-        console.error("Send failed", e);
+        console.error("Failed to create chat", e);
+        setSending(false);
+        return;
+      }
+    }
+    const userMsg: ChatMessage = { role: "user", content: message };
+    setMessages((prev) => [...prev, userMsg]);
+
+    if (isSlashCommand(message)) {
+      try {
+        const d = await sendCommand({ sessionId, command: message });
+        if (d.ok && d.result) {
+          setMessages((prev) => [...prev, {
+            role: "assistant",
+            content: d.result,
+            format: d.format ?? "markdown",
+            command: true,
+          }]);
+          if (d.autoMode !== undefined) setAutoMode(!!d.autoMode);
+          if (d.unlimitedMode !== undefined) setUnlimitedMode(!!d.unlimitedMode);
+        }
+        if (d.actions?.includes("open_pet_settings")) {
+          navigateToSettings("pet");
+        }
+        await refreshSessions();
+      } catch (e) {
+        console.error("Command failed", e);
         setMessages((prev) => prev.slice(0, -1));
       } finally {
-        stopPolling();
-        setPendingApproval(null);
         setSending(false);
       }
-    },
-    [activeSessionId, refreshSessions]
-  );
+      return;
+    }
+
+    // ── Polling-based real-time tool call display ──────────────────────
+    // Strategy: while POST /chat blocks on the agent turn, we poll
+    // GET /messages every second.  The agent loop saves intermediate
+    // tool calls to the session, which are visible through the shared
+    // in-memory SessionStore cache.
+
+    // Track last message count to avoid redundant state updates
+    let lastMsgCount = 0;
+
+    // Approval polling
+    const approvalTimer = setInterval(async () => {
+      try {
+        const ad = await fetchApprovals(sessionId);
+        if (ad.approvals?.length > 0) setPendingApproval(ad.approvals[0]);
+      } catch {}
+    }, 2000);
+
+    // Message polling shows real-time tool call progress (reduced to 2s)
+    const msgTimer = setInterval(async () => {
+      try {
+        const d = await fetchMessages(sessionId);
+        if (d.ok && d.messages && d.messages.length !== lastMsgCount) {
+          lastMsgCount = d.messages.length;
+          setMessages(d.messages);
+        }
+      } catch {}
+    }, 2000);
+
+    try {
+      const d = await sendMessage({ sessionId, message });
+      if (d.ok) {
+        // Use full messages array from response (includes all tool calls)
+        if (d.messages && d.messages.length > 0) {
+          setMessages(d.messages);
+        }
+        if ((d as any).autoMode !== undefined) setAutoMode(!!(d as any).autoMode);
+        if ((d as any).unlimitedMode !== undefined) setUnlimitedMode(!!(d as any).unlimitedMode);
+        if (d.title) updateTitle(sessionId, d.title);
+      } else {
+        // On failure, restore and re-fetch
+        setMessages((prev) => prev.slice(0, -1));
+      }
+      await refreshSessions();
+    } catch (e) {
+      console.error("Send failed", e);
+      setMessages((prev) => prev.slice(0, -1));
+      // Re-fetch to get any partial results
+      try {
+        const d = await fetchMessages(sessionId);
+        if (d.ok) setMessages(d.messages || []);
+      } catch {}
+    } finally {
+      clearInterval(approvalTimer);
+      clearInterval(msgTimer);
+      setPendingApproval(null);
+      setSending(false);
+    }
+  }, [activeSessionId, createChat, navigateToChat, refreshSessions, updateTitle]);
+
+  const handleStop = useCallback(async () => {
+    if (!activeSessionId) return;
+    try {
+      // Send stop request to cancel the running agent turn
+      await stopChat({ sessionId: activeSessionId });
+      // Re-fetch messages to show the cancelled state
+      try {
+        const d = await fetchMessages(activeSessionId);
+        if (d.ok) setMessages(d.messages || []);
+      } catch {}
+    } catch (e) {
+      console.error("Stop failed", e);
+    } finally {
+      setSending(false);
+      setPendingApproval(null);
+    }
+  }, [activeSessionId]);
 
   const handleApprove = useCallback(async () => {
     if (!pendingApproval) return;
-    try {
-      await approveApproval(pendingApproval.approvalId);
-      setPendingApproval(null);
-    } catch (e) {
-      console.error("Approve failed", e);
-    }
+    try { await approveApproval(pendingApproval.approvalId); setPendingApproval(null); } catch (e) { console.error("Approve failed", e); }
   }, [pendingApproval]);
 
   const handleRejectApproval = useCallback(async () => {
     if (!pendingApproval) return;
-    const reason = prompt("拒绝原因（可选）：") || undefined;
-    try {
-      await rejectApproval(pendingApproval.approvalId, reason);
-      setPendingApproval(null);
-    } catch (e) {
-      console.error("Reject failed", e);
-    }
+    const reason = prompt("请输入拒绝原因（可选）") || undefined;
+    try { await rejectApproval(pendingApproval.approvalId, reason); setPendingApproval(null); } catch (e) { console.error("Reject failed", e); }
   }, [pendingApproval]);
 
-  const handleAttach = useCallback(
-    async (file: File) => {
-      let sid = activeSessionId;
-      // Auto-create a session if none is selected
-      if (!sid) {
-        try {
-          const d = await createChat();
-          if (d.sessionId) {
-            sid = d.sessionId;
-            navigateToChat(d.sessionId);
-          } else {
-            return;
-          }
-        } catch {
-          return;
-        }
-      }
+  const handleAttach = useCallback(async (file: File) => {
+    let sid = activeSessionId;
+    if (!sid) {
       try {
-        const result = await uploadAttachment(sid, file);
-        if (result.ok) {
-          console.log(`[upload] ${file.name} 上传成功`);
-          // Add a system message to show the upload
-          setMessages((prev) => [
-            ...prev,
-            { role: "system", content: `附件已上传: ${file.name}` },
-          ]);
-        }
-      } catch (e) {
-        console.error("Upload failed", e);
-        setMessages((prev) => [
-          ...prev,
-          { role: "system", content: `附件上传失败: ${file.name}` },
-        ]);
+        const d = await createChat();
+        if (d.sessionId) { sid = d.sessionId; navigateToChat(d.sessionId); } else return;
+      } catch { return; }
+    }
+    try {
+      const result = await uploadAttachment(sid, file);
+      if (result.ok) {
+        setMessages((prev) => [...prev, { role: "system", content: `已上传附件: ${file.name}` }]);
       }
-    },
-    [activeSessionId, navigateToChat]
-  );
+    } catch (e) {
+      console.error("Upload failed", e);
+      setMessages((prev) => [...prev, { role: "system", content: `上传失败: ${file.name}` }]);
+    }
+  }, [activeSessionId, navigateToChat]);
 
   const handleToggleSidebar = useCallback(() => {
-    if (isMobile) {
-      setMobileSidebarOpen((v) => !v);
-    } else {
-      setSidebarCollapsed((v) => !v);
-    }
+    if (isMobile) setMobileSidebarOpen((v) => !v);
+    else setSidebarCollapsed((v) => !v);
   }, [isMobile]);
 
   const handleToggleCollapse = useCallback(() => {
@@ -276,7 +282,7 @@ function Shell() {
     return view === "settings" ? "settings" : null;
   }, [view]);
 
-  const sidebarProps = {
+  const sidebarProps = useMemo(() => ({
     sessions,
     activeSessionId,
     loading: sessionsLoading,
@@ -288,16 +294,22 @@ function Shell() {
     onToggleSidebar: handleToggleSidebar,
     onToggleCollapse: handleToggleCollapse,
     activeUtility,
-  };
+    interactionLocked: sending,
+  }), [sessions, activeSessionId, sessionsLoading, handleNewChat, handleSelectSession,
+      handleDeleteSession, handleRenameSession, navigateToSettings,
+      handleToggleSidebar, handleToggleCollapse, activeUtility, sending]);
 
   return (
-    <div className="flex h-full w-full overflow-hidden bg-background">
+    <div className="relative flex h-[100dvh] min-h-0 w-full overflow-hidden bg-background">
+      {/* Ambient background */}
+      <div className="ambient-glow" aria-hidden="true" />
+
       {/* Desktop sidebar */}
       <aside
-        className="hidden shrink-0 overflow-hidden border-r border-border transition-[width] duration-300 ease-out md:block"
-        style={{ width: sidebarCollapsed ? 56 : SIDEBAR_WIDTH }}
+        className="relative z-10 hidden shrink-0 overflow-hidden transition-[width] duration-300 ease-smooth md:block"
+        style={{ width: sidebarCollapsed ? 0 : SIDEBAR_WIDTH }}
       >
-        <div className="h-full" style={{ width: sidebarCollapsed ? 56 : SIDEBAR_WIDTH }}>
+        <div className="h-full border-r border-border/70" style={{ width: SIDEBAR_WIDTH }}>
           <Sidebar
             {...sidebarProps}
             collapsed={sidebarCollapsed}
@@ -310,37 +322,17 @@ function Shell() {
       {isMobile && mobileSidebarOpen && (
         <>
           <div
-            className="fixed inset-0 z-40 bg-black/50 md:hidden"
+            className="fixed inset-0 z-40 bg-black/30 backdrop-blur-sm md:hidden"
             onClick={() => setMobileSidebarOpen(false)}
           />
-          <aside className="fixed inset-y-0 left-0 z-50 w-[272px] bg-sidebar border-r border-border md:hidden">
+          <aside className="fixed inset-y-0 left-0 z-50 w-[min(88vw,288px)] bg-sidebar border-r border-border/70 md:hidden animate-enter-up">
             <Sidebar {...sidebarProps} onToggleSidebar={handleToggleSidebar} />
           </aside>
         </>
       )}
 
-      {/* Approval banner */}
-      {pendingApproval && (
-        <div className="fixed bottom-24 left-1/2 z-50 -translate-x-1/2 max-w-lg w-[calc(100%-2rem)] rounded-lg border border-amber-300 bg-amber-50 dark:bg-amber-950 dark:border-amber-700 p-4 shadow-xl animate-fade-in">
-          <div className="flex items-start gap-3">
-            <div className="flex-1 min-w-0">
-              <p className="text-sm font-semibold">
-                等待审批：{pendingApproval.toolName}
-              </p>
-              <pre className="mt-1 max-h-24 overflow-auto text-[11px] text-muted-foreground whitespace-pre-wrap font-mono">
-                {JSON.stringify(pendingApproval.toolArgs, null, 2)}
-              </pre>
-            </div>
-            <div className="flex gap-2 shrink-0">
-              <Button size="sm" onClick={handleApprove}>批准</Button>
-              <Button variant="destructive" size="sm" onClick={handleRejectApproval}>拒绝</Button>
-            </div>
-          </div>
-        </div>
-      )}
-
       {/* Main area */}
-      <main className="flex-1 min-w-0 flex flex-col">
+      <main className="relative z-10 flex-1 min-w-0 flex flex-col">
         {view === "chat" && (
           <ThreadShell
             sessionId={activeSessionId}
@@ -349,13 +341,14 @@ function Shell() {
             loading={messagesLoading}
             sending={sending}
             autoMode={autoMode}
+            unlimitedMode={unlimitedMode}
             onSend={handleSend}
+            onStop={handleStop}
             onAttach={handleAttach}
             onToggleSidebar={handleToggleSidebar}
             onNewChat={handleNewChat}
             theme={theme}
             onToggleTheme={toggleTheme}
-            hideSidebarToggle={true}
           />
         )}
         {view === "settings" && (
@@ -368,7 +361,28 @@ function Shell() {
             activeSessionId={activeSessionId}
           />
         )}
+
       </main>
+
+      {/* Approval request */}
+      {pendingApproval && (
+        <div className="fixed inset-0 z-[200] flex items-center justify-center bg-foreground/15 px-4 backdrop-blur-[2px]">
+          <div className="w-full max-w-lg rounded-2xl border border-border bg-popover p-5 shadow-[0_24px_80px_hsl(215_30%_10%/0.18)] animate-enter-scale">
+            <div className="min-w-0">
+                <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-primary">需要确认</p>
+                <h2 className="mt-1 text-base font-semibold tracking-tight">允许调用 {pendingApproval.toolName}</h2>
+                <p className="mt-1 text-xs leading-relaxed text-muted-foreground">请检查参数。危险操作只有在你批准后才会执行。</p>
+                <pre className="mt-4 max-h-48 overflow-auto rounded-xl border border-border/70 bg-secondary/55 p-3 text-[11px] text-foreground/75 whitespace-pre-wrap font-mono text-left">
+                  {JSON.stringify(pendingApproval.toolArgs, null, 2)}
+                </pre>
+            </div>
+            <div className="mt-5 flex items-center justify-end gap-2">
+              <Button variant="ghost" size="sm" onClick={handleRejectApproval}>拒绝</Button>
+              <Button size="sm" onClick={handleApprove} className="px-5">批准并执行</Button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

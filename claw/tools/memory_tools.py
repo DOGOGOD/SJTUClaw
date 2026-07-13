@@ -212,7 +212,7 @@ def create_remember_tool(
             "required": ["category", "content"],
         },
         handler=_make_remember_handler(memory_store, session_id_provider),
-        safety_level="read_only",
+        safety_level="write",
     )
 
 

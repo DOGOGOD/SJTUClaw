@@ -7,10 +7,19 @@ points:
     chat_with_tools(messages, tools) -> AgentResponse   # tool-calling call
 
 Both translate low-level failures into clear, user-facing errors.
+
+Reliability features:
+- Configurable request timeout (default 120s) prevents indefinite hangs.
+- Automatic retry for transient network errors (connection resets,
+  timeouts, 429/5xx) with exponential backoff.
 """
 
 from __future__ import annotations
 
+import logging
+import os
+import re
+import time
 from typing import Any, Iterable, Mapping, TYPE_CHECKING
 
 import openai
@@ -23,6 +32,36 @@ if TYPE_CHECKING:
     from claw.context.budget import ContextBudget
 
 Message = Mapping[str, str]
+
+logger = logging.getLogger(__name__)
+
+# Patterns scrubbed from error messages before surfacing to callers.
+# Prevents accidental API key / credential leakage in user-facing errors.
+_SECRET_PATTERNS = (
+    re.compile(r"(sk-[A-Za-z0-9_\-]{20,})"),          # OpenAI-style keys
+    re.compile(r"(Bearer\s+[A-Za-z0-9_\-\.]{20,})", re.IGNORECASE),
+    re.compile(r"(api[_-]?key[\"']?\s*[:=]\s*[\"']?[A-Za-z0-9_\-]{16,})", re.IGNORECASE),
+)
+
+
+def _scrub_secrets(text: str) -> str:
+    """Redact credentials from *text* before logging or returning."""
+    if not text:
+        return text
+    redacted = text
+    for pat in _SECRET_PATTERNS:
+        redacted = pat.sub("***REDACTED***", redacted)
+    return redacted
+
+# -- Retry configuration (env-overridable) ----------------------------------
+_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "2"))
+"""Number of automatic retries for transient failures (0 = no retry)."""
+
+_RETRY_BASE_DELAY = float(os.getenv("LLM_RETRY_BASE_DELAY", "1.0"))
+"""Base delay in seconds for exponential backoff."""
+
+_REQUEST_TIMEOUT = float(os.getenv("LLM_REQUEST_TIMEOUT", "120"))
+"""Per-request timeout in seconds (prevents indefinite hangs)."""
 
 
 class LLMError(RuntimeError):
@@ -41,12 +80,35 @@ class LLMResponseFormatError(LLMError):
     """Raised when the LLM API response body cannot be parsed as expected."""
 
 
+def _is_transient_error(exc: Exception) -> bool:
+    """Return True for errors worth retrying (network blips, 429, 5xx)."""
+    if isinstance(exc, openai.APIConnectionError):
+        return True
+    if isinstance(exc, openai.APITimeoutError):
+        return True
+    if isinstance(exc, openai.RateLimitError):
+        return True
+    if isinstance(exc, openai.APIStatusError):
+        status = getattr(exc, "status_code", 0)
+        return status >= 500
+    return False
+
+
 class LLMClient:
     """Thin wrapper around an OpenAI-compatible chat completion API."""
 
     def __init__(self, config: LLMConfig):
         self._config = config
-        self._client = OpenAI(api_key=config.api_key, base_url=config.base_url)
+        self._client = OpenAI(
+            api_key=config.api_key,
+            base_url=config.base_url,
+            timeout=_REQUEST_TIMEOUT,
+        )
+
+    @property
+    def config(self) -> LLMConfig:
+        """Return the LLM configuration (read-only access)."""
+        return self._config
 
     # -- simple text call (backward-compatible) -------------------------------
 
@@ -121,26 +183,38 @@ class LLMClient:
         native_tool_calls: list[dict[str, Any]] | None = None
         msg = choice.message
         if hasattr(msg, "tool_calls") and msg.tool_calls:
-            native_tool_calls = [
-                {
-                    "id": tc.id if hasattr(tc, "id") else "",
+            native_tool_calls = []
+            for tc in msg.tool_calls:
+                # Defensive: some providers omit `function` on malformed calls.
+                fn = getattr(tc, "function", None)
+                if fn is None:
+                    logger.warning("跳过缺少 function 字段的 tool_call: id=%s", getattr(tc, "id", "?"))
+                    continue
+                native_tool_calls.append({
+                    "id": getattr(tc, "id", "") or "",
                     "function": {
-                        "name": tc.function.name,
-                        "arguments": tc.function.arguments,
+                        "name": getattr(fn, "name", "") or "",
+                        "arguments": getattr(fn, "arguments", "") or "",
                     },
-                }
-                for tc in msg.tool_calls
-            ]
+                })
+            if not native_tool_calls:
+                native_tool_calls = None
 
-        content_text: str | None = getattr(msg, "content", None) or None
+        raw_content = getattr(msg, "content", None)
+        content_text: str | None = raw_content if isinstance(raw_content, str) else None
+        finish_reason: str | None = getattr(choice, "finish_reason", None)
 
         try:
-            return parse_agent_response(content_text, native_tool_calls)
+            parsed = parse_agent_response(content_text, native_tool_calls, finish_reason)
         except ProtocolParseError as exc:
             raise LLMResponseFormatError(
                 f"LLM 响应协议解析失败：{exc}\n"
                 f"原始内容（前200字符）：{str(content_text or '')[:200]}"
             ) from exc
+
+        # Propagate finish_reason for length-truncation recovery
+        parsed.finish_reason = finish_reason
+        return parsed
 
     # -- internal helpers ----------------------------------------------------
 
@@ -161,10 +235,9 @@ class LLMClient:
         if budget is not None:
             budget.check_overflow()
             if budget.usage_ratio >= 1.0:
-                print(
-                    f"[llm] 警告：上下文 token 数 ({budget.total_tokens}) "
-                    f"已达预算上限 ({budget.max_tokens})，"
-                    f"建议执行 /compact 压缩会话。"
+                logger.warning(
+                    "上下文 token 数 (%s) 已达预算上限 (%s)，建议执行 /compact 压缩会话。",
+                    budget.total_tokens, budget.max_tokens,
                 )
 
         kwargs: dict[str, Any] = {
@@ -177,20 +250,49 @@ class LLMClient:
             # kwargs["tool_choice"] = "auto"
 
         try:
-            return self._client.chat.completions.create(**kwargs)
+            return self._call_api_with_retry(kwargs)
         except openai.APIConnectionError as exc:
+            raw = _scrub_secrets(str(exc))
+            logger.error("LLM APIConnectionError: %s", raw)
             raise LLMConnectionError(
-                "无法连接到 LLM 服务，请检查网络连接以及 LLM_BASE_URL 配置是否正确。\n"
-                f"原始错误：{exc}"
+                "无法连接到 LLM 服务，请检查网络连接以及 LLM_BASE_URL 配置是否正确。"
             ) from exc
         except openai.APIStatusError as exc:
+            # Log full detail server-side, but only expose status code to user.
+            raw_msg = _scrub_secrets(str(getattr(exc, "message", "") or exc))
+            logger.error("LLM APIStatusError %s: %s", exc.status_code, raw_msg)
             raise LLMResponseStatusError(
-                f"LLM 服务返回了错误状态码 {exc.status_code}。\n"
-                "请检查 LLM_API_KEY、LLM_MODEL、LLM_BASE_URL 是否正确、是否有权限访问该模型。\n"
-                f"原始错误：{exc.message}"
+                f"LLM 服务返回了错误状态码 {exc.status_code}。"
+                "请检查 LLM_API_KEY、LLM_MODEL、LLM_BASE_URL 是否正确、是否有权限访问该模型。"
             ) from exc
         except openai.OpenAIError as exc:
-            raise LLMError(f"调用 LLM 服务时发生未知错误：{exc}") from exc
+            raw = _scrub_secrets(str(exc))
+            logger.error("LLM OpenAIError: %s", raw)
+            raise LLMError("调用 LLM 服务时发生未知错误，请查看日志。") from exc
+
+    def _call_api_with_retry(self, kwargs: dict[str, Any]) -> Any:
+        """Call the API with automatic retry for transient failures.
+
+        Retries up to ``_MAX_RETRIES`` times on connection errors,
+        timeouts, rate limits, and 5xx server errors using exponential
+        backoff. Non-transient errors (auth, validation, 4xx) are raised
+        immediately.
+        """
+        last_exc: Exception | None = None
+        for attempt in range(_MAX_RETRIES + 1):
+            try:
+                return self._client.chat.completions.create(**kwargs)
+            except Exception as exc:
+                last_exc = exc
+                if not _is_transient_error(exc) or attempt >= _MAX_RETRIES:
+                    raise
+                delay = _RETRY_BASE_DELAY * (2 ** attempt)
+                logger.warning(
+                    "LLM 请求失败，%.1fs 后重试 (%d/%d): %s",
+                    delay, attempt + 1, _MAX_RETRIES, _scrub_secrets(str(exc)),
+                )
+                time.sleep(delay)
+        raise last_exc  # unreachable, but keeps type-checker happy
 
     @staticmethod
     def _extract_reply_text(response: object) -> str:

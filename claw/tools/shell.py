@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from claw.tools.base import Tool, ToolResult
+from claw.utils import decode_subprocess_output
 from claw.workspace.manager import WorkspaceManager, WorkspaceError
 
 _IS_WINDOWS = os.name == "nt"
@@ -57,6 +58,7 @@ class ShellSession:
     def __init__(self, workspace_root: Path, cwd: Path):
         self.workspace_root = workspace_root
         self.cwd: Path = cwd
+        self.created_at: float = __import__("time").time()
         fd, self._state_path = tempfile.mkstemp(
             suffix=".txt", prefix="claw_shell_"
         )
@@ -81,6 +83,36 @@ class ShellSession:
 
 # session_id -> ShellSession
 _shell_sessions: dict[str, ShellSession] = {}
+
+# Stale session cleanup: remove sessions idle longer than this (seconds).
+_SHELL_SESSION_TTL_S = 3600  # 1 hour
+_shell_sessions_last_cleanup: float = 0.0
+_SHELL_CLEANUP_INTERVAL_S = 300  # check every 5 minutes
+
+
+def _cleanup_stale_shell_sessions() -> None:
+    """Remove shell sessions that have been idle longer than the TTL.
+
+    This prevents unbounded growth of ``_shell_sessions`` in long-running
+    processes (e.g. the Gateway server) where sessions are created but
+    never explicitly terminated.
+    """
+    import time as _time
+    global _shell_sessions_last_cleanup
+
+    now = _time.time()
+    if now - _shell_sessions_last_cleanup < _SHELL_CLEANUP_INTERVAL_S:
+        return
+
+    _shell_sessions_last_cleanup = now
+    stale_ids = [
+        sid for sid, s in _shell_sessions.items()
+        if now - s.created_at > _SHELL_SESSION_TTL_S
+    ]
+    for sid in stale_ids:
+        session = _shell_sessions.pop(sid, None)
+        if session is not None:
+            session.terminate()
 
 
 # =========================================================================
@@ -116,6 +148,7 @@ def _build_script(command: str, cwd: str) -> str:
     if _IS_WINDOWS:
         return (
             f"@echo off\r\n"
+            f"chcp 65001 >nul\r\n"
             f"cd /d \"{cwd}\"\r\n"
             f"{translated}\r\n"
             f"echo {_CD_MARKER}%CD%{_CD_MARKER}\r\n"
@@ -138,16 +171,14 @@ def _get_real_cwd(session: ShellSession, timeout: float = 5) -> str:
         proc = subprocess.run(
             [_shell_exe()] + _shell_args() + [_cwd_command()],
             capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
+            text=False,
             cwd=str(session.cwd),
             timeout=timeout,
             creationflags=(
                 subprocess.CREATE_NEW_PROCESS_GROUP if _IS_WINDOWS else 0
             ),
         )
-        out = (proc.stdout or "").strip()
+        out = decode_subprocess_output(proc.stdout).strip()
         if out:
             return out
     except Exception:
@@ -397,9 +428,7 @@ def _run_script(
         proc = subprocess.run(
             [_shell_exe()] + _shell_args() + [tmp_script],
             capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
+            text=False,
             timeout=timeout,
             creationflags=(
                 subprocess.CREATE_NEW_PROCESS_GROUP if _IS_WINDOWS else 0
@@ -413,7 +442,7 @@ def _run_script(
         except OSError:
             pass
 
-    raw = (proc.stdout or "") + (proc.stderr or "")
+    raw = decode_subprocess_output(proc.stdout) + decode_subprocess_output(proc.stderr)
 
     # Parse real cwd
     real_cwd = cwd
@@ -497,6 +526,9 @@ def _make_new_shell_handler(
         session_id = session_id_provider()
         ws = workspace_manager.require(session_id)
 
+        # Opportunistic cleanup of stale shell sessions
+        _cleanup_stale_shell_sessions()
+
         old = _shell_sessions.pop(session_id, None)
         if old is not None:
             old.terminate()
@@ -559,30 +591,59 @@ def _make_run_command_handler(
         saved_cwd = shell._read_state()
         shell.cwd = Path(saved_cwd).resolve()
 
-        # 1. Pre-check cwd still in workspace
-        in_ws, reason = _check_in_workspace(saved_cwd, shell.workspace_root)
-        if not in_ws:
+        # -- Shell consistency check: if the workspace or unlimited state
+        #    changed after shell creation, the shell's workspace_root may
+        #    no longer match.  Kill the shell so the next new_shell
+        #    creates one with the correct root.
+        try:
+            current_ws = workspace_manager.require(session_id)
+        except WorkspaceError:
+            current_ws = None
+        if current_ws is None or shell.workspace_root.resolve() != current_ws.resolve():
             shell.terminate()
             _shell_sessions.pop(session_id, None)
+            reason = (
+                "workspace 已取消设置" if current_ws is None
+                else f"workspace 已变为 \"{current_ws}\""
+            )
             return ToolResult(
                 ok=False,
-                error=f"{reason}。shell 已被终止，请重新调用 new_shell。",
+                error=(
+                    f"工作区配置已变更（{reason}）。"
+                    f"当前 shell 已失效，请重新调用 new_shell。"
+                ),
             )
 
-        # 2. Pre-scan for directory escape (cd / pushd)
-        escapes, predicted_cwd, reject_reason = _precheck_directory_escape(
-            command, shell.cwd, shell.workspace_root
-        )
-        if escapes:
-            return ToolResult(ok=False, error=reject_reason)
+        unlimited = workspace_manager.is_unlimited(session_id)
 
-        # 2b. Pre-scan command arguments for paths that escape the workspace.
-        #     This catches `del C:\\outside\\file`, `rm /etc/passwd`, etc.
-        path_escape_reason = _precheck_command_paths(
-            command, shell.cwd, shell.workspace_root
-        )
-        if path_escape_reason:
-            return ToolResult(ok=False, error=path_escape_reason)
+        if not unlimited:
+            # 1. Pre-check cwd still in workspace
+            in_ws, reason = _check_in_workspace(saved_cwd, shell.workspace_root)
+            if not in_ws:
+                shell.terminate()
+                _shell_sessions.pop(session_id, None)
+                return ToolResult(
+                    ok=False,
+                    error=f"{reason}。shell 已被终止，请重新调用 new_shell。",
+                )
+
+            # 2. Pre-scan for directory escape (cd / pushd)
+            escapes, predicted_cwd, reject_reason = _precheck_directory_escape(
+                command, shell.cwd, shell.workspace_root
+            )
+            if escapes:
+                return ToolResult(ok=False, error=reject_reason)
+
+            # 2b. Pre-scan command arguments for paths that escape the workspace.
+            #     This catches `del C:\\outside\\file`, `rm /etc/passwd`, etc.
+            path_escape_reason = _precheck_command_paths(
+                command, shell.cwd, shell.workspace_root
+            )
+            if path_escape_reason:
+                return ToolResult(ok=False, error=path_escape_reason)
+        else:
+            # Unlimited mode: skip workspace boundary checks.
+            predicted_cwd = None
 
         # 3. Execute command via platform wrapper script
         proc, clean_stdout, real_cwd, timed_out = _run_script(
@@ -616,30 +677,31 @@ def _make_run_command_handler(
             shell._write_state(str(predicted_cwd))
             shell.cwd = predicted_cwd
 
-        # 5. Post-check cwd in workspace
-        in_ws, reason = _check_in_workspace(
-            real_cwd or saved_cwd, shell.workspace_root
-        )
-        if not in_ws:
-            shell.terminate()
-            _shell_sessions.pop(session_id, None)
-            err_obj = {
-                "tool": "run_command",
-                "ok": False,
-                "command": command,
-                "cwd": real_cwd or saved_cwd,
-                "exit_code": proc.returncode,
-                "stdout": clean_stdout,
-                "stderr": "",
-                "timed_out": False,
-                "stdout_truncated": len(clean_stdout) > _MAX_OUTPUT_BYTES,
-                "stderr_truncated": False,
-                "error": f"{reason}。shell 已被终止，请重新调用 new_shell。",
-            }
-            return ToolResult(
-                ok=False,
-                error=json.dumps(err_obj, ensure_ascii=False),
+        # 5. Post-check cwd in workspace (skip in unlimited mode)
+        if not unlimited:
+            in_ws, reason = _check_in_workspace(
+                real_cwd or saved_cwd, shell.workspace_root
             )
+            if not in_ws:
+                shell.terminate()
+                _shell_sessions.pop(session_id, None)
+                err_obj = {
+                    "tool": "run_command",
+                    "ok": False,
+                    "command": command,
+                    "cwd": real_cwd or saved_cwd,
+                    "exit_code": proc.returncode,
+                    "stdout": clean_stdout,
+                    "stderr": "",
+                    "timed_out": False,
+                    "stdout_truncated": len(clean_stdout) > _MAX_OUTPUT_BYTES,
+                    "stderr_truncated": False,
+                    "error": f"{reason}。shell 已被终止，请重新调用 new_shell。",
+                }
+                return ToolResult(
+                    ok=False,
+                    error=json.dumps(err_obj, ensure_ascii=False),
+                )
 
         # 6. Truncate + build result
         stdout_text = clean_stdout

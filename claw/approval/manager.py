@@ -12,20 +12,38 @@ Approval flow::
 
 Download tool does NOT go through approval — its user confirmation
 happens when the user clicks the download link in the frontend.
+
+Reliability:
+- Completed approvals are automatically cleaned up after a retention
+  period to prevent unbounded memory growth in long-running processes.
+- ``cleanup_expired`` can be called periodically to remove stale entries.
 """
 
 from __future__ import annotations
 
 import enum
 import threading
+import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
 
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+from claw.utils import now_iso as _now_iso
+
+
+def _now_ts() -> float:
+    return time.time()
+
+
+# Retention period for completed approvals (seconds).
+# After this, a completed approval is eligible for garbage collection.
+_COMPLETED_RETENTION_S = 600  # 10 minutes
+
+# Max number of completed approvals to keep in memory.
+# Older ones are pruned first (FIFO).
+_MAX_COMPLETED_KEEP = 200
 
 
 class ApprovalStatus(str, enum.Enum):
@@ -89,6 +107,7 @@ class ApprovalManager:
         self._lock = threading.Lock()
         self._requests: dict[str, ApprovalRequest] = {}
         self._events: dict[str, threading.Event] = {}
+        self._completed_at: dict[str, float] = {}  # approval_id -> completion timestamp
 
     # ------------------------------------------------------------------
     # Public API
@@ -106,10 +125,23 @@ class ApprovalManager:
             tool_name=tool_name,
             tool_args=tool_args,
         )
-        with self._lock:
-            self._requests[req.approval_id] = req
-            self._events[req.approval_id] = threading.Event()
+        self.register(req)
         return req
+
+    def register(self, req: ApprovalRequest) -> None:
+        """Register an already-constructed ``ApprovalRequest``.
+
+        Use this when the request was created outside the manager
+        (e.g. by the agent loop) and needs to be tracked for
+        approve/reject/wait operations.
+        """
+        with self._lock:
+            # Opportunistic cleanup: prune old completed approvals when
+            # the store grows large, preventing unbounded memory growth.
+            self._maybe_cleanup_locked()
+            self._requests[req.approval_id] = req
+            if req.approval_id not in self._events:
+                self._events[req.approval_id] = threading.Event()
 
     def approve(self, approval_id: str) -> ApprovalRequest | None:
         """Approve the request. Unblocks the waiter."""
@@ -120,6 +152,7 @@ class ApprovalManager:
             if req.status != ApprovalStatus.PENDING.value:
                 return req
             req.status = ApprovalStatus.APPROVED.value
+            self._completed_at[approval_id] = _now_ts()
             evt = self._events.get(approval_id)
             if evt:
                 evt.set()
@@ -137,6 +170,7 @@ class ApprovalManager:
                 return req
             req.status = ApprovalStatus.REJECTED.value
             req.reject_reason = reason
+            self._completed_at[approval_id] = _now_ts()
             evt = self._events.get(approval_id)
             if evt:
                 evt.set()
@@ -154,15 +188,16 @@ class ApprovalManager:
         if evt is None:
             return None
         signaled = evt.wait(timeout=timeout)
-        if not signaled:
-            # Timeout — treat as rejection
-            with self._lock:
+        with self._lock:
+            if not signaled:
+                # Timeout — treat as rejection
                 req = self._requests.get(approval_id)
                 if req and req.status == ApprovalStatus.PENDING.value:
                     req.status = ApprovalStatus.REJECTED.value
                     req.reject_reason = "审批超时，自动拒绝"
+                    self._completed_at[approval_id] = _now_ts()
+                return req
             return self._requests.get(approval_id)
-        return self._requests.get(approval_id)
 
     def get_pending(self) -> list[ApprovalRequest]:
         """Return all currently pending approvals."""
@@ -186,3 +221,59 @@ class ApprovalManager:
                 for r in self._requests.values()
                 if r.session_id == session_id
             ]
+
+    def cleanup_expired(self) -> int:
+        """Remove completed approvals older than the retention period.
+
+        Returns the number of entries removed.  Safe to call from any
+        thread; callers may invoke this periodically (e.g. from the cron
+        service) to bound memory usage.
+        """
+        with self._lock:
+            return self._maybe_cleanup_locked(force=True)
+
+    # ------------------------------------------------------------------
+    # Internal cleanup
+    # ------------------------------------------------------------------
+
+    def _maybe_cleanup_locked(self, *, force: bool = False) -> int:
+        """Prune old completed approvals. Caller must hold ``self._lock``.
+
+        Two strategies:
+        1. Time-based: remove entries completed > ``_COMPLETED_RETENTION_S``
+           ago.
+        2. Count-based: if completed entries exceed
+           ``_MAX_COMPLETED_KEEP``, remove oldest first.
+
+        When *force* is False (called opportunistically on ``create``),
+        only runs when the store has grown past a threshold.  When True
+        (called from ``cleanup_expired``), always runs.
+        """
+        if not force and len(self._requests) < _MAX_COMPLETED_KEEP:
+            return 0
+
+        now = _now_ts()
+        to_remove: list[str] = []
+
+        # Time-based: remove old completed entries
+        for aid, ts in self._completed_at.items():
+            if now - ts > _COMPLETED_RETENTION_S:
+                to_remove.append(aid)
+
+        # Count-based: if still too many, prune oldest completed
+        if len(self._requests) - len(to_remove) > _MAX_COMPLETED_KEEP:
+            remaining_completed = [
+                (aid, ts) for aid, ts in self._completed_at.items()
+                if aid not in to_remove
+            ]
+            remaining_completed.sort(key=lambda x: x[1])
+            excess = len(self._requests) - len(to_remove) - _MAX_COMPLETED_KEEP
+            for aid, _ in remaining_completed[:excess]:
+                to_remove.append(aid)
+
+        for aid in to_remove:
+            self._requests.pop(aid, None)
+            self._events.pop(aid, None)
+            self._completed_at.pop(aid, None)
+
+        return len(to_remove)

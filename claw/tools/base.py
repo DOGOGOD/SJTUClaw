@@ -9,14 +9,21 @@ Enhancements over v5:
 - Workspace scope integration (path traversal detection).
 - SSRF guard classification (hard block, conversational recovery).
 - Repeated external lookup throttling.
+- Schema normalization for OpenAI-compatible tool definitions.
+- Structured tool result wrapping (JSON envelope for error recovery).
+- Pre-execution guardrails (rate limiting, safety validation).
 """
 
 from __future__ import annotations
 
 import contextvars
 import json
+import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any, Callable
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Context variables (bound per-agent-turn)
@@ -182,7 +189,7 @@ class Tool:
         description: human-readable explanation for the model.
         input_schema: JSON Schema dict.
         handler: callable ``(args: dict) -> ToolResult``.
-        safety_level: ``read_only`` / ``write`` / ``shell`` / ``download`` / ``skill_select``.
+        safety_level: ``read_only`` / ``write`` / ``shell`` / ``download``.
         concurrency_safe: if True, this tool can be executed in parallel with others.
         max_result_chars: auto-truncate results longer than this (0 = no limit).
     """
@@ -210,6 +217,14 @@ _TYPE_MAP: dict[str, type | tuple] = {
 }
 
 
+def _matches_json_type(value: Any, expected_type: str) -> bool:
+    """Match JSON types without treating bool as an integer in Python."""
+    if expected_type in {"integer", "number"} and isinstance(value, bool):
+        return False
+    expected = _TYPE_MAP.get(expected_type)
+    return expected is None or isinstance(value, expected)
+
+
 def _validate_args(args: dict[str, Any], schema: dict[str, Any]) -> list[str]:
     """Validate *args* against a (subset of) JSON Schema."""
     errors: list[str] = []
@@ -231,8 +246,7 @@ def _validate_args(args: dict[str, Any], schema: dict[str, Any]) -> list[str]:
             continue
         expected_type = prop.get("type")
         if expected_type is not None and value is not None:
-            expected = _TYPE_MAP.get(expected_type)
-            if expected is not None and not isinstance(value, expected):
+            if not _matches_json_type(value, expected_type):
                 errors.append(
                     f"参数 \"{key}\" 的类型错误：期望 {expected_type}，"
                     f"实际为 {type(value).__name__}"
@@ -258,6 +272,21 @@ def _validate_args(args: dict[str, Any], schema: dict[str, Any]) -> list[str]:
                 errors.append(f"参数 \"{key}\" 的值 {value} 小于最小允许值 {minimum}")
             if maximum is not None and value > maximum:
                 errors.append(f"参数 \"{key}\" 的值 {value} 大于最大允许值 {maximum}")
+        if expected_type == "array" and isinstance(value, list):
+            min_items = prop.get("minItems")
+            max_items = prop.get("maxItems")
+            if min_items is not None and len(value) < min_items:
+                errors.append(f"参数 \"{key}\" 的元素数量小于最小要求 {min_items}")
+            if max_items is not None and len(value) > max_items:
+                errors.append(f"参数 \"{key}\" 的元素数量超过最大限制 {max_items}")
+            item_schema = prop.get("items")
+            if isinstance(item_schema, dict) and isinstance(item_schema.get("type"), str):
+                for index, item in enumerate(value):
+                    if not _matches_json_type(item, item_schema["type"]):
+                        errors.append(
+                            f"参数 \"{key}[{index}]\" 的类型错误：期望 {item_schema['type']}，"
+                            f"实际为 {type(item).__name__}"
+                        )
 
     return errors
 
@@ -347,6 +376,114 @@ def classify_boundary_error(
 
 
 # ---------------------------------------------------------------------------
+# Schema normalization
+# ---------------------------------------------------------------------------
+
+
+def normalize_tool_schema(schema: Any) -> dict[str, Any] | None:
+    """Return a function-tool dict with a resolvable top-level ``name``.
+
+    Handles both bare function schemas (``{"name": ..., "parameters": ...}``)
+    and already-wrapped OpenAI tool entries (``{"type": "function",
+    "function": {...}}``).  Returns ``None`` for schemas without a
+    resolvable name, so callers can skip-with-warning rather than
+    poisoning the LLM request with a nameless tool.
+    """
+    if not isinstance(schema, dict):
+        return None
+    # Unwrap an already-wrapped OpenAI tool entry
+    if schema.get("type") == "function" and isinstance(schema.get("function"), dict):
+        schema = schema["function"]
+        if not isinstance(schema, dict):
+            return None
+    name = schema.get("name", "")
+    if not name or not isinstance(name, str):
+        return None
+    return schema
+
+
+def standardize_tool_result(
+    tool_name: str,
+    result: ToolResult,
+) -> str:
+    """Wrap a ToolResult into a structured JSON envelope.
+
+    This gives the LLM a consistent format to parse:
+
+    - Success: ``{"tool": "read_file", "ok": true, "result": "..."}``
+    - Failure: ``{"tool": "read_file", "ok": false, "result": "error: ..."}``
+
+    The ``result`` key always carries the human-readable content or
+    error message, so the model can extract it uniformly.
+    """
+    if result.ok:
+        return json.dumps(
+            {
+                "tool": tool_name,
+                "ok": True,
+                "result": result.content or "(空结果)",
+            },
+            ensure_ascii=False,
+        )
+    return json.dumps(
+        {
+            "tool": tool_name,
+            "ok": False,
+            "result": f"错误: {result.error}",
+        },
+        ensure_ascii=False,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Pre-execution guardrails
+# ---------------------------------------------------------------------------
+
+
+class ToolGuardrails:
+    """Pre-execution safety checks for tool calls.
+
+    Tracks per-tool invocation counts within a single agent turn to
+    prevent runaway loops.  Integrated into ``ToolRegistry.execute_by_name``
+    via the ``prepare_call`` hook or called directly.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_calls_per_tool: int = 50,
+        max_total_calls: int = 200,
+    ):
+        self._max_per_tool = max_calls_per_tool
+        self._max_total = max_total_calls
+        self._tool_counts: dict[str, int] = {}
+        self._total_calls = 0
+
+    def reset(self) -> None:
+        """Reset counters at the start of a new agent turn."""
+        self._tool_counts.clear()
+        self._total_calls = 0
+
+    def check(self, tool_name: str) -> str | None:
+        """Return an error message if the call should be blocked, else None."""
+        self._total_calls += 1
+        if self._total_calls > self._max_total:
+            return (
+                f"已达到本轮工具调用总数上限（{self._max_total}）。"
+                f"请总结当前进展并回复用户。"
+            )
+        count = self._tool_counts.get(tool_name, 0) + 1
+        self._tool_counts[tool_name] = count
+        if count > self._max_per_tool:
+            return (
+                f"工具 \"{tool_name}\" 在本轮中已被调用 {count} 次，"
+                f"超过单工具上限（{self._max_per_tool}）。"
+                f"请尝试其他方法或总结当前结果。"
+            )
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Tool registry
 # ---------------------------------------------------------------------------
 
@@ -371,9 +508,23 @@ class ToolRegistry:
     # -- registration -------------------------------------------------------
 
     def register(self, tool: Tool) -> None:
+        if not isinstance(tool, Tool):
+            raise ToolRegistryError("只能注册 Tool 实例")
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]{0,63}", tool.name or ""):
+            raise ToolRegistryError(f"tool 名称无效: {tool.name!r}")
+        if not callable(tool.handler):
+            raise ToolRegistryError(f"tool {tool.name} 的 handler 不可调用")
+        if not isinstance(tool.input_schema, dict) or tool.input_schema.get("type") != "object":
+            raise ToolRegistryError(f"tool {tool.name} 的 input_schema 必须是 object schema")
+        if not isinstance(tool.input_schema.get("properties", {}), dict):
+            raise ToolRegistryError(f"tool {tool.name} 的 schema.properties 必须是对象")
         if tool.name in self._tools:
             raise ToolRegistryError(f"tool 名称冲突: {tool.name} 已注册")
         self._tools[tool.name] = tool
+
+    def clear(self) -> None:
+        """Remove all registered tools."""
+        self._tools.clear()
 
     # -- listing ------------------------------------------------------------
 
@@ -386,15 +537,23 @@ class ToolRegistry:
 
     def list_definitions(self) -> list[dict[str, Any]]:
         definitions: list[dict[str, Any]] = []
-        for tool in self._tools.values():
-            definitions.append({
+        for name in self.tool_names:
+            tool = self._tools[name]
+            raw = {
                 "type": "function",
                 "function": {
                     "name": tool.name,
                     "description": tool.description,
                     "parameters": tool.input_schema,
                 },
-            })
+            }
+            # Normalize to catch schema issues before sending to LLM
+            normalized = normalize_tool_schema(raw)
+            if normalized is not None:
+                definitions.append({
+                    "type": "function",
+                    "function": normalized,
+                })
         return definitions
 
     def list_compact_definitions(self) -> list[dict[str, Any]]:
@@ -405,7 +564,7 @@ class ToolRegistry:
                 "parameters": tool.input_schema,
                 "safety_level": tool.safety_level,
             }
-            for tool in self._tools.values()
+            for tool in (self._tools[name] for name in self.tool_names)
         ]
 
     # -- prepare_call hook --------------------------------------------------
@@ -436,14 +595,26 @@ class ToolRegistry:
         """
         # prepare_call hook (pre-execution validation, workspace resolution)
         tool = self._tools.get(name)
+        # Hooks must not be able to mutate the caller's argument dictionary.
+        call_args = dict(args) if isinstance(args, dict) else args
         prep_error: str | None = None
         if self._prepare_call is not None:
             try:
-                result = self._prepare_call(name, args)
+                result = self._prepare_call(name, call_args)
                 if isinstance(result, tuple) and len(result) == 3:
-                    tool, args, prep_error = result
-            except Exception:
-                pass
+                    tool, call_args, prep_error = result
+                elif result is not None:
+                    return ToolResult(ok=False, error="tool 预处理器返回了无效结果")
+            except Exception as exc:
+                # The hook may enforce workspace or permission policy.  A
+                # broken guard must fail closed instead of bypassing checks.
+                logger.exception(
+                    "prepare_call hook 对工具 %s 抛出异常: %s", name, exc
+                )
+                return ToolResult(
+                    ok=False,
+                    error=f"tool \"{name}\" 的执行前检查失败，操作已安全中止：{exc}",
+                )
 
         if prep_error:
             return ToolResult(ok=False, error=prep_error)
@@ -455,7 +626,7 @@ class ToolRegistry:
             )
 
         # Validate args
-        validation_errors = _validate_args(args, tool.input_schema)
+        validation_errors = _validate_args(call_args, tool.input_schema)
         if validation_errors:
             return ToolResult(
                 ok=False,
@@ -464,104 +635,41 @@ class ToolRegistry:
 
         # Execute
         try:
-            result = tool.handler(args)
+            result = tool.handler(call_args)
         except Exception as exc:
+            logger.exception("tool %s 执行异常", name)
             return ToolResult(
                 ok=False,
                 error=f"tool \"{name}\" 执行时发生未预期的异常：{exc}",
             )
 
-        # Auto-truncate
-        effective_max = max_result_chars or tool.max_result_chars
-        if effective_max > 0 and result.ok and result.content and len(result.content) > effective_max:
-            result = ToolResult(
-                ok=True,
-                content=result.content[:effective_max] + "\n...[truncated]",
+        if not isinstance(result, ToolResult):
+            logger.error("tool %s 返回了无效类型: %s", name, type(result).__name__)
+            return ToolResult(
+                ok=False,
+                error=f"tool \"{name}\" 返回格式无效（期望 ToolResult）",
             )
+        if result.ok and result.content is not None and not isinstance(result.content, str):
+            return ToolResult(ok=False, error=f"tool \"{name}\" 返回的 content 必须是字符串")
+        if not result.ok and (not isinstance(result.error, str) or not result.error.strip()):
+            return ToolResult(ok=False, error=f"tool \"{name}\" 执行失败，但未返回有效错误信息")
+
+        # Auto-truncate — applies to both success content and error text
+        # to prevent context bloat from verbose tracebacks.
+        effective_max = max_result_chars or tool.max_result_chars
+        if effective_max > 0:
+            if result.ok and result.content and len(result.content) > effective_max:
+                result = ToolResult(
+                    ok=True,
+                    content=result.content[:effective_max] + "\n...[truncated]",
+                )
+            elif not result.ok and result.error and len(result.error) > effective_max:
+                result = ToolResult(
+                    ok=False,
+                    error=result.error[:effective_max] + "\n...[truncated]",
+                )
 
         return result
 
     def get_tool(self, name: str) -> Tool | None:
         return self._tools.get(name)
-
-
-# ---------------------------------------------------------------------------
-# Tool auto-discovery helpers
-# ---------------------------------------------------------------------------
-
-
-def discover_tools(package_path: str = "claw.tools") -> list[Tool]:
-    """Auto-discover Tool instances in a package via pkgutil.
-
-    Scans all modules in *package_path* for ``Tool`` instances and
-    functions decorated with ``@register_tool``.
-    """
-    import importlib
-    import pkgutil
-
-    tools: list[Tool] = []
-    try:
-        package = importlib.import_module(package_path)
-    except ImportError:
-        return tools
-
-    for _, modname, is_pkg in pkgutil.iter_modules(package.__path__, package.__name__ + "."):
-        try:
-            mod = importlib.import_module(modname)
-        except ImportError:
-            continue
-        for attr_name in dir(mod):
-            attr = getattr(mod, attr_name, None)
-            if isinstance(attr, Tool):
-                tools.append(attr)
-            elif callable(attr) and hasattr(attr, "_claw_tool"):
-                tools.append(attr._claw_tool)
-
-        if is_pkg:
-            tools.extend(discover_tools(modname))
-
-    return tools
-
-
-def register_tool(
-    name: str,
-    description: str,
-    input_schema: dict[str, Any],
-    *,
-    safety_level: str = "read_only",
-    concurrency_safe: bool = False,
-    max_result_chars: int = 0,
-):
-    """Decorator that registers a handler function as a Tool.
-
-    Usage::
-
-        @register_tool("search", "Search the web", {"type": "object", ...})
-        def search(args):
-            ...
-    """
-    tool = Tool(
-        name=name,
-        description=description,
-        input_schema=input_schema,
-        handler=None,  # filled in by decorator
-        safety_level=safety_level,
-        concurrency_safe=concurrency_safe,
-        max_result_chars=max_result_chars,
-    )
-
-    def decorator(fn: Callable[[dict[str, Any]], ToolResult]):
-        # Create a new Tool with the handler set
-        wrapped = Tool(
-            name=tool.name,
-            description=tool.description,
-            input_schema=tool.input_schema,
-            handler=fn,
-            safety_level=tool.safety_level,
-            concurrency_safe=tool.concurrency_safe,
-            max_result_chars=tool.max_result_chars,
-        )
-        fn._claw_tool = wrapped
-        return fn
-
-    return decorator

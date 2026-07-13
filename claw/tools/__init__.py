@@ -1,8 +1,22 @@
 """Tool definitions, registry and built-in tool implementations."""
 
-from claw.tools.base import Tool, ToolRegistry, ToolResult
+from claw.tools.base import (
+    Tool,
+    ToolGuardrails,
+    ToolRegistry,
+    ToolResult,
+    normalize_tool_schema,
+    standardize_tool_result,
+)
 
-__all__ = ["Tool", "ToolRegistry", "ToolResult"]
+__all__ = [
+    "Tool",
+    "ToolGuardrails",
+    "ToolRegistry",
+    "ToolResult",
+    "normalize_tool_schema",
+    "standardize_tool_result",
+]
 
 
 def register_all_tools(
@@ -12,6 +26,7 @@ def register_all_tools(
     session_id_provider=None,
     sessions_dir=None,
     include_skill_tool: bool = False,
+    skill_registry=None,
     include_memory_tools: bool = False,
     memory_store=None,
     include_cron_tool: bool = False,
@@ -32,21 +47,28 @@ def register_all_tools(
             session id (required for workspace-aware tools).
         sessions_dir: ``Path`` to the sessions directory (required for
             attachment tool).
-        include_skill_tool: if True, register the ``use_skill`` tool
-            (Step 9).
+        include_skill_tool: if True, register ``skills_list`` and
+            ``skill_view`` tools (Step 9).
         include_memory_tools: if True, register ``remember`` and
             ``recall`` tools (hierarchical memory).
         memory_store: ``MemoryStore`` instance (required for memory tools).
     """
     from claw.tools.readonly import register_all_readonly
+    from claw.tools.web import register_web_tools
 
-    register_all_readonly(registry)
+    register_all_readonly(registry, workspace_manager, session_id_provider)
+    # Network tools are read-only and do not depend on a workspace.  They are
+    # enabled by default and can be disabled with WEB_TOOL_ENABLED=false.
+    register_web_tools(registry)
 
-    # -- Step 9: use_skill tool (always available when requested) ----------
-    if include_skill_tool:
-        from claw.tools.skills import create_use_skill_tool
+    # -- Step 9: skills_list + skill_view + skill_manage tools ------------
+    if include_skill_tool and skill_registry is not None:
+        from claw.tools.skills_tool import create_skills_list_tool, create_skill_view_tool
+        from claw.tools.skill_manager_tool import create_skill_manage_tool
 
-        registry.register(create_use_skill_tool())
+        registry.register(create_skills_list_tool(skill_registry))
+        registry.register(create_skill_view_tool(skill_registry))
+        registry.register(create_skill_manage_tool(skill_registry))
 
     # -- Hierarchical memory tools ----------------------------------------
     if include_memory_tools and memory_store is not None:

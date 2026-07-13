@@ -45,10 +45,41 @@ _FORK_VOLATILE_META = frozenset({
     "title", "title_user_edited",
 })
 
+# Max session id length (filesystem-safe).  Base64-encoded filenames
+# grow ~1.33x, so 200 chars → ~270 char filenames, still safe on all
+# major filesystems.
+_SESSION_ID_MAX_LEN = 200
+
+# Disallowed characters in session ids: path separators, null bytes,
+# control characters.  Base64 encoding neutralises most traversal
+# attempts, but rejecting these upfront is defence-in-depth.
+_SESSION_ID_FORBIDDEN_CHARS = frozenset({"/", "\\", "\x00", "\n", "\r", "\t"})
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _validate_session_id(session_id: str) -> None:
+    """Validate *session_id* before any cache or filesystem operation.
+
+    Raises ``SessionStoreError`` when the id is empty, too long, or
+    contains forbidden characters.  This is defence-in-depth: even
+    though ``_encode_key`` base64-encodes the id, rejecting malformed
+    ids upfront avoids confusing error paths later.
+    """
+    if not session_id or not isinstance(session_id, str):
+        raise SessionStoreError("session id 不能为空")
+    if len(session_id) > _SESSION_ID_MAX_LEN:
+        raise SessionStoreError(
+            f"session id 过长（>{_SESSION_ID_MAX_LEN} 字符）: {session_id[:40]}..."
+        )
+    for ch in session_id:
+        if ch in _SESSION_ID_FORBIDDEN_CHARS or ord(ch) < 0x20:
+            raise SessionStoreError(
+                f"session id 包含非法字符: {session_id!r}"
+            )
 
 
 def replay_max_messages_for_context(context_window_tokens: int | None) -> int:
@@ -149,6 +180,8 @@ class SessionStore:
         self._cache: dict[str, Session] = {}
         self.load_warnings: list[str] = []
         self._legacy_sessions_dir: Path | None = None  # set for migration
+        # Cache for list_summaries() — invalidated on save/delete/rename.
+        self._summaries_cache: list[SessionSummary] | None = None
         self._load_all()
 
     @property
@@ -158,6 +191,11 @@ class SessionStore:
     @property
     def default_session_title(self) -> str:
         return "默认会话"
+
+    @property
+    def sessions_dir(self) -> Path:
+        """Return the sessions directory path."""
+        return self._sessions_dir
 
     # ------------------------------------------------------------------
     # Startup
@@ -338,42 +376,75 @@ class SessionStore:
         self, title: str | None = None, session_id: str | None = None
     ) -> Session:
         resolved_id = session_id or self._generate_session_id()
+        _validate_session_id(resolved_id)
         if resolved_id in self._cache:
             raise SessionStoreError(f"session id 已存在: {resolved_id}")
         session = Session(
             session_id=resolved_id,
             title=title or resolved_id,
         )
+        # Persist title into metadata so it survives reload.
+        # (rename() does the same sync; create_session was missing it.)
+        if title:
+            session.metadata["title"] = title
         self._cache[resolved_id] = session
+        self._summaries_cache = None
         self.save(session)
         return session
 
     def get(self, session_id: str) -> Session:
+        _validate_session_id(session_id)
         try:
             return self._cache[session_id]
         except KeyError as exc:
             raise SessionNotFoundError(f"未找到 session: {session_id}") from exc
 
     def exists(self, session_id: str) -> bool:
+        try:
+            _validate_session_id(session_id)
+        except SessionStoreError:
+            return False
         return session_id in self._cache
 
     def invalidate(self, session_id: str) -> None:
         """Remove from cache (force re-read from disk on next get)."""
+        try:
+            _validate_session_id(session_id)
+        except SessionStoreError:
+            return
         self._cache.pop(session_id, None)
+        self._summaries_cache = None
 
-    def rename(self, session_id: str, new_title: str) -> Session:
+    def rename(self, session_id: str, new_title: str, *, user_edited: bool = True) -> Session:
+        """Rename a session's title.
+
+        Args:
+            session_id: The session identifier.
+            new_title: The new title.
+            user_edited: If True, marks the title as user-edited (prevents
+                automatic title generation from overwriting it).
+        """
+        _validate_session_id(session_id)
         session = self.get(session_id)
         session.title = new_title
         session.metadata["title"] = new_title
-        session.metadata["title_user_edited"] = True
+        if user_edited:
+            session.metadata["title_user_edited"] = True
+        else:
+            # Auto-generated title — remove the user_edited flag so it can
+            # be overwritten by a future auto-title if needed.
+            session.metadata.pop("title_user_edited", None)
         session.touch()
+        self._summaries_cache = None
         self.save(session)
         return session
 
     def delete(self, session_id: str) -> bool:
         """Delete a session from disk and cache. Returns True if deleted."""
+        _validate_session_id(session_id)
         self.get(session_id)  # raises if missing
         del self._cache[session_id]
+        self._summaries_cache = None
         path = self._key_path(session_id)
         deleted = False
         if path.exists():
@@ -415,6 +486,8 @@ class SessionStore:
             ) from exc
 
         self._cache[session.session_id] = session
+        # Invalidate the summaries cache — the session list has changed.
+        self._summaries_cache = None
 
     @staticmethod
     def _write_jsonl(session: Session, path: Path, *, fsync: bool = False) -> None:
@@ -454,15 +527,14 @@ class SessionStore:
     # ------------------------------------------------------------------
 
     def list_summaries(self) -> list[SessionSummary]:
+        # Return cached summaries if available — avoids re-scanning all
+        # messages of all sessions on every call.
+        if self._summaries_cache is not None:
+            return self._summaries_cache
+
         summaries = []
         for session in self._cache.values():
-            preview = ""
-            for msg in session.messages:
-                if msg.role == "user" and not msg._command:
-                    preview = _text_preview(msg.content)
-                    break
-                if not preview and msg.role == "assistant":
-                    preview = _text_preview(msg.content)
+            preview = self._compute_preview(session.messages)
             summaries.append(SessionSummary(
                 session_id=session.session_id,
                 title=_metadata_title(session.metadata) or session.title,
@@ -471,7 +543,27 @@ class SessionStore:
                 preview=preview,
                 path=str(self._key_path(session.session_id)),
             ))
-        return sorted(summaries, key=lambda s: s.updated_at, reverse=True)
+        summaries.sort(key=lambda s: s.updated_at, reverse=True)
+        self._summaries_cache = summaries
+        return summaries
+
+    @staticmethod
+    def _compute_preview(messages: list[Message], *, scan_limit: int = 50) -> str:
+        """Extract a display preview from session messages.
+
+        Prefers the first real user message; falls back to the first
+        assistant message.  Only scans the first *scan_limit* messages
+        to avoid O(n) traversal of very long histories.
+        """
+        fallback = ""
+        for i, msg in enumerate(messages):
+            if i >= scan_limit:
+                break
+            if msg.role == "user" and not msg._command:
+                return _text_preview(msg.content)
+            if not fallback and msg.role == "assistant":
+                fallback = _text_preview(msg.content)
+        return fallback
 
     # ------------------------------------------------------------------
     # Crash recovery

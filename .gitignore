@@ -31,3 +31,6 @@ web/
 .vscode/
 .idea/
 .DS_Store
+
+# Agent
+.claude

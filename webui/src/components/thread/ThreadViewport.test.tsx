@@ -39,4 +39,76 @@ describe("ThreadViewport user messages", () => {
     expect(window.localStorage.getItem("sjtuclaw.user-avatar")).toBe("cat");
     expect(view.getByRole("button", { name: /猫咪/ })).toBeTruthy();
   });
+
+  it("renders network and workspace-local images inside messages", () => {
+    const view = render(
+      <ThreadViewport
+        messages={[
+          { role: "assistant", content: "![network](https://example.com/a.png)" },
+          { role: "assistant", content: "![local](C:\\workspace\\result.png)" },
+        ]}
+        loading={false}
+        sessionId="session-a"
+      />
+    );
+
+    expect(view.getByRole("img", { name: "network" }).getAttribute("src"))
+      .toBe("https://example.com/a.png");
+    expect(view.getByRole("img", { name: "local" }).getAttribute("src"))
+      .toBe("/sessions/session-a/local-image?path=C%3A%5Cworkspace%5Cresult.png");
+  });
+
+  it("turns image download links into inline message images", () => {
+    const view = render(
+      <ThreadViewport
+        messages={[{
+          role: "assistant",
+          content: "图片已生成：[点击下载 heart.png](/downloads/dl_demo)",
+        }]}
+        loading={false}
+        sessionId="session-a"
+      />
+    );
+
+    expect(view.getByRole("img", { name: "heart.png" }).getAttribute("src"))
+      .toBe("/downloads/dl_demo");
+  });
+
+  it("renders adjacent display math formulas with KaTeX", () => {
+    const view = render(
+      <ThreadViewport
+        messages={[{
+          role: "assistant",
+          content: "$$x = 16\\sin^3t$$$$y = 13\\cos t - 5\\cos 2t -2\\cos 3t -\\cos 4t$$",
+        }]}
+        loading={false}
+        sessionId="session-math"
+      />
+    );
+
+    expect(view.container.querySelectorAll(".katex-display")).toHaveLength(2);
+    expect(view.container.textContent).toContain("x=16");
+    expect(view.container.textContent).toContain("y=13");
+  });
+
+  it("renders native LaTeX inline and display delimiters", () => {
+    const view = render(
+      <ThreadViewport
+        messages={[{
+          role: "assistant",
+          content: "设 \\(D\\) 是有界区域，且 \\(P(x,y)\\) 连续：\n\n\\[\n\\oint_{\\partial D} P\\,dx + Q\\,dy = \\iint_D \\left(\\frac{\\partial Q}{\\partial x} - \\frac{\\partial P}{\\partial y}\\right) dx\\,dy\n\\]",
+        }]}
+        loading={false}
+        sessionId="session-native-latex"
+      />
+    );
+
+    expect(view.container.querySelectorAll(".katex").length).toBeGreaterThanOrEqual(3);
+    expect(
+      view.container.querySelectorAll(".katex-display"),
+      view.container.innerHTML
+    ).toHaveLength(1);
+    expect(view.container.textContent).not.toContain("\\oint");
+    expect(view.container.textContent).not.toContain("\\partial");
+  });
 });

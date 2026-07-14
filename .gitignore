@@ -24,6 +24,9 @@ node_modules/
 /claw_shell_*.txt
 /skills/.usage.json
 
+# Web UI build output
+web/
+
 # Editors / OS
 .vscode/
 .idea/

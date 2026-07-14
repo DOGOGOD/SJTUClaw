@@ -1,8 +1,10 @@
-import { Component, memo, useCallback, useEffect, useMemo, useRef, useState, lazy, Suspense } from "react";
+import { Children, Component, memo, useCallback, useEffect, useMemo, useRef, useState, lazy, Suspense } from "react";
 import { createPortal } from "react-dom";
-import ReactMarkdown from "react-markdown";
+import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkBreaks from "remark-breaks";
+import remarkMath from "remark-math";
+import rehypeKatex from "rehype-katex";
 import { Check, Copy } from "lucide-react";
 import { BrandAvatar } from "@/components/BrandAvatar";
 import { cn } from "@/lib/utils";
@@ -43,6 +45,130 @@ interface ThreadViewportProps {
   messages: ChatMessage[];
   loading: boolean;
   sessionId: string | null;
+}
+
+function markdownUrlTransform(url: string, key: string): string {
+  let decoded = url;
+  try { decoded = decodeURIComponent(url); } catch {}
+  if (key === "src" && (
+    /^file:/i.test(url) || /^[a-z]:[\\/]/i.test(decoded)
+  )) return url;
+  return defaultUrlTransform(url);
+}
+
+function resolveImageSource(source: string, sessionId: string | null): string {
+  if (!source || /^(https?:|data:image\/|blob:)/i.test(source) || source.startsWith("/")) {
+    return source;
+  }
+  let localPath = source;
+  try { localPath = decodeURIComponent(localPath); } catch {}
+  if (/^file:/i.test(localPath)) {
+    try { localPath = new URL(localPath).pathname; } catch {}
+    if (/^\/[a-z]:/i.test(localPath)) localPath = localPath.slice(1);
+  }
+  if (!sessionId) return source;
+  return `/sessions/${encodeURIComponent(sessionId)}/local-image?path=${encodeURIComponent(localPath)}`;
+}
+
+function normalizeMathSegment(segment: string): string {
+  let normalized = segment;
+
+  // LLMs commonly emit native LaTeX delimiters. Markdown treats the
+  // backslashes as escapes unless we translate them before parsing.
+  const inlineOpen = normalized.match(/\\\(/g)?.length || 0;
+  const inlineClose = normalized.match(/\\\)/g)?.length || 0;
+  if (inlineOpen > 0 && inlineOpen === inlineClose) {
+    normalized = normalized.replace(/\\\(/g, "$").replace(/\\\)/g, "$");
+  }
+  const displayOpen = normalized.match(/\\\[/g)?.length || 0;
+  const displayClose = normalized.match(/\\\]/g)?.length || 0;
+  if (displayOpen > 0 && displayOpen === displayClose) {
+    // A replacement string of "$$" means a single literal "$" in JS;
+    // callbacks preserve the two display-math delimiter characters.
+    normalized = normalized
+      .replace(/\\\[/g, () => "$$")
+      .replace(/\\\]/g, () => "$$");
+  }
+
+  const delimiters = normalized.match(/\$\$/g)?.length || 0;
+  if (delimiters < 2 || delimiters % 2 !== 0) return normalized;
+
+  let result = "";
+  let cursor = 0;
+  let open = false;
+  while (true) {
+    const index = normalized.indexOf("$$", cursor);
+    if (index < 0) break;
+    result += normalized.slice(cursor, index);
+    if (!result.endsWith("\n")) result += "\n";
+    result += "$$\n";
+    if (open) result += "\n";
+    open = !open;
+    cursor = index + 2;
+  }
+  return result + normalized.slice(cursor);
+}
+
+/** Make same-line/adjacent $$ blocks parseable without touching code samples. */
+function normalizeMathMarkdown(markdown: string): string {
+  if (!markdown.includes("$$") && !/\\[()[\]]/.test(markdown)) return markdown;
+  const code = /(```[\s\S]*?```|~~~[\s\S]*?~~~|`[^`\n]*`)/g;
+  let result = "";
+  let cursor = 0;
+  for (const match of markdown.matchAll(code)) {
+    const index = match.index ?? 0;
+    result += normalizeMathSegment(markdown.slice(cursor, index));
+    result += match[0];
+    cursor = index + match[0].length;
+  }
+  return result + normalizeMathSegment(markdown.slice(cursor));
+}
+
+function MessageImage({ src, alt, sessionId }: { src?: string; alt?: string; sessionId: string | null }) {
+  const [failed, setFailed] = useState(false);
+  if (!src) return null;
+  const resolved = resolveImageSource(src, sessionId);
+  if (failed) {
+    return <a href={resolved} target="_blank" rel="noreferrer">无法显示图片：{alt || src}</a>;
+  }
+  return (
+    <a href={resolved} target="_blank" rel="noreferrer" className="block no-underline">
+      <img
+        src={resolved}
+        alt={alt || "消息图片"}
+        loading="lazy"
+        onError={() => setFailed(true)}
+        className="my-2 max-h-[520px] max-w-full rounded-xl border border-border/60 object-contain shadow-sm"
+      />
+    </a>
+  );
+}
+
+function imageNameFromLink(children: React.ReactNode): string | null {
+  const text = Children.toArray(children)
+    .filter((child): child is string => typeof child === "string")
+    .join("");
+  const match = text.match(/[^\\/\s]+\.(?:png|jpe?g|gif|webp|bmp|avif)$/i);
+  return match?.[0] || null;
+}
+
+function MessageLink({
+  href,
+  children,
+  sessionId,
+  ...props
+}: React.AnchorHTMLAttributes<HTMLAnchorElement> & { sessionId: string | null }) {
+  const imageName = href && /\/downloads\/[^/]+$/i.test(href)
+    ? imageNameFromLink(children)
+    : null;
+  if (imageName && href) {
+    return <MessageImage src={href} alt={imageName} sessionId={sessionId} />;
+  }
+  return (
+    <a href={href} target="_blank" rel="noreferrer" {...props}>
+      {children}
+    </a>
+  );
 }
 
 const USER_AVATARS = [
@@ -378,12 +504,14 @@ const CodeBlock = memo(function CodeBlock({
 
 const MessageBubble = memo(function MessageBubble({
   message,
+  sessionId,
   userAvatarId,
   userAvatarImage,
   onUserAvatarChange,
   onUserAvatarImageChange,
 }: {
   message: ChatMessage;
+  sessionId: string | null;
   index: number;
   userAvatarId: UserAvatarSelection;
   userAvatarImage: string;
@@ -457,6 +585,7 @@ const MessageBubble = memo(function MessageBubble({
   }
 
   const isUser = message.role === "user";
+  const markdownContent = normalizeMathMarkdown(message.content);
 
   return (
     <div className={cn("flex gap-3 py-4 message-row md:gap-4", isUser ? "justify-end" : "")}>
@@ -473,8 +602,16 @@ const MessageBubble = memo(function MessageBubble({
           <div className="flex min-h-10 items-center rounded-2xl rounded-br-md border border-border/50 bg-secondary/75 px-4 py-2.5 text-[14px] leading-relaxed text-foreground/90 shadow-sm">
             <div className="user-message-content prose prose-sm dark:prose-invert max-w-none prose-p:leading-relaxed">
               <ReactMarkdown
-                remarkPlugins={[remarkGfm, remarkBreaks]}
+                remarkPlugins={[remarkGfm, remarkBreaks, remarkMath]}
+                rehypePlugins={[rehypeKatex]}
+                urlTransform={markdownUrlTransform}
                 components={{
+                  img({ src, alt }) {
+                    return <MessageImage src={src} alt={alt} sessionId={sessionId} />;
+                  },
+                  a({ href, children, ...props }) {
+                    return <MessageLink href={href} children={children} sessionId={sessionId} {...props} />;
+                  },
                   code({ className, children, ...props }) {
                     const match = /language-(\w+)/.exec(className || "");
                     const value = String(children).replace(/\n$/, "");
@@ -496,7 +633,7 @@ const MessageBubble = memo(function MessageBubble({
                   },
                 }}
               >
-                {message.content}
+                {markdownContent}
               </ReactMarkdown>
             </div>
           </div>
@@ -507,8 +644,16 @@ const MessageBubble = memo(function MessageBubble({
           )}>
             <div className="prose prose-sm dark:prose-invert max-w-none prose-p:leading-relaxed">
               <ReactMarkdown
-                remarkPlugins={[remarkGfm, remarkBreaks]}
+                remarkPlugins={[remarkGfm, remarkBreaks, remarkMath]}
+                rehypePlugins={[rehypeKatex]}
+                urlTransform={markdownUrlTransform}
                 components={{
+                  img({ src, alt }) {
+                    return <MessageImage src={src} alt={alt} sessionId={sessionId} />;
+                  },
+                  a({ href, children, ...props }) {
+                    return <MessageLink href={href} children={children} sessionId={sessionId} {...props} />;
+                  },
                   code({ className, children, ...props }) {
                     const match = /language-(\w+)/.exec(className || "");
                     const value = String(children).replace(/\n$/, "");
@@ -530,7 +675,7 @@ const MessageBubble = memo(function MessageBubble({
                   },
                 }}
               >
-                {message.content}
+                {markdownContent}
               </ReactMarkdown>
             </div>
           </div>
@@ -624,6 +769,7 @@ export function ThreadViewport({ messages, loading, sessionId }: ThreadViewportP
         <MessageBubble
           key={getMsgKey(msg, i)}
           message={msg}
+          sessionId={sessionId}
           index={i}
           userAvatarId={userAvatarId}
           userAvatarImage={userAvatarImage}

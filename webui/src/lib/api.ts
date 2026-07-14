@@ -219,6 +219,10 @@ export async function fetchWorkspace(sessionId: string): Promise<import("@/lib/t
   return request(`/workspace?sessionId=${encodeURIComponent(sessionId)}`);
 }
 
+export async function pickWorkspace(): Promise<{ ok: boolean; cancelled?: boolean; path: string }> {
+  return request("/workspace/pick", { method: "POST", body: "{}" });
+}
+
 export async function setWorkspace(sessionId: string, path: string): Promise<{ ok: boolean; workspace: string }> {
   return request("/workspace", {
     method: "POST",
@@ -422,6 +426,7 @@ export async function fetchSkillDetail(name: string): Promise<{
 export async function uploadAttachment(sessionId: string, file: File): Promise<{
   ok: boolean;
   attachment?: { id: string; originalName: string; storedName: string; size: number; mimeType: string; uploadedAt: string };
+  message?: { role: "user"; content: string; command?: boolean };
 }> {
   const fd = new FormData();
   fd.append("file", file);

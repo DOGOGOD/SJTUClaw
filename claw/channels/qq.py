@@ -22,11 +22,14 @@ Reference: https://bot.q.qq.com/wiki/develop/api-v2/
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
+import mimetypes
 import os
 import time
-from typing import Any
+from pathlib import Path
+from typing import Any, Awaitable, Callable
 
 import aiohttp
 
@@ -39,13 +42,21 @@ from claw.channels.qq_constants import (
     GATEWAY_URL_PATH,
     MAX_MESSAGE_LENGTH,
     MAX_QUICK_DISCONNECT_COUNT,
+    MEDIA_TYPE_FILE,
+    MEDIA_TYPE_IMAGE,
     MAX_RECONNECT_ATTEMPTS,
     MSG_TYPE_MARKDOWN,
+    MSG_TYPE_MEDIA,
     MSG_TYPE_TEXT,
     QUICK_DISCONNECT_THRESHOLD,
     RATE_LIMIT_DELAY,
     RECONNECT_BACKOFF,
     TOKEN_URL,
+)
+from claw.channels.qq_interactions import (
+    QQInteraction,
+    build_approval_keyboard,
+    parse_interaction,
 )
 
 logger = logging.getLogger(__name__)
@@ -159,6 +170,20 @@ class QQChannel(BaseChannel):
         # Dedup
         self._seen_messages: dict[str, float] = {}
         self._last_msg_id: dict[str, str] = {}
+        self._interaction_handler: Callable[[QQInteraction], Awaitable[None]] | None = None
+        self._pending_media: dict[str, list[str]] = {}
+
+    def set_interaction_handler(
+        self, handler: Callable[[QQInteraction], Awaitable[None]]
+    ) -> None:
+        self._interaction_handler = handler
+
+    def queue_outbound_media(self, chat_id: str, paths: list[str]) -> None:
+        if paths:
+            self._pending_media.setdefault(chat_id, []).extend(paths)
+
+    def _take_outbound_media(self, chat_id: str) -> list[str]:
+        return self._pending_media.pop(chat_id, [])
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -468,7 +493,8 @@ class QQChannel(BaseChannel):
             "d": {
                 "token": f"QQBot {token}",
                 "intents": (1 << 25)  # C2C_GROUP_AT_MESSAGES
-                           | (1 << 12),  # DIRECT_MESSAGE
+                           | (1 << 12)  # DIRECT_MESSAGE
+                           | (1 << 26),  # INTERACTION
                 "shard": [0, 1],
                 "properties": {
                     "$os": "Windows",
@@ -530,6 +556,8 @@ class QQChannel(BaseChannel):
                 "DIRECT_MESSAGE_CREATE",
             }:
                 asyncio.create_task(self._on_ws_event(t, d))
+            elif t == "INTERACTION_CREATE":
+                asyncio.create_task(self._on_interaction(d))
             return
 
         # op 11 = Heartbeat ACK
@@ -635,6 +663,7 @@ class QQChannel(BaseChannel):
                 OutboundMessage(
                     chat_id=user_openid,
                     content=reply,
+                    media=self._take_outbound_media(user_openid),
                     metadata={"message_id": msg_id, "chat_type": "c2c"},
                 )
             )
@@ -648,6 +677,13 @@ class QQChannel(BaseChannel):
             return
 
         member_openid = str(author.get("member_openid", ""))
+        if not member_openid or not self.is_allowed(member_openid):
+            logger.warning(
+                "[%s] Rejected group message from unauthorised member %s",
+                self._log_tag,
+                member_openid or "<missing>",
+            )
+            return
 
         # Strip @bot mention
         text = content
@@ -668,6 +704,7 @@ class QQChannel(BaseChannel):
                 OutboundMessage(
                     chat_id=group_openid,
                     content=reply,
+                    media=self._take_outbound_media(group_openid),
                     metadata={"message_id": msg_id, "chat_type": "group"},
                 )
             )
@@ -697,6 +734,7 @@ class QQChannel(BaseChannel):
                 OutboundMessage(
                     chat_id=guild_id,
                     content=reply,
+                    media=self._take_outbound_media(guild_id),
                     metadata={"message_id": msg_id, "chat_type": "dm"},
                 )
             )
@@ -706,9 +744,21 @@ class QQChannel(BaseChannel):
     # ------------------------------------------------------------------
 
     async def send(self, msg: OutboundMessage) -> None:
-        """Send a text message to a QQ user or group."""
-        if not msg.content.strip():
+        """Send text plus any network/local media to a QQ user or group."""
+        if not msg.content.strip() and not msg.media:
             return
+
+        if msg.media:
+            caption = msg.content
+            sent_media = False
+            for item in msg.media:
+                try:
+                    await self._send_media(msg, item, caption if not sent_media else "")
+                    sent_media = True
+                except Exception as exc:
+                    logger.error("[%s] Failed to send media %s: %s", self._log_tag, item, exc)
+            if sent_media:
+                return
 
         # Truncate long messages
         text = msg.content
@@ -760,3 +810,120 @@ class QQChannel(BaseChannel):
 
         except Exception as exc:
             logger.error("[%s] Failed to send message: %s", self._log_tag, exc)
+
+    async def send_approval(
+        self,
+        chat_id: str,
+        chat_type: str,
+        approval_id: str,
+        tool_name: str,
+        tool_args: dict[str, Any],
+        message_id: str | None = None,
+    ) -> None:
+        args_text = json.dumps(tool_args, ensure_ascii=False, default=str)
+        if len(args_text) > 900:
+            args_text = args_text[:900] + "…"
+        text = (
+            f"⚠️ 需要审批\n工具：{tool_name}\n参数：{args_text}\n\n"
+            f"也可回复 /approve {approval_id} 或 /reject {approval_id} [原因]"
+        )
+        await self._send_text_body(
+            chat_id, chat_type, text, message_id, keyboard=build_approval_keyboard(approval_id)
+        )
+
+    async def _send_text_body(
+        self,
+        chat_id: str,
+        chat_type: str,
+        text: str,
+        message_id: str | None,
+        keyboard: dict[str, Any] | None = None,
+    ) -> None:
+        token = await self._ensure_token()
+        headers = {"Authorization": f"QQBot {token}", "Content-Type": "application/json"}
+        use_markdown = self.config.markdown_support
+        body: dict[str, Any] = {
+            "msg_type": MSG_TYPE_MARKDOWN if use_markdown else MSG_TYPE_TEXT,
+            "msg_id": message_id,
+        }
+        body["markdown" if use_markdown else "content"] = (
+            {"content": text} if use_markdown else text
+        )
+        if keyboard is not None and chat_type in {"c2c", "group"}:
+            body["keyboard"] = keyboard
+        if not self._http_client:
+            import httpx
+            self._http_client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
+        target = "groups" if chat_type == "group" else "users"
+        response = await self._http_client.post(
+            f"{API_BASE}/v2/{target}/{chat_id}/messages", headers=headers, json=body
+        )
+        response.raise_for_status()
+
+    async def _send_media(self, msg: OutboundMessage, source: str, caption: str) -> None:
+        chat_type = msg.metadata.get("chat_type", "c2c") if msg.metadata else "c2c"
+        message_id = msg.metadata.get("message_id") if msg.metadata else None
+        is_url = source.startswith(("https://", "http://"))
+        suffix = Path(source.split("?", 1)[0]).suffix.lower()
+        mime_type = mimetypes.guess_type(source)[0] or ""
+        file_type = MEDIA_TYPE_IMAGE if mime_type.startswith("image/") or suffix in {
+            ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"
+        } else MEDIA_TYPE_FILE
+        body: dict[str, Any] = {"file_type": file_type, "srv_send_msg": False}
+        if is_url:
+            body["url"] = source
+        else:
+            path = Path(source).expanduser().resolve()
+            if not path.is_file():
+                raise FileNotFoundError(source)
+            if path.stat().st_size > 9 * 1024 * 1024:
+                raise ValueError("QQ 内联文件上传上限为 9 MB")
+            raw = await asyncio.to_thread(path.read_bytes)
+            body["file_data"] = base64.b64encode(raw).decode("ascii")
+            if file_type == MEDIA_TYPE_FILE:
+                body["file_name"] = path.name
+
+        token = await self._ensure_token()
+        headers = {"Authorization": f"QQBot {token}", "Content-Type": "application/json"}
+        if not self._http_client:
+            import httpx
+            self._http_client = httpx.AsyncClient(timeout=120.0, follow_redirects=True)
+        target = "groups" if chat_type == "group" else "users"
+        upload = await self._http_client.post(
+            f"{API_BASE}/v2/{target}/{msg.chat_id}/files", headers=headers, json=body
+        )
+        upload.raise_for_status()
+        upload_data = upload.json()
+        file_info = upload_data.get("file_info") or (upload_data.get("data") or {}).get("file_info")
+        if not file_info:
+            raise RuntimeError("QQ upload response missing file_info")
+        message_body: dict[str, Any] = {
+            "msg_type": MSG_TYPE_MEDIA,
+            "media": {"file_info": file_info},
+            "msg_id": message_id,
+        }
+        if caption:
+            message_body["content"] = caption[:MAX_MESSAGE_LENGTH]
+        response = await self._http_client.post(
+            f"{API_BASE}/v2/{target}/{msg.chat_id}/messages", headers=headers, json=message_body
+        )
+        response.raise_for_status()
+    async def _on_interaction(self, raw: Any) -> None:
+        if not isinstance(raw, dict):
+            return
+        event = parse_interaction(raw)
+        if event.interaction_id:
+            try:
+                token = await self._ensure_token()
+                headers = {"Authorization": f"QQBot {token}", "Content-Type": "application/json"}
+                if not self._http_client:
+                    import httpx
+                    self._http_client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
+                response = await self._http_client.put(
+                    f"{API_BASE}/interactions/{event.interaction_id}", headers=headers, json={"code": 0}
+                )
+                response.raise_for_status()
+            except Exception as exc:
+                logger.warning("[%s] Failed to ACK interaction: %s", self._log_tag, exc)
+        if self._interaction_handler:
+            await self._interaction_handler(event)

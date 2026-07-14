@@ -1,4 +1,4 @@
-"""Skill tools (Hermes-agent style): ``skills_list`` + ``skill_view``.
+"""Skill tools: ``skills_list`` + ``skill_view``.
 
 LLM-driven progressive disclosure:
 - ``skills_list`` — list available skills (name + description only, lightweight)

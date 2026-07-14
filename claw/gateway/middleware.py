@@ -8,17 +8,19 @@ Gateway middleware providing:
 
 from __future__ import annotations
 
+import hmac
 import logging
+import os
 import time
 import uuid
 from collections import defaultdict, deque
 from threading import Lock
 from typing import Any
 
-from fastapi import Request, Response
+from fastapi import Request
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
-from starlette.types import ASGIApp
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +39,69 @@ _INTERNAL_PET_PATHS = frozenset({
     "/pet/runtime/closed",
 })
 _LOOPBACK_CLIENTS = frozenset({"127.0.0.1", "::1", "localhost", "testclient"})
+
+
+def allowed_gateway_origins() -> list[str]:
+    """Return the exact browser origins allowed to control the gateway."""
+    gateway_port = os.getenv("GATEWAY_PORT", "8000").strip() or "8000"
+    defaults = {
+        f"http://127.0.0.1:{gateway_port}",
+        f"http://localhost:{gateway_port}",
+        "http://127.0.0.1:5173",
+        "http://localhost:5173",
+    }
+    configured = {
+        item.strip().rstrip("/")
+        for item in os.getenv("GATEWAY_ALLOWED_ORIGINS", "").split(",")
+        if item.strip()
+    }
+    return sorted(defaults | configured)
+
+
+class GatewaySecurityMiddleware(BaseHTTPMiddleware):
+    """Protect browser requests and require a token for remote clients.
+
+    Loopback CLI clients may omit both Origin and token. Browser requests must
+    come from an explicitly allowed local origin. Non-loopback clients always
+    need ``GATEWAY_API_TOKEN`` via Bearer or ``X-SJTUClaw-Token``.
+    """
+
+    def __init__(self, app: ASGIApp):
+        super().__init__(app)
+        self._allowed_origins = frozenset(allowed_gateway_origins())
+        self._token = os.getenv("GATEWAY_API_TOKEN", "").strip()
+
+    async def dispatch(self, request: Request, call_next):
+        path = request.url.path
+        if path in _RATE_EXEMPT_PATHS or _is_internal_pet_request(request, path):
+            return await call_next(request)
+
+        # Static assets and the SPA shell are read-only. API paths are the only
+        # resources that can mutate or expose local agent state.
+        if request.method in {"GET", "HEAD"} and (
+            path == "/"
+            or path.startswith("/assets/")
+            or path in {"/favicon.ico", "/claw-cat.png", "/claw-cat-transparent.png"}
+        ):
+            return await call_next(request)
+
+        client_host = request.client.host if request.client else "unknown"
+        is_loopback = client_host in _LOOPBACK_CLIENTS
+        origin = (request.headers.get("origin") or "").rstrip("/")
+        if origin and origin not in self._allowed_origins:
+            return JSONResponse(status_code=403, content={"ok": False, "error": "不受信任的请求来源。"})
+        if request.method == "OPTIONS":
+            return await call_next(request)
+
+        supplied = request.headers.get("x-sjtuclaw-token", "")
+        auth = request.headers.get("authorization", "")
+        if auth.lower().startswith("bearer "):
+            supplied = auth[7:].strip()
+        token_ok = bool(self._token and hmac.compare_digest(supplied, self._token))
+
+        if not is_loopback and not token_ok:
+            return JSONResponse(status_code=401, content={"ok": False, "error": "Gateway API 认证失败。"})
+        return await call_next(request)
 
 
 def _is_internal_pet_request(request: Request, path: str) -> bool:
@@ -144,32 +209,62 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         return response
 
 
-class RequestSizeMiddleware(BaseHTTPMiddleware):
-    """Reject requests whose body exceeds ``max_bytes``."""
+class RequestSizeMiddleware:
+    """ASGI body limiter that counts actual chunks, not only Content-Length."""
 
     def __init__(self, app: ASGIApp, max_bytes: int = MAX_REQUEST_BYTES):
-        super().__init__(app)
+        self.app = app
         self._max_bytes = max_bytes
 
-    async def dispatch(self, request: Request, call_next):
-        content_length = request.headers.get("content-length")
-        if content_length:
-            try:
-                size = int(content_length)
-                if size > self._max_bytes:
-                    return JSONResponse(
-                        status_code=413,
-                        content={
-                            "ok": False,
-                            "error": (
-                                f"请求体过大 ({size} bytes)，"
-                                f"上限为 {self._max_bytes} bytes。"
-                            ),
-                        },
-                    )
-            except ValueError:
-                pass
-        return await call_next(request)
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        path = scope.get("path", "")
+        limit = (
+            MAX_ATTACHMENT_BYTES + 1024 * 1024
+            if path.endswith("/attachments") or path == "/pet/pets"
+            else self._max_bytes
+        )
+        headers = {k.lower(): v for k, v in scope.get("headers", [])}
+        raw_length = headers.get(b"content-length", b"")
+        try:
+            declared = int(raw_length) if raw_length else None
+        except ValueError:
+            declared = None
+        if declared is not None and declared > limit:
+            response = JSONResponse(status_code=413, content={"ok": False, "error": "请求体超过大小限制。"})
+            await response(scope, receive, send)
+            return
+
+        consumed = 0
+        response_started = False
+
+        class _BodyTooLarge(Exception):
+            pass
+
+        async def limited_receive() -> Message:
+            nonlocal consumed
+            message = await receive()
+            if message["type"] == "http.request":
+                consumed += len(message.get("body", b""))
+                if consumed > limit:
+                    raise _BodyTooLarge
+            return message
+
+        async def tracked_send(message: Message) -> None:
+            nonlocal response_started
+            if message["type"] == "http.response.start":
+                response_started = True
+            await send(message)
+
+        try:
+            await self.app(scope, limited_receive, tracked_send)
+        except _BodyTooLarge:
+            if response_started:
+                raise
+            response = JSONResponse(status_code=413, content={"ok": False, "error": "请求体超过大小限制。"})
+            await response(scope, receive, send)
 
 
 class RequestLoggingMiddleware(BaseHTTPMiddleware):
@@ -233,6 +328,8 @@ __all__ = [
     "MAX_ATTACHMENT_BYTES",
     "RATE_LIMIT_WINDOW_S",
     "RATE_LIMIT_MAX_REQUESTS",
+    "allowed_gateway_origins",
+    "GatewaySecurityMiddleware",
     "RateLimiter",
     "RateLimitMiddleware",
     "RequestSizeMiddleware",

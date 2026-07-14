@@ -77,6 +77,10 @@ class Message:
             d["tool_call_id"] = self.tool_call_id
         if self.name:
             d["name"] = self.name
+        if self._command:
+            d["command"] = True
+        if self.media:
+            d["media"] = self.media
         return d
 
     def to_jsonl_dict(self) -> dict:

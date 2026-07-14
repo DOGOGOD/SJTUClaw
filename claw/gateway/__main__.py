@@ -31,6 +31,14 @@ def _webui_exists() -> bool:
 def main() -> int:
     force_utf8_stdio()
     host = os.getenv("GATEWAY_HOST", "127.0.0.1")
+    if host not in {"127.0.0.1", "::1", "localhost"} and not os.getenv(
+        "GATEWAY_API_TOKEN", ""
+    ).strip():
+        print(
+            "拒绝启动：监听非本机地址时必须设置 GATEWAY_API_TOKEN。",
+            file=sys.stderr,
+        )
+        return 1
     port_str = os.getenv("GATEWAY_PORT", "8000")
     try:
         port = int(port_str)

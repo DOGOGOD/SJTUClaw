@@ -156,6 +156,14 @@
   margin-top: 1.5em;
   margin-bottom: 0.5em;
 }
+.prose .katex-display {
+  max-width: 100%;
+  margin: 1em 0;
+  padding: 0.15em 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+.prose .katex-display > .katex { min-width: max-content; }
 
 /* ===========================================================================
    Taste-Skill animations

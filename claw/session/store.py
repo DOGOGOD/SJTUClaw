@@ -19,6 +19,7 @@ import json
 import os
 import re
 import shutil
+import uuid
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -466,7 +467,9 @@ class SessionStore:
         explicitly flushed (for graceful shutdown).
         """
         path = self._key_path(session.session_id)
-        tmp_path = path.with_suffix(f"{_SESSION_FILE_EXT}.tmp")
+        # A unique temporary file prevents concurrent background compaction or
+        # shutdown flushes from replacing another writer's in-progress file.
+        tmp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
 
         try:
             self._write_jsonl(session, tmp_path, fsync=fsync)

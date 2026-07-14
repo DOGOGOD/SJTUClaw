@@ -12,11 +12,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import mimetypes
 import os
 import queue
 import shutil
 import threading
 import uuid
+from urllib.parse import unquote, urlparse
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
 from pathlib import Path
@@ -73,6 +75,8 @@ from claw.pet.state import PetStateBroker
 
 # -- QQ channel support ---------------------------------------------------------
 from claw.channels.qq import QQChannel, QQConfig
+from claw.channels.base import OutboundMessage
+from claw.channels.qq_interactions import QQInteraction, parse_approval_button_data
 
 logger = logging.getLogger(__name__)
 
@@ -363,6 +367,7 @@ async def _lifespan(_app: FastAPI):
                 ack_message=_qq_cfg.ack_message,
             ))
             _qq_channel.set_message_handler(_qq_message_handler)
+            _qq_channel.set_interaction_handler(_qq_interaction_handler)
             _qq_task = asyncio.create_task(_qq_channel.start())
             print(f"[QQ] QQ 机器人已启动 (AppID: {_qq_cfg.app_id[:8]}...)")
 
@@ -392,23 +397,27 @@ app = FastAPI(
     lifespan=_lifespan,
 )
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 # -- Custom middleware ---------------------------------------------------------
 from claw.gateway.middleware import (
+    GatewaySecurityMiddleware,
+    MAX_ATTACHMENT_BYTES,
     RateLimitMiddleware,
     RequestLoggingMiddleware,
     RequestSizeMiddleware,
+    allowed_gateway_origins,
 )
+from claw.gateway.uploads import UploadTooLargeError, save_upload_limited
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=allowed_gateway_origins(),
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Request-ID", "X-SJTUClaw-Token"],
+)
 app.add_middleware(RequestSizeMiddleware)
 app.add_middleware(RateLimitMiddleware)
+app.add_middleware(GatewaySecurityMiddleware)
 app.add_middleware(RequestLoggingMiddleware)
 
 # Web UI is served at the end of the file (after all API routes).
@@ -423,18 +432,23 @@ _active_turns: dict[str, threading.Event] = {}
 _active_turns_lock = threading.Lock()
 
 
-def _register_active_turn(session_id: str) -> threading.Event:
-    """Register a new active turn and return its cancel event."""
+def _register_active_turn(session_id: str) -> threading.Event | None:
+    """Register a turn, or return None when the session is already busy."""
     event = threading.Event()
     with _active_turns_lock:
+        if session_id in _active_turns:
+            return None
         _active_turns[session_id] = event
     return event
 
 
-def _unregister_active_turn(session_id: str) -> None:
-    """Remove an active turn from tracking."""
+def _unregister_active_turn(
+    session_id: str, event: threading.Event | None = None
+) -> None:
+    """Remove a turn; identity-aware callers cannot remove a newer turn."""
     with _active_turns_lock:
-        _active_turns.pop(session_id, None)
+        if event is None or _active_turns.get(session_id) is event:
+            _active_turns.pop(session_id, None)
 
 
 def _cancel_active_turn(session_id: str) -> bool:
@@ -470,6 +484,41 @@ _qq_task: asyncio.Task | None = None
 _qq_session_map: dict[str, str] = {}
 
 
+_INLINE_IMAGE_EXTENSIONS = frozenset({
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".avif"
+})
+
+
+def _decorate_download_reply(
+    session_id: str,
+    reply: str,
+    downloads_before: set[str],
+) -> str:
+    """Add inline-image Markdown for image downloads created this turn."""
+    image_links: list[str] = []
+    for download_id in set(list_downloads()) - downloads_before:
+        file_path = get_download(download_id)
+        if file_path is None or file_path.suffix.lower() not in _INLINE_IMAGE_EXTENSIONS:
+            continue
+        marker = f"/downloads/{download_id}"
+        if marker not in reply:
+            image_links.append(f"![{file_path.name}]({marker})")
+    if not image_links:
+        return reply
+
+    decorated = reply.rstrip() + "\n\n图片已生成：\n" + "\n".join(image_links)
+    try:
+        session = _session_store.get(session_id)
+        for message in reversed(session.messages):
+            if message.role == "assistant" and message.content == reply:
+                message.content = decorated
+                _session_store.save(session)
+                break
+    except Exception:
+        logger.exception("无法将图片 Markdown 写回 session: %s", session_id)
+    return decorated
+
+
 def _find_existing_qq_session(chat_id: str) -> str | None:
     """Scan sessions on disk for a QQ session previously bound to *chat_id*.
 
@@ -489,6 +538,40 @@ def _find_existing_qq_session(chat_id: str) -> str | None:
         except Exception:
             continue
     return None
+
+
+async def _qq_interaction_handler(event: QQInteraction) -> None:
+    """Resolve an approval button after binding it to its chat and operator."""
+    parsed = parse_approval_button_data(event.button_data)
+    if parsed is None or _qq_channel is None:
+        return
+    approval_id, decision = parsed
+    req = _approval_manager.get(approval_id)
+    if req is None or req.status != ApprovalStatus.PENDING.value:
+        return
+    try:
+        session = _session_store.get(req.session_id)
+    except Exception:
+        return
+    if (
+        str(session.metadata.get("qq_chat_id", "")) != event.chat_id
+        or str(session.metadata.get("qq_sender_id", "")) != event.operator_id
+    ):
+        logger.warning("Rejected QQ approval interaction from a different chat/operator")
+        return
+    if decision == "approve":
+        _approval_manager.approve(approval_id)
+        result_text = f"已批准：{req.tool_name}"
+    else:
+        _approval_manager.reject(approval_id, "用户通过 QQ 按钮拒绝")
+        result_text = f"已拒绝：{req.tool_name}"
+    await _qq_channel.send(
+        OutboundMessage(
+            chat_id=event.chat_id,
+            content=result_text,
+            metadata={"chat_type": event.chat_type},
+        )
+    )
 
 
 async def _qq_message_handler(
@@ -527,6 +610,20 @@ async def _qq_message_handler(
             _session_store.save(session)
         _qq_session_map[chat_id] = session_key
 
+    session = _session_store.get(session_key)
+    is_approval_command = content.strip().lower().startswith(("/approve", "/reject"))
+    bound_sender = str(session.metadata.get("qq_sender_id", ""))
+    if is_approval_command and bound_sender and bound_sender != sender_id:
+        return "只有发起该操作的 QQ 用户可以审批。"
+
+    # Bind approvals to the exact user who initiated the agent turn. This
+    # matters in group chats where another member could otherwise approve it.
+    session.metadata["qq_chat_id"] = chat_id
+    session.metadata["qq_chat_type"] = chat_type
+    if not is_approval_command:
+        session.metadata["qq_sender_id"] = sender_id
+    _session_store.save(session)
+
     # Update cron tool context (with correct channel and chat_type metadata)
     _update_cron_context(
         session_key, chat_id, channel="qq",
@@ -542,6 +639,38 @@ async def _qq_message_handler(
         finally:
             _set_turn_session_id(None)
 
+    cancel_event = _register_active_turn(session_key)
+    if cancel_event is None:
+        return "当前会话已有任务正在运行，请稍后再试。"
+
+    loop = _asyncio.get_running_loop()
+    downloads_before = set(list_downloads())
+
+    def _qq_approval_handler(req: ApprovalRequest) -> ApprovalRequest:
+        _approval_manager.register(req)
+        _pet_state.approval_pending(req.session_id, req.tool_name)
+        if _qq_channel is not None:
+            future = _asyncio.run_coroutine_threadsafe(
+                _qq_channel.send_approval(
+                    chat_id,
+                    chat_type,
+                    req.approval_id,
+                    req.tool_name,
+                    req.tool_args,
+                    (metadata or {}).get("message_id"),
+                ),
+                loop,
+            )
+            try:
+                future.result(timeout=15)
+            except Exception:
+                logger.exception("QQ approval prompt could not be sent")
+        result = _approval_manager.wait(req.approval_id, timeout=300) or req
+        _pet_state.approval_resolved(
+            req.session_id, result.status == ApprovalStatus.APPROVED.value
+        )
+        return result
+
     # Non-command: run agent turn in a thread. The thread-local
     # session_id must be set INSIDE the worker thread.
     def _run_qq_turn() -> str:
@@ -554,16 +683,27 @@ async def _qq_message_handler(
                 context_builder=_context_builder,
                 tool_registry=_tool_registry,
                 llm_client=_llm_client,
-                approval_handler=None,  # QQ: no interactive approval
+                approval_handler=_qq_approval_handler,
                 compaction_worker=_compaction_worker,
                 auto_mode=_auto_mode.get(session_key, False),
                 unlimited_mode=_workspace_manager.is_unlimited(session_key),
+                cancel_event=cancel_event,
             )
         finally:
             _set_turn_session_id(None)
 
     try:
         reply = await _asyncio.to_thread(_run_qq_turn)
+        reply = _decorate_download_reply(session_key, reply, downloads_before)
+
+        if _qq_channel is not None:
+            new_download_ids = set(list_downloads()) - downloads_before
+            paths = [
+                str(path)
+                for download_id in new_download_ids
+                if (path := get_download(download_id)) is not None
+            ]
+            _qq_channel.queue_outbound_media(chat_id, paths)
 
         # Auto-title for QQ sessions
         try:
@@ -577,6 +717,8 @@ async def _qq_message_handler(
     except Exception as exc:
         print(f"[qq] agent turn 异常: {exc}")
         return "抱歉，处理你的消息时发生了内部错误。请重试。"
+    finally:
+        _unregister_active_turn(session_key, cancel_event)
 
 
 # ---------------------------------------------------------------------------
@@ -764,8 +906,12 @@ async def handle_chat(req: ChatRequest):
             "title": session.title,
         }
 
+    downloads_before = set(list_downloads())
+
     # Register a cancel event so /stop can interrupt this turn
     cancel_event = _register_active_turn(sid)
+    if cancel_event is None:
+        raise HTTPException(status_code=409, detail="该 Session 已有任务正在运行，请等待完成或先停止任务。")
 
     reply: str
     try:
@@ -804,7 +950,9 @@ async def handle_chat(req: ChatRequest):
             sid, "抱歉，Agent 在执行工具时意外中止。已保留现有进度，请重试。"
         )
     finally:
-        _unregister_active_turn(sid)
+        _unregister_active_turn(sid, cancel_event)
+
+    reply = _decorate_download_reply(sid, reply, downloads_before)
 
     # Safely retrieve session messages for the response
     messages: list[dict[str, Any]] = []
@@ -1056,8 +1204,6 @@ async def upload_attachment(session_id: str, file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="文件名不能为空")
 
     original_name = file.filename
-    content = await file.read()
-    size = len(content)
     mime_type = file.content_type or "application/octet-stream"
 
     attachment_id = f"att_{uuid.uuid4().hex[:12]}"
@@ -1067,13 +1213,28 @@ async def upload_attachment(session_id: str, file: UploadFile = File(...)):
     stored_name = f"{attachment_id}{safe_suffix}"
 
     d = _attachments_dir(session_id)
-    d.mkdir(parents=True, exist_ok=True)
     file_path = d / stored_name
-    file_path.write_bytes(content)
+    try:
+        size = await save_upload_limited(
+            file, file_path, max_bytes=MAX_ATTACHMENT_BYTES
+        )
+    except UploadTooLargeError as exc:
+        raise HTTPException(status_code=413, detail=str(exc)) from exc
 
     record = _add_attachment_record(
         session_id, attachment_id, original_name, stored_name, size, mime_type
     )
+
+    content_url = f"/sessions/{session_id}/attachments/{attachment_id}"
+    markdown_name = original_name.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+    message_content = (
+        f"![{markdown_name}]({content_url})"
+        if mime_type.startswith("image/")
+        else f"[{markdown_name}]({content_url})"
+    )
+    session = _session_store.get(session_id)
+    session.append_message("user", message_content, _command=True)
+    _session_store.save(session)
 
     return {
         "ok": True,
@@ -1085,7 +1246,62 @@ async def upload_attachment(session_id: str, file: UploadFile = File(...)):
             "mimeType": record["mimeType"],
             "uploadedAt": record["uploadedAt"],
         },
+        "message": {"role": "user", "content": message_content, "command": True},
     }
+
+
+@app.get("/sessions/{session_id}/attachments/{attachment_id}")
+def get_attachment_content(session_id: str, attachment_id: str):
+    if not _session_store.exists(session_id):
+        raise HTTPException(status_code=404, detail=f"Session 不存在: {session_id}")
+    record = next(
+        (r for r in _read_attachments_meta(session_id) if r.get("id") == attachment_id),
+        None,
+    )
+    if record is None:
+        raise HTTPException(status_code=404, detail="附件不存在")
+    root = _attachments_dir(session_id).resolve()
+    path = (root / str(record.get("storedName", ""))).resolve()
+    try:
+        path.relative_to(root)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="无效的附件路径") from exc
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="附件文件不存在")
+    media_type = str(record.get("mimeType") or "application/octet-stream")
+    if media_type.startswith("image/"):
+        return FileResponse(path, media_type=media_type, content_disposition_type="inline")
+    return FileResponse(
+        path,
+        media_type=media_type,
+        filename=str(record.get("originalName") or path.name),
+    )
+
+
+@app.get("/sessions/{session_id}/local-image")
+def get_local_image(session_id: str, path: str = Query(...)):
+    if not _session_store.exists(session_id):
+        raise HTTPException(status_code=404, detail=f"Session 不存在: {session_id}")
+    workspace = _workspace_manager.get(session_id)
+    # Sessions without an explicit binding still operate from the project
+    # workspace, so expose images there while retaining the same boundary.
+    root = (workspace or PROJECT_ROOT).resolve()
+    candidate_path = Path(path)
+    candidate = (
+        candidate_path.resolve()
+        if candidate_path.is_absolute()
+        else (root / candidate_path).resolve()
+    )
+    try:
+        candidate.relative_to(root)
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail="图片路径超出 workspace") from exc
+    media_type = mimetypes.guess_type(candidate.name)[0] or ""
+    if not candidate.is_file() or not media_type.startswith("image/"):
+        raise HTTPException(status_code=404, detail="本地图片不存在或格式不受支持")
+    if candidate.stat().st_size > 20 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="图片不能超过 20 MB")
+    return FileResponse(candidate, media_type=media_type, content_disposition_type="inline")
 
 
 @app.get("/sessions/{session_id}/attachments")
@@ -1122,6 +1338,36 @@ class SetWorkspaceRequest(BaseModel):
     path: str = Field(..., min_length=1)
 
 
+def _pick_workspace_directory() -> str:
+    """Open a native folder picker on the machine running the Gateway."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+    except Exception as exc:
+        raise RuntimeError("当前 Python 环境不支持原生文件夹选择器") from exc
+
+    try:
+        root = tk.Tk()
+    except Exception as exc:
+        raise RuntimeError("当前 Gateway 无法打开图形文件夹选择器") from exc
+    root.withdraw()
+    root.attributes("-topmost", True)
+    try:
+        return str(filedialog.askdirectory(title="选择 SJTUClaw Workspace") or "")
+    finally:
+        root.destroy()
+
+
+@app.post("/workspace/pick")
+async def pick_workspace_directory():
+    """Open a native folder picker without blocking the async Gateway loop."""
+    try:
+        path = await asyncio.to_thread(_pick_workspace_directory)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {"ok": True, "cancelled": not bool(path), "path": path}
+
+
 @app.get("/workspace")
 def get_workspace(session_id: str = Query(..., alias="sessionId")):
     """Get the workspace for a session."""
@@ -1137,9 +1383,19 @@ def get_workspace(session_id: str = Query(..., alias="sessionId")):
 @app.post("/workspace")
 def set_workspace(req: SetWorkspaceRequest):
     """Set the workspace for a session."""
+    raw_path = req.path.strip()
+    if len(raw_path) >= 2 and raw_path[0] == raw_path[-1] and raw_path[0] in {'"', "'"}:
+        raw_path = raw_path[1:-1].strip()
+    if raw_path.lower().startswith("file://"):
+        parsed = urlparse(raw_path)
+        raw_path = unquote(parsed.path)
+        if os.name == "nt" and raw_path.startswith("/") and len(raw_path) > 2 and raw_path[2] == ":":
+            raw_path = raw_path[1:]
+    if not raw_path:
+        raise HTTPException(status_code=400, detail="workspace 路径不能为空")
     try:
-        resolved = _workspace_manager.set(req.session_id, req.path)
-    except WorkspaceError as exc:
+        resolved = _workspace_manager.set(req.session_id, raw_path)
+    except (WorkspaceError, OSError) as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return {
         "ok": True,
@@ -1275,6 +1531,8 @@ async def install_pet(
     description: str = Form(""),
     sprite_version_number: int | None = Form(None, alias="spriteVersionNumber"),
 ):
+    if spritesheet.size is not None and spritesheet.size > MAX_ATTACHMENT_BYTES:
+        raise HTTPException(status_code=413, detail="spritesheet 超过 50 MB 限制")
     try:
         pet = _pet_catalog.install(
             pet_id=pet_id,
@@ -1374,10 +1632,17 @@ def serve_download(download_id: str):
         raise HTTPException(
             status_code=404, detail=f"文件已被删除: {file_path.name}"
         )
+    media_type = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
+    if media_type.startswith("image/"):
+        return FileResponse(
+            path=str(file_path),
+            media_type=media_type,
+            content_disposition_type="inline",
+        )
     return FileResponse(
         path=str(file_path),
         filename=file_path.name,
-        media_type="application/octet-stream",
+        media_type=media_type,
     )
 
 
@@ -1889,6 +2154,10 @@ async def handle_chat_stream(req: ChatRequest):
             },
         )
 
+    cancel_event = _register_active_turn(sid)
+    if cancel_event is None:
+        raise HTTPException(status_code=409, detail="该 Session 已有任务正在运行，请等待完成或先停止任务。")
+
     # Per-session event queue (thread-safe)
     event_queue: queue.Queue = queue.Queue()
     done = threading.Event()
@@ -1915,6 +2184,7 @@ async def handle_chat_stream(req: ChatRequest):
                 auto_mode=_auto_mode.get(sid, False),
                 unlimited_mode=_workspace_manager.is_unlimited(sid),
                 event_callback=_event_callback,
+                cancel_event=cancel_event,
             )
             # The FinalEvent is emitted inside run_agent_turn, but we
             # also send a session_id + autoMode info event
@@ -1939,6 +2209,7 @@ async def handle_chat_stream(req: ChatRequest):
             event_queue.put(FinalEvent(content=fallback))
         finally:
             _set_turn_session_id(None)
+            _unregister_active_turn(sid, cancel_event)
             done.set()
             event_queue.put(None)  # sentinel
 

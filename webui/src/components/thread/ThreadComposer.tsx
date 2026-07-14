@@ -3,7 +3,7 @@ import { ArrowUp, Plus, FolderOpen, FolderSearch, Square } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
-import { fetchWorkspace, setWorkspace, unsetWorkspace } from "@/lib/api";
+import { fetchWorkspace, pickWorkspace, setWorkspace, unsetWorkspace } from "@/lib/api";
 
 interface ThreadComposerProps {
   onSend: (message: string) => Promise<void>;
@@ -28,15 +28,16 @@ export function ThreadComposer({
   const [showWsPicker, setShowWsPicker] = useState(false);
   const [wsPath, setWsPath] = useState("");
   const [wsDisplay, setWsDisplay] = useState("");
+  const [wsError, setWsError] = useState("");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const wsRef = useRef<HTMLDivElement>(null);
-  const dirInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     if (!sessionId) {
       setWsPath("");
       setWsDisplay("");
+      setWsError("");
       return;
     }
     fetchWorkspace(sessionId).then((d) => {
@@ -106,31 +107,41 @@ export function ThreadComposer({
   );
 
   const handlePickFolder = useCallback(async () => {
-    if ("showDirectoryPicker" in window) {
-      try { const handle = await (window as any).showDirectoryPicker(); setWsPath((prev) => prev || handle.name); return; } catch {}
+    setWsError("");
+    try {
+      const result = await pickWorkspace();
+      if (result.path) {
+        setWsPath(result.path);
+        setWsDisplay(result.path.split("/").pop()?.split("\\").pop() || result.path);
+      }
+    } catch (error) {
+      setWsError(error instanceof Error ? error.message : "无法打开本机文件夹选择器。");
     }
-    dirInputRef.current?.click();
   }, []);
-
-  const handleDirInputChange = useCallback((e: React.ChangeEvent<HTMLInputElement>) => {
-    const files = e.target.files;
-    if (!files || files.length === 0) return;
-    const relPath = (files[0] as any).webkitRelativePath || "";
-    const folderName = relPath.split("/")[0] || "";
-    if (folderName && !wsPath) setWsPath(folderName);
-    e.target.value = "";
-  }, [wsPath]);
 
   const handleWsSet = async () => {
     if (!sessionId) return;
     const sid = sessionId;
-    try { await setWorkspace(sid, wsPath); setWsDisplay(wsPath.split("/").pop()?.split("\\").pop() || wsPath); setShowWsPicker(false); } catch {}
+    const path = wsPath.trim();
+    if (!path) {
+      setWsError("请填写 workspace 的绝对路径。");
+      return;
+    }
+    try {
+      await setWorkspace(sid, path);
+      setWsPath(path);
+      setWsDisplay(path.split("/").pop()?.split("\\").pop() || path);
+      setWsError("");
+      setShowWsPicker(false);
+    } catch (error) {
+      setWsError(error instanceof Error ? error.message : "workspace 设置失败，请检查路径是否存在且为文件夹。");
+    }
   };
 
   const handleWsUnset = async () => {
     if (!sessionId) return;
     const sid = sessionId;
-    try { await unsetWorkspace(sid); setWsPath(""); setWsDisplay(""); setShowWsPicker(false); } catch {}
+    try { await unsetWorkspace(sid); setWsPath(""); setWsDisplay(""); setWsError(""); setShowWsPicker(false); } catch {}
   };
 
   const hasContent = value.trim().length > 0;
@@ -176,17 +187,9 @@ export function ThreadComposer({
             <p className="mb-3 text-[11px] leading-relaxed text-muted-foreground">设置当前会话允许操作的项目目录。</p>
             <div className="flex gap-1.5 mb-2.5">
               <Input value={wsPath} onChange={(e) => setWsPath(e.target.value)} placeholder="选择文件夹或输入路径..." className="h-7 text-xs flex-1" onKeyDown={(e) => e.key === "Enter" && handleWsSet()} />
-              <input
-                ref={dirInputRef}
-                type="file"
-                className="hidden"
-                // @ts-expect-error webkitdirectory is non-standard
-                webkitdirectory=""
-                directory=""
-                onChange={handleDirInputChange}
-              />
               <Button variant="outline" size="sm" className="h-7 w-7 p-0 shrink-0" onClick={handlePickFolder}><FolderSearch className="h-3 w-3" /></Button>
             </div>
+            {wsError && <p role="alert" className="mb-2 text-[11px] leading-relaxed text-destructive">{wsError}</p>}
             <div className="flex gap-1.5">
               <Button size="sm" className="h-6 text-[10px]" onClick={handleWsSet}>设置</Button>
               {wsPath && <Button variant="ghost" size="sm" className="h-6 text-[10px] text-destructive" onClick={handleWsUnset}>取消</Button>}

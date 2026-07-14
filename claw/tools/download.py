@@ -87,6 +87,11 @@ def _make_create_download_handler(
                     "path": path_str,
                     "downloadId": download_id,
                     "fileName": resolved.name,
+                    "inlineMarkdown": (
+                        f"![{resolved.name}](/downloads/{download_id})"
+                        if resolved.suffix.lower() in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".avif"}
+                        else None
+                    ),
                     "result": "下载入口已创建",
                 },
                 ensure_ascii=False,
@@ -110,7 +115,8 @@ def create_download_tool(
         description=(
             "为 workspace 内已有文件创建一个可通过 Gateway 下载的临时入口。"
             "需要提供 path 参数（相对于 workspace 的文件路径）。"
-            "文件必须已存在。返回 downloadId，前端可通过此 ID 下载文件。"
+            "文件必须已存在。返回 downloadId，前端可通过此 ID 下载文件；图片还会返回 inlineMarkdown，"
+            "最终回复中必须使用该 Markdown 图片语法展示图片，不要说无法在消息中显示图片。"
         ),
         input_schema={
             "type": "object",

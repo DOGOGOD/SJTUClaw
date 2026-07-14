@@ -163,7 +163,7 @@ from claw.llm.client import LLMClient
 from claw.session.store import SessionStore
 
 
-from claw.tools.base import ToolRegistry
+from claw.tools.base import ToolRegistry, ToolResult
 
 
 
@@ -181,8 +181,23 @@ _APPROVAL_REQUIRED_LEVELS = {"write", "shell"}
 _SKILL_SELECT_LEVEL = "skill_select"
 
 
-_MAX_AGENT_ITERATIONS = int(os.getenv("CLAW_MAX_AGENT_ITERATIONS", "15"))
-_MAX_TOOL_CALLS_PER_TURN = max(1, int(os.getenv("CLAW_MAX_TOOL_CALLS_PER_TURN", "20")))
+def _positive_env_int(name: str, default: int) -> int:
+    """Read a positive integer without making module import fragile."""
+    raw = os.getenv(name, str(default))
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning("环境变量 %s=%r 不是整数，使用默认值 %d", name, raw, default)
+        return default
+    if value < 1:
+        logger.warning("环境变量 %s=%r 必须大于 0，使用默认值 %d", name, raw, default)
+        return default
+    return value
+
+
+_MAX_AGENT_ITERATIONS = _positive_env_int("CLAW_MAX_AGENT_ITERATIONS", 15)
+_MAX_TOOL_CALLS_PER_TURN = _positive_env_int("CLAW_MAX_TOOL_CALLS_PER_TURN", 20)
+_MAX_IDENTICAL_TOOL_CALLS = _positive_env_int("CLAW_MAX_IDENTICAL_TOOL_CALLS", 3)
 
 
 _MAX_REJECTIONS_PER_OPERATION = 3  # stop LLM from retrying the same rejected operation
@@ -210,6 +225,9 @@ def _now_iso() -> str:
 
 
 _session_aggregators: dict[str, Any] = {}
+_session_health_monitors: dict[str, Any] = {}
+_metrics_lock = threading.Lock()
+_MAX_METRIC_SESSIONS = 500
 
 
 
@@ -224,13 +242,15 @@ def get_session_metrics_summary(session_id: str) -> dict[str, Any] | None:
     """Return the aggregated metrics summary for *session_id*, or None."""
 
 
-    from claw.agent.metrics import TurnMetricsAggregator
-
-
-    agg = _session_aggregators.get(session_id)
-
-
-    return agg.summary() if agg else None
+    with _metrics_lock:
+        agg = _session_aggregators.get(session_id)
+        monitor = _session_health_monitors.get(session_id)
+    if agg is None:
+        return None
+    summary = agg.summary()
+    if monitor is not None:
+        summary["health"] = monitor.summary()
+    return summary
 
 
 
@@ -461,6 +481,44 @@ def run_agent_turn(
 
     """
 
+    from claw.agent.health import LoopHealthMonitor
+    from claw.agent.metrics import TurnMetrics, TurnMetricsAggregator
+
+    metrics = TurnMetrics(session_id=session_id, turn_id=f"{session_id}:{time.time_ns()}")
+    tool_outcomes: list[dict[str, Any]] = []
+    tool_progress: dict[str, tuple[str, int]] = {}
+    reply_finished = False
+
+    def _record_outcome(tool_name: str, status: str, detail: str = "") -> None:
+        """Keep a compact, non-sensitive record for deterministic summaries."""
+        compact = " ".join(str(detail or "").split())
+        if len(compact) > 180:
+            compact = compact[:177] + "..."
+        tool_outcomes.append({"tool": tool_name, "status": status, "detail": compact})
+
+    def _completion_brief(status: str, reason: str) -> str:
+        labels = {
+            "completed": "已完成",
+            "partial": "部分完成",
+            "cancelled": "已终止",
+            "failed": "未完成",
+        }
+        successful = [item for item in tool_outcomes if item["status"] == "ok"]
+        unsuccessful = [item for item in tool_outcomes if item["status"] != "ok"]
+        lines = ["任务处理简报", f"- 状态：{labels.get(status, status)}"]
+        if successful:
+            names = list(dict.fromkeys(item["tool"] for item in successful))
+            lines.append(f"- 已完成：{len(successful)} 次工具操作（{', '.join(names)}）")
+            details = [item["detail"] for item in successful if item["detail"]]
+            if details:
+                lines.append(f"- 最近结果：{details[-1]}")
+        if unsuccessful:
+            names = list(dict.fromkeys(item["tool"] for item in unsuccessful))
+            lines.append(f"- 未成功：{len(unsuccessful)} 次操作（{', '.join(names)}）")
+        if reason:
+            lines.append(f"- 说明：{reason}")
+        return "\n".join(lines)
+
 
 
 
@@ -471,7 +529,7 @@ def run_agent_turn(
         """Background compaction is handled by the idle compaction worker.
 
 
-        (nanobot-style: only compact idle sessions, not every turn.)"""
+        (only compact idle sessions, not every turn.)"""
 
 
         pass
@@ -511,28 +569,31 @@ def run_agent_turn(
 
 
 
-    def _finish_reply(text: str | None, *, empty_reason: str = "") -> str:
+    def _finish_reply(
+        text: str | None,
+        *,
+        empty_reason: str = "",
+        status: str = "completed",
+    ) -> str:
 
 
         """Persist and emit exactly one non-empty assistant reply."""
 
 
+        nonlocal reply_finished
         final_text = text if isinstance(text, str) else ""
 
 
         if not final_text.strip():
 
 
-            final_text = empty_reason or (
+            reason = empty_reason or "模型没有生成有效回复，已根据本轮执行记录生成简报。"
+            final_text = _completion_brief(status, reason)
 
-
-                "本轮处理已经结束，但模型没有生成有效回复。"
-
-
-                "请重试，或将任务拆分成更小的步骤。"
-
-
-            )
+        if reply_finished:
+            logger.warning("忽略重复的 turn 终止请求: session=%s", session_id)
+            return final_text
+        reply_finished = True
 
 
         session.append_message("assistant", final_text)
@@ -545,6 +606,29 @@ def run_agent_turn(
 
 
         _emit_event(FinalEvent(content=final_text))
+
+        metric_status = "ok" if status == "completed" else status
+        metrics.finalize(status=metric_status, error="" if status == "completed" else empty_reason)
+        with _metrics_lock:
+            aggregator = _session_aggregators.setdefault(session_id, TurnMetricsAggregator())
+            monitor = _session_health_monitors.setdefault(session_id, LoopHealthMonitor())
+            while len(_session_aggregators) > _MAX_METRIC_SESSIONS:
+                oldest_session = next(iter(_session_aggregators))
+                if oldest_session == session_id and len(_session_aggregators) > 1:
+                    oldest_session = next(
+                        key for key in _session_aggregators if key != session_id
+                    )
+                _session_aggregators.pop(oldest_session, None)
+                _session_health_monitors.pop(oldest_session, None)
+        aggregator.add(metrics)
+        monitor.record_turn(metrics)
+        alerts = monitor.check_health()
+        if alerts:
+            logger.warning(
+                "Agent loop health alert session=%s: %s",
+                session_id,
+                "; ".join(f"{alert.category}:{alert.level}" for alert in alerts),
+            )
 
 
         return final_text
@@ -688,10 +772,11 @@ def run_agent_turn(
             logger.info("Agent turn cancelled by user at iteration %d", turn_count)
 
 
-            cancel_msg = "任务已被用户终止。"
-
-
-            return _finish_reply(cancel_msg)
+            return _finish_reply(
+                None,
+                empty_reason="用户已终止本轮任务；已完成的操作和结果仍然保留。",
+                status="cancelled",
+            )
 
 
 
@@ -706,27 +791,25 @@ def run_agent_turn(
             print(f"[agent] 已达到最大迭代次数 {_MAX_AGENT_ITERATIONS}，强制终止循环")
 
 
-            final_text = (
-
-
-                "已达到最大迭代次数限制，代理循环已被强制终止。"
-
-
-                "请检查任务是否过于复杂，可尝试拆分为更小的子任务后重新运行。"
-
-
+            metrics.record_max_iterations()
+            return _finish_reply(
+                None,
+                empty_reason=(
+                    f"已达到 {_MAX_AGENT_ITERATIONS} 次迭代上限；"
+                    "为防止循环失控已安全停止，可拆分任务后继续。"
+                ),
+                status="partial" if tool_outcomes else "failed",
             )
 
 
-            return _finish_reply(final_text)
 
 
 
-
-
+        metrics.record_iteration()
         _emit_event(ThinkingEvent(iteration=turn_count))
 
 
+        llm_call_started = False
         try:
 
 
@@ -751,10 +834,21 @@ def run_agent_turn(
 
 
 
+            metrics.start_llm_call()
+            llm_call_started = True
             response = llm_client.chat_with_tools(messages, tool_defs)
+            if response is None or not hasattr(response, "is_final") or not hasattr(response, "is_tool_call"):
+                raise TypeError("模型客户端返回了无效的 AgentResponse")
+            metrics.end_llm_call(
+                ok=True,
+                truncated=getattr(response, "finish_reason", None) == "length",
+            )
 
 
         except Exception:
+
+            if llm_call_started:
+                metrics.end_llm_call(ok=False)
 
 
             logger.exception("Agent 在第 %d 轮调用模型失败", turn_count)
@@ -763,28 +857,16 @@ def run_agent_turn(
             _emit_event(ErrorEvent(error="模型调用失败，Agent 已安全结束本轮任务。"))
 
 
-            if tool_calls_used:
-
-
-                message = (
-
-
-                    "工具调用已执行，但在整理最终结果时模型服务发生异常。"
-
-
+            return _finish_reply(
+                None,
+                empty_reason=(
+                    "工具调用已执行，但模型服务在整理最终回复时发生异常；"
                     "已保留当前工具结果，请稍后重试。"
-
-
-                )
-
-
-            else:
-
-
-                message = "模型服务暂时不可用，本轮未能完成处理。请稍后重试。"
-
-
-            return _finish_reply(message)
+                    if tool_outcomes
+                    else "模型服务暂时不可用，本轮未能开始处理，请稍后重试。"
+                ),
+                status="partial" if tool_outcomes else "failed",
+            )
 
 
 
@@ -797,6 +879,18 @@ def run_agent_turn(
 
 
             final_text = response.final
+
+            if getattr(response, "finish_reason", None) == "length":
+                if final_text.strip():
+                    final_text = (
+                        final_text.rstrip()
+                        + "\n\n> 回复达到模型输出长度限制，以上内容可能不完整；可让我继续。"
+                    )
+                return _finish_reply(
+                    final_text,
+                    empty_reason="模型输出达到长度限制且未返回正文；已保留本轮进度。",
+                    status="partial",
+                )
 
 
             return _finish_reply(
@@ -834,8 +928,20 @@ def run_agent_turn(
 
         if response.is_tool_call:
 
+            if tool_limit_reached:
+                return _finish_reply(
+                    None,
+                    empty_reason=(
+                        "模型在工具调用已关闭后仍请求工具；为避免空转已安全停止。"
+                    ),
+                    status="partial" if tool_outcomes else "failed",
+                )
+
 
             for tc in response.tool_calls:
+
+                if tool_limit_reached:
+                    break
 
 
                 if tool_calls_used >= _MAX_TOOL_CALLS_PER_TURN:
@@ -876,6 +982,8 @@ def run_agent_turn(
 
                     )
 
+                    _record_outcome(tc.name, "blocked", limit_message)
+
 
                     logger.warning("单轮工具调用达到上限: %d", _MAX_TOOL_CALLS_PER_TURN)
 
@@ -887,6 +995,8 @@ def run_agent_turn(
 
 
                 args_json = json.dumps(tc.args, ensure_ascii=False)
+
+                call_signature = f"{tc.name}:{json.dumps(tc.args, sort_keys=True, ensure_ascii=False)}"
 
 
                 print(f"[tool_call #{turn_count}] {tc.name} {args_json}")
@@ -1009,11 +1119,10 @@ def run_agent_turn(
                 needs_approval = _needs_approval(tc.name)
 
 
-                # UNLIMITED removes the workspace sandbox.  Every mutating or
-                # shell operation therefore requires an explicit user decision,
-                # even when AUTO is enabled.  A channel without an interactive
-                # approval mechanism must fail closed instead of executing.
-                if needs_approval and unlimited_mode and approval_handler is None:
+                # A channel without an interactive approval mechanism must
+                # always fail closed. Otherwise remote channels could bypass
+                # the approval gate simply by omitting the callback.
+                if needs_approval and approval_handler is None:
 
 
                     result_content = json.dumps(
@@ -1031,7 +1140,7 @@ def run_agent_turn(
                             "result": (
 
 
-                                "UNLIMITED 模式下的写入、删除和 shell 操作必须经过用户审批。"
+                                "写入、删除和 shell 操作必须经过用户审批。"
 
 
                                 "当前通道不支持交互式审批，操作已拒绝；请改用 CLI 或 WebUI。"
@@ -1051,8 +1160,10 @@ def run_agent_turn(
 
                     session.append_message("tool", result_content)
 
+                    _record_outcome(tc.name, "rejected", "当前通道不支持交互式审批")
 
-                    print(f"[tool_result] {tc.name}: 已拒绝 — UNLIMITED 模式需要显式审批")
+
+                    print(f"[tool_result] {tc.name}: 已拒绝 — 当前通道不支持显式审批")
 
 
                     continue
@@ -1160,25 +1271,34 @@ def run_agent_turn(
                         req = _make_approval_request(session_id, tc.name, tc.args)
 
 
-                        decided = approval_handler(req)
+                        try:
+                            decided = approval_handler(req)
+                        except Exception as exc:
+                            logger.exception("工具 %s 的审批回调执行失败", tc.name)
+                            _emit_event(ErrorEvent(error=f"{tc.name} 的审批流程异常，操作已安全拒绝。"))
+                            decided = None
+                            approval_error = str(exc)
+                        else:
+                            approval_error = ""
 
 
 
 
 
-                        if decided is None or decided.status == ApprovalStatus.REJECTED.value:
+                        decision_status = getattr(decided, "status", None)
+                        if decision_status != ApprovalStatus.APPROVED.value:
 
 
                             reason = (
 
 
-                                decided.reject_reason
+                                getattr(decided, "reject_reason", "")
 
 
-                                if decided and decided.reject_reason
+                                if decided and getattr(decided, "reject_reason", "")
 
 
-                                else "操作被拒绝，未提供具体原因"
+                                else approval_error or "审批未明确通过，操作已安全拒绝"
 
 
                             )
@@ -1199,7 +1319,7 @@ def run_agent_turn(
 
 
 
-                            if rejection_count >= 3:
+                            if rejection_count >= _MAX_REJECTIONS_PER_OPERATION:
 
 
                                 result_content = json.dumps({
@@ -1258,8 +1378,13 @@ def run_agent_turn(
 
                             session.append_message("tool", result_content)
 
+                            _record_outcome(tc.name, "rejected", reason)
 
-                            print(f"[tool_result] {tc.name}: 已拒绝 ({rejection_count}/3) — {reason}")
+
+                            print(
+                                f"[tool_result] {tc.name}: 已拒绝 "
+                                f"({rejection_count}/{_MAX_REJECTIONS_PER_OPERATION}) — {reason}"
+                            )
 
 
                             continue
@@ -1300,8 +1425,23 @@ def run_agent_turn(
 
                 tool_started_at = time.perf_counter()
 
+                metrics.start_tool_call()
 
-                result = tool_registry.execute_by_name(tc.name, tc.args)
+                try:
+                    result = tool_registry.execute_by_name(tc.name, tc.args)
+                except Exception as exc:
+                    logger.exception("工具注册表执行 %s 时发生异常", tc.name)
+                    result = ToolResult(
+                        ok=False,
+                        error=f"工具执行框架发生异常，操作已安全中止：{exc}",
+                    )
+                    _emit_event(ErrorEvent(error=f"{tc.name} 执行异常，已转为失败结果。"))
+
+                if not all(hasattr(result, attr) for attr in ("ok", "content", "error")):
+                    logger.error("工具注册表为 %s 返回了无效类型: %s", tc.name, type(result).__name__)
+                    result = ToolResult(ok=False, error="工具执行框架返回了无效结果")
+
+                metrics.end_tool_call(ok=result.ok)
 
 
 
@@ -1314,6 +1454,8 @@ def run_agent_turn(
 
 
                     print(f"[tool_result] {tc.name}: 成功")
+
+                    _record_outcome(tc.name, "ok", result_content)
 
 
                 else:
@@ -1333,11 +1475,31 @@ def run_agent_turn(
 
                     print(f"[tool_result] {tc.name}: 失败 — {result.error}")
 
+                    _record_outcome(tc.name, "error", result.error or "未知错误")
+
 
 
 
 
                 tool_msg_content = result.content if (result.ok and result.content) else result_content
+
+                # Polling is legitimate while results change. Treat only an
+                # unchanged tool+args+result sequence as a stuck loop.
+                result_fingerprint = f"{result.ok}:{tool_msg_content}"
+                previous_fingerprint, stagnant_count = tool_progress.get(
+                    call_signature, ("", 0)
+                )
+                stagnant_count = stagnant_count + 1 if previous_fingerprint == result_fingerprint else 1
+                tool_progress[call_signature] = (result_fingerprint, stagnant_count)
+                if stagnant_count >= _MAX_IDENTICAL_TOOL_CALLS:
+                    tool_limit_reached = True
+                    repeat_message = (
+                        f"检测到相同工具和相同结果连续出现 {stagnant_count} 次，"
+                        "已停止继续调用工具并进入结果总结。"
+                    )
+                    tool_msg_content = f"{tool_msg_content}\n\n[loop_guard] {repeat_message}"
+                    _record_outcome(tc.name, "blocked", repeat_message)
+                    logger.warning("检测到无进展的重复工具调用: %s", call_signature)
 
 
                 session.append_message("tool", tool_msg_content)
@@ -1598,25 +1760,36 @@ def _handle_skill_select(
         )
 
 
-        decided = approval_handler(req)
+        try:
+            decided = approval_handler(req)
+        except Exception as exc:
+            logger.exception("skill %s 的审批回调执行失败", skill_name)
+            return json.dumps(
+                {
+                    "tool": "use_skill",
+                    "ok": False,
+                    "result": f"skill 审批流程异常，已安全拒绝: {exc}",
+                },
+                ensure_ascii=False,
+            )
 
 
 
 
 
-        if decided is None or decided.status == ApprovalStatus.REJECTED.value:
+        if getattr(decided, "status", None) != ApprovalStatus.APPROVED.value:
 
 
             reason = (
 
 
-                decided.reject_reason
+                getattr(decided, "reject_reason", "")
 
 
-                if decided and decided.reject_reason
+                if decided and getattr(decided, "reject_reason", "")
 
 
-                else "用户拒绝加载该 skill，未提供具体原因"
+                else "skill 审批未明确通过，已安全拒绝"
 
 
             )

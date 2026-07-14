@@ -61,7 +61,7 @@ _HELP_TEXT = (
     "    show <name>              查看 Skill 详情\n"
     "    usage                    查看使用记录\n"
     "    <name> <任务描述>        使用指定 Skill 执行任务\n"
-    "  /cron <sub> ...          定时作业管理 (nanobot 兼容)\n"
+    "  /cron <sub> ...          定时作业管理\n"
     "    list                     列出所有作业\n"
     "    status                   服务状态\n"
     "    disable <jobId>          禁用作业\n"
@@ -609,7 +609,8 @@ def _handle_approvals_list(state: RuntimeState) -> str:
     if state.approval_manager is None:
         return "Approval manager 未初始化。"
 
-    pending = state.approval_manager.get_pending()
+    pending = [r for r in state.approval_manager.get_pending()
+               if r.session_id == state.current_session_id]
     if not pending:
         return "当前没有待审批的操作。"
 
@@ -637,8 +638,9 @@ def _handle_approve(args: list[str], state: RuntimeState) -> str:
         return "Approval manager 未初始化。"
 
     if not args:
-        # If there's exactly one pending, use it
-        pending = state.approval_manager.get_pending()
+        # If there's exactly one pending in this session, use it.
+        pending = [r for r in state.approval_manager.get_pending()
+                   if r.session_id == state.current_session_id]
         if len(pending) == 1:
             approval_id = pending[0].approval_id
         else:
@@ -646,9 +648,10 @@ def _handle_approve(args: list[str], state: RuntimeState) -> str:
     else:
         approval_id = args[0]
 
+    existing = state.approval_manager.get(approval_id)
+    if existing is None or existing.session_id != state.current_session_id:
+        return f"未找到当前会话的审批请求: {approval_id}"
     req = state.approval_manager.approve(approval_id)
-    if req is None:
-        return f"未找到审批请求: {approval_id}"
     return f"已批准: [{req.approval_id}] {req.tool_name}"
 
 
@@ -660,7 +663,8 @@ def _handle_reject(raw_input: str, args: list[str], state: RuntimeState) -> str:
         return "Approval manager 未初始化。"
 
     if not args:
-        pending = state.approval_manager.get_pending()
+        pending = [r for r in state.approval_manager.get_pending()
+                   if r.session_id == state.current_session_id]
         if len(pending) == 1:
             approval_id = pending[0].approval_id
         else:
@@ -676,9 +680,10 @@ def _handle_reject(raw_input: str, args: list[str], state: RuntimeState) -> str:
     else:
         reason = ""
 
+    existing = state.approval_manager.get(approval_id)
+    if existing is None or existing.session_id != state.current_session_id:
+        return f"未找到当前会话的审批请求: {approval_id}"
     req = state.approval_manager.reject(approval_id, reason)
-    if req is None:
-        return f"未找到审批请求: {approval_id}"
     reason_text = f"原因: {reason}" if reason else "未提供原因"
     return f"已拒绝: [{req.approval_id}] {req.tool_name} ({reason_text})"
 
@@ -847,7 +852,7 @@ def _handle_reflect_command(args: list[str], state: RuntimeState) -> str:
 
 
 def _handle_cron_command(args: list[str], state: RuntimeState) -> str:
-    """Handle /cron commands (nanobot-compatible)."""
+    """Handle /cron commands."""
     if state.cron_service is None:
         return "Cron 服务未初始化。"
 

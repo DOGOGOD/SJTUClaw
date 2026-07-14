@@ -9,7 +9,8 @@ from claw.agent.events import (
     ToolCallEndEvent,
     ToolCallStartEvent,
 )
-from claw.agent.loop import run_agent_turn
+from claw.agent.loop import get_session_metrics_summary, run_agent_turn
+from claw.approval.manager import ApprovalRequest
 from claw.llm.protocol import AgentResponse, ToolCallRequest
 from claw.session.store import SessionStore
 from claw.tools.base import Tool, ToolRegistry, ToolResult
@@ -104,6 +105,8 @@ def test_empty_final_after_tool_is_replaced_with_visible_reply(tmp_path):
     )
 
     assert reply.strip()
+    assert "任务处理简报" in reply
+    assert "探测完成" in reply
     assert "没有生成最终回复" in reply
     assert store.get("empty-after-tool").messages[-1].content == reply
 
@@ -145,3 +148,119 @@ def test_broken_event_callback_does_not_interrupt_reply(tmp_path):
 
     assert reply == "完成"
     assert store.get("callback-error").messages[-1].content == "完成"
+
+
+def test_pending_approval_never_executes_mutating_tool(tmp_path):
+    store = _store(tmp_path, "pending-approval")
+    executed = []
+    registry = ToolRegistry()
+    registry.register(
+        Tool(
+            name="write_probe",
+            description="mutating test tool",
+            input_schema={"type": "object", "properties": {}},
+            handler=lambda args: executed.append(True) or ToolResult(ok=True, content="已写入"),
+            safety_level="write",
+        )
+    )
+
+    reply = run_agent_turn(
+        "pending-approval",
+        "执行写入",
+        session_store=store,
+        context_builder=_Context(),
+        tool_registry=registry,
+        llm_client=_SequenceLLM(
+            AgentResponse(tool_calls=[ToolCallRequest(name="write_probe", args={})]),
+            AgentResponse(final="写入未获批准"),
+        ),
+        approval_handler=lambda req: ApprovalRequest(
+            session_id=req.session_id,
+            tool_name=req.tool_name,
+            tool_args=req.tool_args,
+        ),
+    )
+
+    assert reply == "写入未获批准"
+    assert executed == []
+    assert "审批未明确通过" in store.get("pending-approval").messages[-2].content
+
+
+def test_approval_callback_exception_becomes_safe_observation(tmp_path):
+    store = _store(tmp_path, "approval-exception")
+    registry = ToolRegistry()
+    registry.register(
+        Tool(
+            name="write_probe",
+            description="mutating test tool",
+            input_schema={"type": "object", "properties": {}},
+            handler=lambda args: ToolResult(ok=True, content="不应执行"),
+            safety_level="write",
+        )
+    )
+
+    def broken_approval(req):
+        raise RuntimeError("approval transport disconnected")
+
+    reply = run_agent_turn(
+        "approval-exception",
+        "执行写入",
+        session_store=store,
+        context_builder=_Context(),
+        tool_registry=registry,
+        llm_client=_SequenceLLM(
+            AgentResponse(tool_calls=[ToolCallRequest(name="write_probe", args={})]),
+            AgentResponse(final="操作已安全停止"),
+        ),
+        approval_handler=broken_approval,
+    )
+
+    assert reply == "操作已安全停止"
+    assert "transport disconnected" in store.get("approval-exception").messages[-2].content
+
+
+def test_repeated_identical_tool_call_stops_with_completion_brief(tmp_path):
+    store = _store(tmp_path, "repeat-tool")
+    calls = []
+    registry = ToolRegistry()
+    registry.register(
+        Tool(
+            name="probe",
+            description="test tool",
+            input_schema={"type": "object", "properties": {}},
+            handler=lambda args: calls.append(True) or ToolResult(ok=True, content="探测完成"),
+        )
+    )
+    repeated = AgentResponse(tool_calls=[ToolCallRequest(name="probe", args={})])
+
+    reply = run_agent_turn(
+        "repeat-tool",
+        "不要无限循环",
+        session_store=store,
+        context_builder=_Context(),
+        tool_registry=registry,
+        llm_client=_SequenceLLM(repeated, repeated, repeated, repeated, repeated),
+    )
+
+    assert len(calls) == 3
+    assert "任务处理简报" in reply
+    assert "重复" in reply or "工具调用已关闭" in reply
+    assert store.get("repeat-tool").messages[-1].content == reply
+
+
+def test_turn_metrics_are_aggregated(tmp_path):
+    store = _store(tmp_path, "metrics")
+    run_agent_turn(
+        "metrics",
+        "正常完成",
+        session_store=store,
+        context_builder=_Context(),
+        tool_registry=_registry(),
+        llm_client=_SequenceLLM(AgentResponse(final="完成")),
+    )
+
+    summary = get_session_metrics_summary("metrics")
+    assert summary is not None
+    assert summary["turns"] == 1
+    assert summary["llm_calls"] == 1
+    assert summary["health"]["turns_monitored"] == 1

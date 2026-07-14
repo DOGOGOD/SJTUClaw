@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -202,8 +203,10 @@ class TurnMetricsAggregator:
     wall-clock time.
     """
 
-    def __init__(self):
-        self._turns: list[dict[str, Any]] = []
+    def __init__(self, max_turns: int = 200):
+        # A long-running gateway can see thousands of turns per session.
+        # Keep a useful rolling diagnostic window instead of leaking memory.
+        self._turns: deque[dict[str, Any]] = deque(maxlen=max(1, max_turns))
         self._lock = threading.Lock()
 
     def add(self, metrics: TurnMetrics) -> None:

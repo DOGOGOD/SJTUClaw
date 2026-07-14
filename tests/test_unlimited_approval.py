@@ -368,6 +368,41 @@ class TestApprovalGateEnforcement:
             for message in saved.messages
         )
 
+    def test_normal_mode_without_approval_channel_also_fails_closed(
+        self, store, context_builder
+    ):
+        session = store.create_session(session_id="normal-no-approval")
+        store.save(session)
+        tools = {"write_file": _FakeTool("write_file", safety_level="write")}
+        registry = _FakeToolRegistry(tools)
+        executed = []
+        original_execute = registry.execute_by_name
+
+        def tracking_execute(name, args):
+            executed.append(name)
+            return original_execute(name, args)
+
+        registry.execute_by_name = tracking_execute
+        tool_call = MagicMock()
+        tool_call.name = "write_file"
+        tool_call.args = {"file_path": "local.txt", "content": "x"}
+        client = _FakeLLMClient([
+            _FakeLLMResponse(is_tool_call=True, tool_calls=[tool_call]),
+            _FakeLLMResponse(final="done"),
+        ])
+
+        run_agent_turn(
+            "normal-no-approval", "test",
+            session_store=store,
+            context_builder=context_builder,
+            tool_registry=registry,
+            llm_client=client,
+            approval_handler=None,
+            auto_mode=False,
+            unlimited_mode=False,
+        )
+        assert executed == []
+
     def test_non_unlimited_auto_mode_relative_path_auto_approved(
         self, store, context_builder
     ):

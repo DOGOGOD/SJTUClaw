@@ -255,7 +255,12 @@ function Shell() {
     try {
       const result = await uploadAttachment(sid, file);
       if (result.ok) {
-        setMessages((prev) => [...prev, { role: "system", content: `已上传附件: ${file.name}` }]);
+        const message = result.message || {
+          role: "user" as const,
+          content: `已上传附件: ${file.name}`,
+          command: true,
+        };
+        setMessages((prev) => [...prev, message]);
       }
     } catch (e) {
       console.error("Upload failed", e);

@@ -18,7 +18,7 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from typing import Any, Callable, Iterable
-from urllib.parse import parse_qs, unquote, urljoin, urlsplit
+from urllib.parse import parse_qs, unquote, urljoin, urlsplit, urlunsplit
 
 import httpx
 
@@ -115,7 +115,13 @@ def _is_proxy_fake_ip(address: str) -> bool:
         return False
 
 
-def validate_public_url(url: str) -> str:
+def _resolve_public_target(url: str) -> tuple[str, str, str, str]:
+    """Return normalized URL plus an IP-pinned connection target.
+
+    The HTTP client must not resolve the hostname again after validation;
+    otherwise a DNS-rebinding attacker can swap a public answer for a private
+    one between the check and the connection.
+    """
     """Validate and normalize a public HTTP(S) URL.
 
     Hostnames are resolved up front and all returned addresses must be public.
@@ -146,6 +152,7 @@ def validate_public_url(url: str) -> str:
     # Literal IPs do not need DNS.  For hostnames, reject the destination if
     # any answer is non-public; choosing one safe answer from a mixed set can
     # otherwise enable DNS rebinding/failover attacks.
+    selected_address: str
     try:
         literal = ipaddress.ip_address(host.split("%", 1)[0])
     except ValueError:
@@ -158,10 +165,24 @@ def validate_public_url(url: str) -> str:
             _is_public_ip(address) or _is_proxy_fake_ip(address) for address in addresses
         ):
             raise WebSecurityError("internal/private URL detected: 主机解析到非公网地址")
+        selected_address = sorted(addresses)[0]
     else:
         if not _is_public_ip(str(literal)):
             raise WebSecurityError("internal/private URL detected: 禁止访问非公网地址")
-    return normalized
+        selected_address = str(literal)
+
+    default_port = 443 if parts.scheme.lower() == "https" else 80
+    explicit_port = parts.port
+    ip_literal = f"[{selected_address}]" if ":" in selected_address else selected_address
+    netloc = ip_literal if (explicit_port is None or explicit_port == default_port) else f"{ip_literal}:{explicit_port}"
+    connect_url = urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
+    host_header = host if (explicit_port is None or explicit_port == default_port) else f"{host}:{explicit_port}"
+    return normalized, connect_url, host_header, host
+
+
+def validate_public_url(url: str) -> str:
+    """Validate and normalize a public HTTP(S) URL."""
+    return _resolve_public_target(url)[0]
 
 
 class _TextExtractor(HTMLParser):
@@ -290,13 +311,19 @@ def _fetch(
     max_chars: int,
     client_factory: Callable[[WebToolConfig], httpx.Client] = _client,
 ) -> dict[str, Any]:
-    current = validate_public_url(url)
+    current = url.strip()
     attempts = 0
     redirects = 0
     while True:
         try:
+            current, connect_url, host_header, sni_hostname = _resolve_public_target(current)
             with client_factory(config) as client:
-                with client.stream("GET", current) as response:
+                with client.stream(
+                    "GET",
+                    connect_url,
+                    headers={"Host": host_header},
+                    extensions={"sni_hostname": sni_hostname},
+                ) as response:
                     if response.status_code in {301, 302, 303, 307, 308}:
                         location = response.headers.get("location", "")
                         if not location:
@@ -304,7 +331,7 @@ def _fetch(
                         redirects += 1
                         if redirects > 5:
                             raise RuntimeError("重定向次数超过上限（5）")
-                        current = validate_public_url(urljoin(current, location))
+                        current = urljoin(current, location)
                         continue
                     if response.status_code in _TRANSIENT_STATUS and attempts < config.max_retries:
                         attempts += 1
@@ -327,7 +354,7 @@ def _fetch(
                         text = text[:max_chars]
                     return {
                         "url": url,
-                        "final_url": str(response.url),
+                        "final_url": current,
                         "status_code": response.status_code,
                         "content_type": content_type.split(";", 1)[0] or "unknown",
                         "title": title,

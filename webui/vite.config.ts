@@ -23,7 +23,14 @@ export default defineConfig(({ mode }) => {
         output: {
           manualChunks: {
             "vendor-react": ["react", "react-dom"],
-            "vendor-markdown": ["react-markdown", "remark-gfm", "remark-breaks"],
+            "vendor-markdown": [
+              "react-markdown",
+              "remark-gfm",
+              "remark-breaks",
+              "remark-math",
+              "rehype-katex",
+              "katex",
+            ],
             "vendor-syntax": ["react-syntax-highlighter"],
             "vendor-icons": ["lucide-react"],
           },

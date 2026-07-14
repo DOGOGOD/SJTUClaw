@@ -6,7 +6,10 @@ import json
 import math
 import os
 import queue
+import random
+import re
 import threading
+import time
 import urllib.error
 import urllib.request
 from contextlib import contextmanager
@@ -23,10 +26,14 @@ from claw.pet.catalog import PetCatalog
 CELL_WIDTH = 192
 CELL_HEIGHT = 208
 WINDOW_BASE_WIDTH = 330
-WINDOW_BASE_HEIGHT = 235
+# 窗口高度需为气泡预留足够顶部空间（200字气泡约需 220px）：
+#   bubble_bottom = PET_BASE_CENTER_Y - _BUBBLE_BOTTOM_OFFSET = 310 - 76 = 234
+#   200字 bubble_height ≈ 225 → bubble_top ≈ 9 ≥ 0（圆角不被裁切）
+WINDOW_BASE_HEIGHT = 385
 # Codex's floating mascot layout uses a 121 logical-pixel-high pet box.
 PET_BASE_SCALE = 121 / CELL_HEIGHT
-PET_BASE_CENTER_Y = 160
+# 宠物中心Y坐标随窗口高度同步增大，保持距窗口底部 75px 不变
+PET_BASE_CENTER_Y = 310
 TRANSPARENT_COLOR = "#010203"
 IDLE_DURATION_MULTIPLIER = 6
 NON_IDLE_REPEAT_COUNT = 3
@@ -42,6 +49,90 @@ ANIMATIONS: dict[str, tuple[int, list[int]]] = {
     "running": (7, [120, 120, 120, 120, 120, 220]),
     "review": (8, [150, 150, 150, 150, 150, 280]),
 }
+
+# 点击桌宠时随机显示的俏皮回复
+_PLAYFUL_REPLIES: tuple[str, ...] = (
+    "喵～戳我干嘛？",
+    "在呢在呢，别戳啦！",
+    "想我了吗？",
+    "今天也要加油哦～",
+    "点击有惊喜？并没有～",
+    "哎呀，别闹！",
+    "我可是很忙的喵！",
+    "嘿嘿，又被你发现了～",
+    "要不要给我起个名字？",
+    "戳一下，开心一整天～",
+    "我在看着你哦～",
+    "月薪喵，随时待命！",
+    "再戳我就生气了喵！",
+    "你今天看起来不错呢～",
+    "嗨，有什么吩咐？",
+    "呜哇，轻点戳，脑袋要扁啦喵！",
+    "咕噜咕噜，找本喵何事呀？",
+    "偷偷探头，不会只有你在戳我吧？",
+    "再戳就要蹭你手手咯～",
+    "本喵在线营业，欢迎投喂！",
+    "等等等等，让我伸个懒腰先！",
+    "眼光真好，居然选中我啦喵",
+    "戳多了要收小鱼干手续费哦",
+    "发呆被你逮住啦，完蛋！",
+    "软软小脑袋专供你戳一下",
+    "有事说事，没事陪我摸鱼喵",
+    "哇，又来找我玩啦，好开心",
+    "别一直戳，我会害羞躲起来",
+    "小鱼干准备好了就听你安排",
+    "探头！捕捉一只正在戳我的你",
+    "揉一揉小耳朵，有话慢慢说",
+    "警告警告，连续戳击触发撒娇模式",
+    "本喵摸鱼中，小声一点哦",
+    "见到你心情瞬间变好啦喵",
+    "要是戳够十下，我就跟你贴贴"
+)
+
+# 本地消息显示时长（秒）
+_LOCAL_MESSAGE_TTL = 4.0
+# 回复消息显示时长（秒）——比俏皮回复更长，给用户阅读时间
+_REPLY_MESSAGE_TTL = 15.0
+
+# 气泡底部距桌宠中心点的向上偏移（逻辑像素），用于 _update_bubble 和输入框对齐
+_BUBBLE_BOTTOM_OFFSET = 76
+# 气泡文字显示上限（字符数），超过则不显示原文，仅显示占位提示
+_BUBBLE_DISPLAY_LIMIT = 200
+# 超过字数限制时的占位提示
+_BUBBLE_OVERLIMIT_HINT = "回复过长，请在 WebUI 查看"
+
+
+def _strip_markdown(text: str) -> str:
+    """移除 Markdown 格式符号，返回适合 Tkinter 气泡显示的纯文本。"""
+    # 代码块 ```lang ... ```
+    text = re.sub(r"```[^\n]*\n?", "", text)
+    # 行内代码 `code`
+    text = re.sub(r"`([^`]+)`", r"\1", text)
+    # 粗体 **text** 或 __text__
+    text = re.sub(r"\*\*([^*]+)\*\*", r"\1", text)
+    text = re.sub(r"__([^_]+)__", r"\1", text)
+    # 斜体 *text* 或 _text_（避免误伤单词内下划线）
+    text = re.sub(r"(?<!\w)\*([^*]+)\*(?!\w)", r"\1", text)
+    text = re.sub(r"(?<!\w)_([^_]+)_(?!\w)", r"\1", text)
+    # 删除线 ~~text~~
+    text = re.sub(r"~~([^~]+)~~", r"\1", text)
+    # 标题 # / ## / ###
+    text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
+    # 引用 >
+    text = re.sub(r"^>\s*", "", text, flags=re.MULTILINE)
+    # 无序列表 - / * / + 开头 → •
+    text = re.sub(r"^[\-\*\+]\s+", "• ", text, flags=re.MULTILINE)
+    # 有序列表 1. / 2. 开头 → 去掉序号
+    text = re.sub(r"^\d+\.\s+", "", text, flags=re.MULTILINE)
+    # 图片 ![alt](url) → alt
+    text = re.sub(r"!\[([^\]]*)\]\([^)]+\)", r"\1", text)
+    # 链接 [text](url) → text
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    # 水平分割线 --- / ***
+    text = re.sub(r"^[\-\*_]{3,}$", "", text, flags=re.MULTILINE)
+    # 多余空行压缩
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 
 def _rounded_rectangle_points(
@@ -113,7 +204,34 @@ class GatewayClient:
         except Exception:
             pass
 
-    def _request(self, method: str, path: str, body: dict | None = None) -> dict[str, Any]:
+    def create_session(self) -> dict[str, Any]:
+        return self._request("POST", "/sessions", {})
+
+    def fetch_sessions(self) -> list[dict[str, Any]]:
+        """获取会话列表（按最近活跃排序）。"""
+        data = self._request("GET", "/sessions")
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            return data.get("sessions") or data.get("items") or []
+        return []
+
+    def send_message(self, session_id: str, message: str) -> dict[str, Any]:
+        """发送消息到指定 session（同步阻塞，应在后台线程调用）。
+
+        /chat 端点会等待 Agent 完整执行后才返回，需要较长超时。
+        注意：字段名必须用 camelCase 的 sessionId，与服务端 ChatRequest
+        的 alias 保持一致，否则 session_id 会被解析为 None 导致新建 session。
+        """
+        return self._request(
+            "POST", "/chat",
+            {"sessionId": session_id, "message": message},
+            timeout=180.0,
+        )
+
+    def _request(
+        self, method: str, path: str, body: dict | None = None, timeout: float = 5.0
+    ) -> dict[str, Any]:
         data = None
         headers = {
             "Accept": "application/json",
@@ -128,7 +246,7 @@ class GatewayClient:
             headers=headers,
             method=method,
         )
-        with urllib.request.urlopen(request, timeout=2.5) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             return json.loads(response.read().decode("utf-8"))
 
 
@@ -174,7 +292,7 @@ class DesktopPet:
         self._task_font = tkfont.Font(
             root=self.root,
             family="Microsoft YaHei UI",
-            size=8,
+            size=9,
         )
         self._bubble = self.canvas.create_polygon(
             *_rounded_rectangle_points(
@@ -191,12 +309,12 @@ class DesktopPet:
             splinesteps=24,
         )
         self._status_text = self.canvas.create_text(
-            self._px(22), self._px(22), anchor="nw", fill="#27241F",
+            self._px(22), self._px(22), anchor="nw", fill="#1A1814",
             font=self._status_font, width=self._px(285),
             text="月薪喵 · 待命中",
         )
         self._task_text = self.canvas.create_text(
-            self._px(22), self._px(45), anchor="nw", fill="#6C655B",
+            self._px(22), self._px(45), anchor="nw", fill="#4A453E",
             font=self._task_font, width=self._px(285),
             text="",
         )
@@ -221,11 +339,20 @@ class DesktopPet:
         self._hovering_pet = False
         self._closed = threading.Event()
         self._updates: queue.Queue[dict[str, Any]] = queue.Queue()
+        # 本地消息（点击俏皮回复等）优先于远程状态显示
+        self._local_message: str | None = None
+        self._local_message_until: float = 0.0
+        # 延迟俏皮回复，用于区分单击/双击
+        self._pending_reply_job: str | None = None
+        self._suppress_reply = False
+        # 双击输入框相关
+        self._input_popup: tk.Toplevel | None = None
 
         self.menu = tk.Menu(self.root, tearoff=False, font=("Microsoft YaHei UI", 9))
         self.canvas.bind("<ButtonPress-1>", self._on_press)
         self.canvas.bind("<B1-Motion>", self._on_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
+        self.canvas.bind("<Double-1>", self._on_double_click)
         self.canvas.bind("<Motion>", self._on_pointer_motion)
         self.canvas.bind("<Leave>", self._on_pointer_leave)
         self.canvas.bind("<Button-3>", self._show_menu)
@@ -244,6 +371,12 @@ class DesktopPet:
         if self._closed.is_set():
             return
         self._closed.set()
+        if self._input_popup is not None:
+            try:
+                self._input_popup.destroy()
+            except tk.TclError:
+                pass
+            self._input_popup = None
         if self._animation_job is not None:
             try:
                 self.root.after_cancel(self._animation_job)
@@ -393,14 +526,294 @@ class DesktopPet:
         was_dragging = self._dragging
         self._drag_origin = None
         self._dragging = False
-        self._start_animation(
-            "jumping" if self._hovering_pet else self._requested_animation
-        )
+        if not was_dragging and not self._hovering_pet:
+            self._start_animation(self._requested_animation)
+        else:
+            self._start_animation(
+                "jumping" if self._hovering_pet else self._requested_animation
+            )
         if was_dragging:
             x, y = self.root.winfo_x(), self.root.winfo_y()
             threading.Thread(
                 target=lambda: self._safe_save_position(x, y), daemon=True
             ).start()
+        elif self._hovering_pet:
+            # 双击的第二次 release：已被 _on_double_click 抑制，直接跳过
+            if self._suppress_reply:
+                self._suppress_reply = False
+                return
+            # 延迟显示俏皮回复，若在延迟期内双击则取消（避免双击触发单击）
+            if self._pending_reply_job is not None:
+                try:
+                    self.root.after_cancel(self._pending_reply_job)
+                except tk.TclError:
+                    pass
+            self._pending_reply_job = self.root.after(
+                400, self._show_playful_reply
+            )
+
+    def _show_playful_reply(self) -> None:
+        """点击桌宠时随机显示一条俏皮回复气泡。"""
+        self._pending_reply_job = None
+        reply = random.choice(_PLAYFUL_REPLIES)
+        self._set_local_message(reply)
+
+    def _set_local_message(self, message: str, ttl: float = _LOCAL_MESSAGE_TTL) -> None:
+        """设置本地消息，在 TTL 内优先于远程状态显示。"""
+        self._local_message = _strip_markdown(message)
+        self._local_message_until = time.time() + ttl
+        self._refresh_bubble()
+
+    def _on_double_click(self, event: tk.Event) -> None:
+        """双击桌宠弹出输入框，可发送消息给 SJTUClaw。
+
+        气泡显示时（有任务/审批/本地消息）禁止双击，避免输入框与气泡重叠。
+        """
+        if not self._point_in_pet(event.x, event.y):
+            return
+        # 气泡可见时禁止双击
+        now = time.time()
+        bubble_visible = (
+            (self._local_message is not None and now < self._local_message_until)
+            or should_show_bubble(self._remote_state, self._approvals)
+        )
+        if bubble_visible:
+            return
+        # 取消 pending 的俏皮回复（第一次 release 设置的延迟）
+        if self._pending_reply_job is not None:
+            try:
+                self.root.after_cancel(self._pending_reply_job)
+            except tk.TclError:
+                pass
+            self._pending_reply_job = None
+        # 抑制第二次 release 的俏皮回复
+        self._suppress_reply = True
+        # 阻止拖拽
+        self._drag_origin = None
+        self._dragging = False
+        self._open_input_popup()
+
+    def _open_input_popup(self) -> None:
+        """打开消息输入气泡框。"""
+        if self._input_popup is not None and self._input_popup.winfo_exists():
+            self._input_popup.focus_set()
+            return
+
+        popup = tk.Toplevel(self.root)
+        popup.overrideredirect(True)
+        popup.attributes("-topmost", True)
+        popup.configure(bg=TRANSPARENT_COLOR)
+        if popup.tk.call("tk", "windowingsystem") == "win32":
+            popup.wm_attributes("-transparentcolor", TRANSPARENT_COLOR)
+
+        entry_font = tkfont.Font(
+            root=self.root, family="Microsoft YaHei UI", size=10,
+        )
+        btn_radius = self._px(11)
+
+        # 定位：输入框底部与状态气泡底部对齐（同一水平高度，误差 ±2px）
+        pet_x = self.root.winfo_rootx()
+        pet_y = self.root.winfo_rooty()
+        popup_width = self._px(300)
+        popup_height = self._px(36)
+        popup_x = pet_x + (self.window_width - popup_width) // 2
+        # 气泡底部在窗口坐标系 Y = pet_center_y - offset，转屏幕坐标后对齐输入框底部
+        bubble_bottom_screen_y = pet_y + self.pet_center_y - self._px(_BUBBLE_BOTTOM_OFFSET)
+        popup_y = max(0, bubble_bottom_screen_y - popup_height)
+        popup.geometry(f"{popup_width}x{popup_height}+{popup_x}+{popup_y}")
+
+        popup_canvas = tk.Canvas(
+            popup, width=popup_width, height=popup_height,
+            bg=TRANSPARENT_COLOR, highlightthickness=0, bd=0,
+        )
+        popup_canvas.pack(fill="both", expand=True)
+
+        bubble_id = popup_canvas.create_polygon(
+            *_rounded_rectangle_points(
+                self._px(4), self._px(4),
+                popup_width - self._px(4), popup_height - self._px(4),
+                self._px(12),
+            ),
+            fill="#FFFDF8", outline="#D9D4CA", width=self._px(1),
+            smooth=True, splinesteps=24,
+        )
+
+        entry = tk.Entry(
+            popup_canvas, font=entry_font, bd=0, relief="flat",
+            highlightthickness=0, bg="#FFFDF8", fg="#27241F",
+            insertbackground="#27241F",
+        )
+        entry_window = popup_canvas.create_window(
+            self._px(16), popup_height // 2, anchor="w", window=entry,
+        )
+
+        # 圆形发送按钮（橙色背景 + 白色箭头）
+        btn_cx = popup_width - self._px(24)
+        btn_cy = popup_height // 2
+        btn_circle = popup_canvas.create_oval(
+            btn_cx - btn_radius, btn_cy - btn_radius,
+            btn_cx + btn_radius, btn_cy + btn_radius,
+            fill="#FF8C00", outline="#E07800", width=self._px(1),
+        )
+        # 白色向上箭头（三角形）
+        arrow_size = self._px(5)
+        btn_arrow = popup_canvas.create_polygon(
+            btn_cx - arrow_size, btn_cy + arrow_size * 0.8,
+            btn_cx + arrow_size, btn_cy + arrow_size * 0.8,
+            btn_cx, btn_cy - arrow_size * 1.2,
+            fill="white", outline="white", smooth=False,
+        )
+
+        def _on_send_click(_event=None):
+            self._send_input_message(entry, popup)
+
+        # 用 Canvas 级别绑定 + 位置检查，避免重叠 item 重复触发
+        btn_pos = {"x": btn_cx, "y": btn_cy, "r": btn_radius}
+
+        def _on_canvas_click(event: tk.Event):
+            dx = event.x - btn_pos["x"]
+            dy = event.y - btn_pos["y"]
+            if dx * dx + dy * dy <= btn_pos["r"] * btn_pos["r"]:
+                _on_send_click()
+
+        popup_canvas.bind("<Button-1>", _on_canvas_click)
+
+        def _resize_popup():
+            """根据输入文字长度自适应气泡框大小。"""
+            text = entry.get()
+            char_width = entry_font.measure("测")
+            needed_text_width = max(
+                self._px(160), len(text) * char_width + self._px(30)
+            )
+            max_width = self._px(420)
+            content_width = min(needed_text_width, max_width)
+            total_width = content_width + self._px(52)  # 圆形按钮空间
+            height = popup_height
+            pet_x = self.root.winfo_rootx()
+            pet_y = self.root.winfo_rooty()
+            popup_x = pet_x + (self.window_width - total_width) // 2
+            # 与状态气泡底部保持同一水平高度（误差 ±2px）
+            bubble_bottom_screen_y = pet_y + self.pet_center_y - self._px(_BUBBLE_BOTTOM_OFFSET)
+            popup_y = max(0, bubble_bottom_screen_y - height)
+            popup.geometry(f"{total_width}x{height}+{popup_x}+{popup_y}")
+            popup_canvas.configure(width=total_width, height=height)
+            popup_canvas.coords(
+                bubble_id,
+                *_rounded_rectangle_points(
+                    self._px(4), self._px(4),
+                    total_width - self._px(4), height - self._px(4),
+                    self._px(12),
+                ),
+            )
+            popup_canvas.coords(entry_window, self._px(16), height // 2)
+            popup_canvas.itemconfigure(entry_window, width=content_width - self._px(16))
+            # 重新定位圆形按钮
+            new_cx = total_width - self._px(24)
+            new_cy = height // 2
+            btn_pos["x"] = new_cx
+            btn_pos["y"] = new_cy
+            popup_canvas.coords(
+                btn_circle,
+                new_cx - btn_radius, new_cy - btn_radius,
+                new_cx + btn_radius, new_cy + btn_radius,
+            )
+            popup_canvas.coords(
+                btn_arrow,
+                new_cx - arrow_size, new_cy + arrow_size * 0.8,
+                new_cx + arrow_size, new_cy + arrow_size * 0.8,
+                new_cx, new_cy - arrow_size * 1.2,
+            )
+
+        def _on_key(event: tk.Event):
+            if event.keysym == "Return":
+                _on_send_click()
+            else:
+                popup.after_idle(_resize_popup)
+
+        entry.bind("<KeyRelease>", _on_key)
+        entry.bind("<KeyPress>", lambda e: popup.after_idle(_resize_popup))
+        popup.bind("<FocusOut>", lambda e: self._close_input_popup(popup))
+        popup.bind("<Escape>", lambda e: self._close_input_popup(popup))
+
+        self._input_popup = popup
+        _resize_popup()
+        entry.focus_set()
+
+    def _close_input_popup(self, popup: tk.Toplevel) -> None:
+        """关闭输入气泡框。"""
+        try:
+            popup.destroy()
+        except tk.TclError:
+            pass
+        if self._input_popup is popup:
+            self._input_popup = None
+
+    def _send_input_message(self, entry: tk.Entry, popup: tk.Toplevel) -> None:
+        """发送输入框中的消息给 SJTUClaw。"""
+        # 防重入：popup 已关闭则跳过（Enter + 点击可能同时触发）
+        try:
+            if not popup.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        text = entry.get().strip()
+        if not text:
+            return
+        self._close_input_popup(popup)
+        self._set_local_message("消息已发送，执行中…")
+        threading.Thread(
+            target=self._send_message_worker, args=(text,), daemon=True
+        ).start()
+
+    def _send_message_worker(self, text: str) -> None:
+        """在后台线程中发送消息（/chat 是同步阻塞的）。
+
+        始终使用最近活跃的 session；fetch_sessions 失败时不新建 session。
+        只有 fetch 成功且返回空列表（系统中无任何 session）时才创建新的。
+        """
+        # 1. 获取 session 列表；失败则直接返回，不新建 session
+        try:
+            sessions = self.client.fetch_sessions()
+        except Exception:
+            return
+
+        # 2. 有 session → 使用最近的
+        if sessions:
+            recent = sessions[0]
+            sid = recent.get("sessionId") or recent.get("session_id") or recent.get("id")
+            if sid:
+                try:
+                    result = self.client.send_message(sid, text)
+                    self._show_reply(result)
+                except Exception:
+                    pass
+                return
+
+        # 3. fetch 成功但无 session → 创建新的
+        try:
+            created = self.client.create_session()
+            new_sid = created.get("sessionId") or created.get("session_id")
+            if new_sid:
+                result = self.client.send_message(new_sid, text)
+                self._show_reply(result)
+        except Exception:
+            pass
+
+    def _show_reply(self, result: dict | None) -> None:
+        """从 /chat 响应中提取 reply，在气泡中显示。
+
+        直接使用 HTTP 响应中的 reply 而非依赖轮询 /pet/state 的 notify
+        状态，避免因本地消息遮蔽、轮询延迟或 notify TTL 过期导致显示失效。
+        超过 200 字时不显示（由 _refresh_bubble 的远程状态显示占位提示）。
+        """
+        if not isinstance(result, dict):
+            return
+        reply = (result.get("reply") or "").strip()
+        if reply and len(reply) <= _BUBBLE_DISPLAY_LIMIT:
+            # Tkinter 非线程安全，需在主线程中更新 UI
+            self.root.after(
+                0, lambda r=reply: self._set_local_message(r, ttl=_REPLY_MESSAGE_TTL)
+            )
 
     def _on_pointer_motion(self, event: tk.Event) -> None:
         if self._dragging:
@@ -488,6 +901,10 @@ class DesktopPet:
                 self.close(notify=False)
                 return
             self._apply_remote_state()
+        elif self._local_message is not None and time.time() >= self._local_message_until:
+            # 本地消息刚过期，刷新气泡恢复远程状态
+            self._local_message = None
+            self._refresh_bubble()
         self.root.after(100, self._drain_updates)
 
     def _apply_remote_state(self) -> None:
@@ -501,9 +918,29 @@ class DesktopPet:
             self._requested_animation = animation
             if not self._dragging and not self._hovering_pet:
                 self._start_animation(animation)
+        self._refresh_bubble()
+
+    def _refresh_bubble(self) -> None:
+        """根据本地消息（优先）或远程状态刷新气泡内容。
+
+        保证同一时刻只显示一层文字，不会重叠。
+        """
+        now = time.time()
+        # 本地消息未过期时优先显示
+        if self._local_message and now < self._local_message_until:
+            self._update_bubble(self._local_message, "", visible=True)
+            return
+        if self._local_message is not None and now >= self._local_message_until:
+            self._local_message = None
+
+        state = self._remote_state
         display_name = self.pet.get("displayName", "宠物")
-        message = state.get("message") or "待命中"
+        message = _strip_markdown(state.get("message") or "待命中")
+        # 严格 200 字限制：超限时不显示原文，仅显示占位提示
+        if len(message) > _BUBBLE_DISPLAY_LIMIT:
+            message = _BUBBLE_OVERLIMIT_HINT
         task = state.get("task") or ""
+        animation = state.get("animation", "idle")
         if self._approvals:
             approval = self._approvals[0]
             message = f"等待审批：{approval.get('toolName', '命令')}（右键处理）"
@@ -516,13 +953,22 @@ class DesktopPet:
         self._update_bubble(f"{display_name} · {message}", task, visible=visible)
 
     def _update_bubble(self, status: str, task: str, *, visible: bool) -> None:
-        """Update bubble content and vertically center its text block."""
+        """更新气泡内容，根据文字量自适应宽度和高度，避免文字超出或重叠。
+
+        - 宽度：用 font.measure 量算自然文字宽度，气泡宽度包裹文字，
+          右侧无多余空白；超过 max_bubble_width 时自动换行。
+        - 高度：底部固定在桌宠上方，文字增多时顶部向上延伸。
+        - 排版：适当行间距(5px)、颜色对比度优化、左对齐顶部排列。
+        - 通过 itemconfigure 原地更新，不创建新 Canvas item，避免重叠。
+        """
+        # 气泡不可见时隐藏所有元素
         item_state = "normal" if visible else "hidden"
         for item in (self._bubble, self._status_text, self._task_text):
             self.canvas.itemconfigure(item, state=item_state)
         if not visible:
             return
 
+        # 更新文字内容
         self.canvas.itemconfigure(self._status_text, text=status)
         self.canvas.itemconfigure(self._task_text, text=task)
         self.canvas.itemconfigure(
@@ -530,34 +976,74 @@ class DesktopPet:
             state="normal" if task else "hidden",
         )
 
-        left = self._px(22)
-        top = self._px(8)
-        base_bottom = self._px(72)
-        padding = self._px(13)
-        gap = self._px(4)
-        status_height = self._status_font.metrics("linespace")
-        task_height = self._task_font.metrics("linespace") if task else 0
+        padding = self._px(10)
+        gap = self._px(5)
+        margin = self._px(10)
+
+        # 1. 量算自然文字宽度（单行，不考虑换行）
+        status_w = self._status_font.measure(status)
+        task_w = self._task_font.measure(task) if task else 0
+        max_text_w = max(status_w, task_w)
+
+        # 2. 计算自适应气泡宽度
+        max_bubble_w = self.window_width - 2 * margin
+        min_bubble_w = self._px(50)
+        bubble_w = min(max_bubble_w, max(min_bubble_w, max_text_w + 2 * padding))
+
+        # 3. 设置文字换行宽度（超过气泡内宽时自动换行）
+        text_wrap_w = bubble_w - 2 * padding
+        self.canvas.itemconfigure(self._status_text, width=text_wrap_w)
+        self.canvas.itemconfigure(self._task_text, width=text_wrap_w)
+
+        # 4. 量算换行后的实际渲染高度
+        self.canvas.update_idletasks()
+        status_bbox = self.canvas.bbox(self._status_text)
+        status_height = (
+            status_bbox[3] - status_bbox[1] if status_bbox
+            else self._status_font.metrics("linespace")
+        )
+        task_height = 0
         if task:
             task_bbox = self.canvas.bbox(self._task_text)
-            if task_bbox is not None:
-                task_height = task_bbox[3] - task_bbox[1]
-        text_height = status_height + (gap + task_height if task else 0)
-        bubble_bottom = max(base_bottom, top + text_height + 2 * padding)
-        start_y = top + (bubble_bottom - top - text_height) / 2
+            task_height = (
+                task_bbox[3] - task_bbox[1] if task_bbox
+                else self._task_font.metrics("linespace")
+            )
+
+        # 文字总高度（status + gap + task）
+        text_height = status_height
+        if task:
+            text_height += gap + task_height
+
+        # 5. 气泡位置：底部固定在桌宠上方（间距 ≥12px），向上延伸
+        bubble_bottom = self.pet_center_y - self._px(_BUBBLE_BOTTOM_OFFSET)
+        min_height = self._px(32)
+        bubble_height = max(min_height, text_height + 2 * padding)
+        bubble_top = bubble_bottom - bubble_height
+        # 安全约束：气泡顶部不得超出窗口顶部，否则圆角会被裁切成直角
+        min_top = self._px(2)
+        if bubble_top < min_top:
+            bubble_top = min_top
+            bubble_height = bubble_bottom - bubble_top
+
+        # 6. 水平居中
+        bubble_left = (self.window_width - bubble_w) // 2
+        bubble_right = bubble_left + bubble_w
 
         self.canvas.coords(
             self._bubble,
             *_rounded_rectangle_points(
-                self._px(8),
-                top,
-                self.window_width - self._px(8),
-                bubble_bottom,
+                bubble_left, bubble_top, bubble_right, bubble_bottom,
                 self._px(14),
             ),
         )
-        self.canvas.coords(self._status_text, left, start_y)
+
+        # 7. 文字定位（左对齐 + 顶部排列，自然向下延伸）
+        text_left = bubble_left + padding
+        start_y = bubble_top + padding
+        self.canvas.coords(self._status_text, text_left, start_y)
         if task:
-            self.canvas.coords(self._task_text, left, start_y + status_height + gap)
+            self.canvas.coords(self._task_text, text_left, start_y + status_height + gap)
 
     def _px(self, logical_pixels: float) -> int:
         return max(1, round(logical_pixels * self._dpi_scale))

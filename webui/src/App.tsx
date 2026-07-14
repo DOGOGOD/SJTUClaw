@@ -75,6 +75,38 @@ function Shell() {
     return () => { cancelled = true; };
   }, [activeSessionId]);
 
+  // 后台轮询：当不在发送消息时，定期检查当前会话是否有新消息
+  // 用于感知定时任务（cron）到点后由后端写入 session 的新消息
+  useEffect(() => {
+    if (!activeSessionId || sending) return;
+    let cancelled = false;
+    const timer = setInterval(async () => {
+      if (cancelled) return;
+      try {
+        const d = await fetchMessages(activeSessionId);
+        if (cancelled) return;
+        if (d.ok && d.messages) {
+          setMessages((prev) => {
+            // 仅在消息数量增加时更新，避免覆盖正在编辑或流式中的状态
+            if (d.messages.length > prev.length) {
+              return d.messages;
+            }
+            return prev;
+          });
+        }
+      } catch {}
+    }, 5000);
+    return () => { cancelled = true; clearInterval(timer); };
+  }, [activeSessionId, sending]);
+
+  // 定期刷新会话列表：让侧边栏感知其他会话由定时任务产生的更新（updatedAt / messageCount）
+  useEffect(() => {
+    const timer = setInterval(() => {
+      refreshSessions();
+    }, 10000);
+    return () => clearInterval(timer);
+  }, [refreshSessions]);
+
   const navigateToChat = useCallback((sessionId: string | null) => {
     setView("chat");
     setActiveSessionId(sessionId);
@@ -86,6 +118,16 @@ function Shell() {
     setSettingsSection(section);
     setMobileSidebarOpen(false);
   }, []);
+
+  // Esc 键关闭设置浮窗
+  useEffect(() => {
+    if (view !== "settings") return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") navigateToChat(activeSessionId);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [view, activeSessionId, navigateToChat]);
 
   const handleNewChat = useCallback(() => {
     if (sending) return;
@@ -273,10 +315,6 @@ function Shell() {
     else setSidebarCollapsed((v) => !v);
   }, [isMobile]);
 
-  const handleToggleCollapse = useCallback(() => {
-    setSidebarCollapsed((v) => !v);
-  }, []);
-
   const activeTitle = useMemo(() => {
     if (!activeSessionId) return "SJTUClaw";
     const s = sessions.find((x) => x.sessionId === activeSessionId);
@@ -297,12 +335,11 @@ function Shell() {
     onRename: handleRenameSession,
     onOpenSettings: navigateToSettings,
     onToggleSidebar: handleToggleSidebar,
-    onToggleCollapse: handleToggleCollapse,
     activeUtility,
     interactionLocked: sending,
   }), [sessions, activeSessionId, sessionsLoading, handleNewChat, handleSelectSession,
       handleDeleteSession, handleRenameSession, navigateToSettings,
-      handleToggleSidebar, handleToggleCollapse, activeUtility, sending]);
+      handleToggleSidebar, activeUtility, sending]);
 
   return (
     <div className="relative flex h-[100dvh] min-h-0 w-full overflow-hidden bg-background">
@@ -318,7 +355,6 @@ function Shell() {
           <Sidebar
             {...sidebarProps}
             collapsed={sidebarCollapsed}
-            onToggleCollapse={handleToggleCollapse}
           />
         </div>
       </aside>
@@ -338,36 +374,48 @@ function Shell() {
 
       {/* Main area */}
       <main className="relative z-10 flex-1 min-w-0 flex flex-col">
-        {view === "chat" && (
-          <ThreadShell
-            sessionId={activeSessionId}
-            title={activeTitle}
-            messages={messages}
-            loading={messagesLoading}
-            sending={sending}
-            autoMode={autoMode}
-            unlimitedMode={unlimitedMode}
-            onSend={handleSend}
-            onStop={handleStop}
-            onAttach={handleAttach}
-            onToggleSidebar={handleToggleSidebar}
-            onNewChat={handleNewChat}
-            theme={theme}
-            onToggleTheme={toggleTheme}
-          />
-        )}
-        {view === "settings" && (
-          <SettingsView
-            theme={theme}
-            activeSection={settingsSection}
-            onToggleTheme={toggleTheme}
-            onBackToChat={() => navigateToChat(activeSessionId)}
-            onSectionChange={setSettingsSection}
-            activeSessionId={activeSessionId}
-          />
-        )}
-
+        <ThreadShell
+          sessionId={activeSessionId}
+          title={activeTitle}
+          messages={messages}
+          loading={messagesLoading}
+          sending={sending}
+          autoMode={autoMode}
+          unlimitedMode={unlimitedMode}
+          onSend={handleSend}
+          onStop={handleStop}
+          onAttach={handleAttach}
+          onToggleSidebar={handleToggleSidebar}
+          onNewChat={handleNewChat}
+          theme={theme}
+          onToggleTheme={toggleTheme}
+        />
       </main>
+
+      {/* Settings floating modal with glass mask */}
+      {view === "settings" && (
+        <div
+          className="fixed inset-0 z-[150] flex items-center justify-center bg-background/40 p-3 backdrop-blur-md sm:p-6"
+          onClick={() => navigateToChat(activeSessionId)}
+          role="presentation"
+        >
+          <div
+            className="flex h-[88vh] w-full max-w-5xl flex-col overflow-hidden rounded-2xl border border-border/70 bg-popover shadow-[0_24px_80px_hsl(215_30%_10%/0.25)] animate-enter-scale"
+            onClick={(e) => e.stopPropagation()}
+            role="dialog"
+            aria-modal="true"
+          >
+            <SettingsView
+              theme={theme}
+              activeSection={settingsSection}
+              onToggleTheme={toggleTheme}
+              onBackToChat={() => navigateToChat(activeSessionId)}
+              onSectionChange={setSettingsSection}
+              activeSessionId={activeSessionId}
+            />
+          </div>
+        </div>
+      )}
 
       {/* Approval request */}
       {pendingApproval && (

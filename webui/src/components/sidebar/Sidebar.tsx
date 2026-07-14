@@ -1,5 +1,5 @@
 import { memo, useCallback, useState } from "react";
-import { Plus, Search, Trash2, Pencil, Settings, PanelLeftClose } from "lucide-react";
+import { Plus, Search, Trash2, Pencil, Settings } from "lucide-react";
 import { BrandAvatar } from "@/components/BrandAvatar";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -17,7 +17,6 @@ interface SidebarProps {
   onOpenSettings: (section?: SettingsSection) => void;
   onToggleSidebar?: () => void;
   collapsed?: boolean;
-  onToggleCollapse?: () => void;
   activeUtility?: ShellView | null;
   interactionLocked?: boolean;
 }
@@ -32,7 +31,6 @@ export const Sidebar = memo(function Sidebar({
   onRename,
   onOpenSettings,
   collapsed = false,
-  onToggleCollapse,
   activeUtility,
   interactionLocked = false,
 }: SidebarProps) {
@@ -83,14 +81,6 @@ export const Sidebar = memo(function Sidebar({
               className={activeUtility === "settings" ? "text-foreground bg-sidebar-accent" : ""}
             >
               <Settings className="h-3.5 w-3.5" />
-            </Button>
-            <Button
-              variant="ghost"
-              size="icon-sm"
-              onClick={onToggleCollapse}
-              title="收起侧栏"
-            >
-              <PanelLeftClose className="h-3.5 w-3.5" />
             </Button>
           </div>
         </div>

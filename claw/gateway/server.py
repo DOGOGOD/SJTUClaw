@@ -265,6 +265,27 @@ def _cron_mark_active(session_key: str) -> None:
 def _cron_mark_idle(session_key: str) -> None:
     _active_cron_sessions.discard(session_key)
 
+
+def _cron_turn_start(session_key: str, message: str) -> None:
+    """定时任务开始时更新桌宠状态。"""
+    _pet_state.start_turn(session_key, f"[定时任务] {message[:60]}")
+
+
+def _cron_turn_finish(session_key: str, failed: bool, reply: str | None) -> None:
+    """定时任务结束时让桌宠播放动画并显示气泡通知。
+
+    有回复时在气泡中显示（桌宠端按100字阈值截断+展开/收起）；
+    无回复时仅标记任务完成让桌宠恢复空闲。
+    """
+    if failed:
+        _pet_state.notify(session_key, "定时任务执行失败", animation="failed")
+        return
+    if reply:
+        _pet_state.notify(session_key, reply.strip(), animation="jumping")
+    else:
+        _pet_state.finish_turn(session_key)
+
+
 # -- Set up the cron dispatcher ------------------------------------------------
 from claw.scheduler.dispatcher import create_cron_dispatcher
 
@@ -280,6 +301,9 @@ _cron_service.on_job = create_cron_dispatcher(
     on_session_resolve=lambda sid, chat_id: _find_existing_qq_session(chat_id),
     on_turn_active=_cron_mark_active,
     on_turn_idle=_cron_mark_idle,
+    on_turn_start=_cron_turn_start,
+    on_turn_finish=_cron_turn_finish,
+    event_handler=lambda sid, event: _pet_state.handle_event(sid, event),
 )
 
 _reflection_mgr = ReflectionManager(
@@ -734,6 +758,8 @@ class ChatRequest(BaseModel):
     )
     message: str = Field(..., min_length=1, description="User message text.")
 
+    model_config = {"populate_by_name": True}
+
 
 class CreateSessionRequest(BaseModel):
     title: str | None = Field(default=None, description="Optional session title.")
@@ -914,6 +940,7 @@ async def handle_chat(req: ChatRequest):
         raise HTTPException(status_code=409, detail="该 Session 已有任务正在运行，请等待完成或先停止任务。")
 
     reply: str
+    _turn_failed = False
     try:
         # Wrap in a callable so _set_turn_session_id runs inside the worker
         # thread — threading.local() is not shared across threads.
@@ -945,12 +972,20 @@ async def handle_chat(req: ChatRequest):
         reply = await asyncio.to_thread(_run)
     except Exception as exc:
         # Ensure a response is still returned even if the agent crashes
+        _turn_failed = True
         print(f"[gateway] agent turn 异常: {exc}")
         reply = _persist_agent_fallback(
             sid, "抱歉，Agent 在执行工具时意外中止。已保留现有进度，请重试。"
         )
     finally:
         _unregister_active_turn(sid, cancel_event)
+
+    # 成功时标记桌宠任务完成。
+    # 注意：不调用 _pet_state.notify 推送 reply，因为 /chat 的 reply 已通过
+    # HTTP 响应返回给桌宠（_show_reply → _set_local_message），两条路径同时
+    # 显示会导致消息重复。定时任务回复仍由 _cron_turn_finish 中的 notify 推送。
+    if not _turn_failed:
+        _pet_state.finish_turn(sid)
 
     reply = _decorate_download_reply(sid, reply, downloads_before)
 
@@ -1957,8 +1992,13 @@ def create_cron_job(req: CreateCronJobRequest):
             detail="需要 everySeconds、cronExpr 或 at 之一",
         )
 
+    # 如果指定的 session 不存在，使用最近的 session 而非新建
     if not _session_store.exists(req.session_id):
-        _session_store.create_session(session_id=req.session_id)
+        recent = _session_store.list_summaries()
+        if recent:
+            req.session_id = recent[0].session_id
+        else:
+            _session_store.create_session(session_id=req.session_id)
 
     job = _cron_service.add_job(
         name=req.name or req.message[:30],

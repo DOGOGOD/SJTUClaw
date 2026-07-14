@@ -1214,7 +1214,19 @@ class CronService:
 
                 os.fsync(f.fileno())
 
-            os.replace(tmp_path, path)
+            # Windows 上 os.replace 可能因目标文件被其他进程短暂占用而
+            # 抛出 PermissionError [WinError 5]，重试几次即可成功。
+            last_exc: Exception | None = None
+            for _attempt in range(6):
+                try:
+                    os.replace(tmp_path, path)
+                    last_exc = None
+                    break
+                except PermissionError as exc:
+                    last_exc = exc
+                    time.sleep(0.05)
+            if last_exc is not None:
+                raise last_exc
 
             # fsync the parent directory so the rename itself is durable.
 

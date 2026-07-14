@@ -7,6 +7,7 @@ import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
 import { Check, Copy } from "lucide-react";
 import { BrandAvatar } from "@/components/BrandAvatar";
+import { PetSprite } from "@/components/PetSprite";
 import { cn } from "@/lib/utils";
 import { useTheme } from "@/hooks/useTheme";
 import type { ChatMessage } from "@/lib/types";
@@ -718,6 +719,20 @@ export function ThreadViewport({ messages, loading, sessionId }: ThreadViewportP
       "今天想探索什么？",
       "准备好做点什么了吗？",
       "有什么值得认真想一想？",
+      "想梳理思绪，或是创造些什么？",
+      "What would you like to work on today?",
+      "需要我帮你梳理难题、撰写内容吗？",
+      "随意说说你的想法，我随时倾听。",
+      "Ready to brainstorm new ideas?",
+      "今天有什么计划想落地实现？",
+      "想写文案、解问题还是构思方案？",
+      "Share your thoughts, let's figure it out together.",
+      "有藏在心底的构思，不妨讲给我听。",
+      "What topic shall we dive into first?",
+      "需要复盘、规划，或是自由创作？",
+      "放下顾虑，把所有疑问都抛给我。",
+      "Let’s turn your ideas into clear words.",
+      "今天打算攻克哪一件棘手的事？"
     ];
     return greetings[Math.floor(Math.random() * greetings.length)];
   }, [sessionId]);
@@ -725,7 +740,7 @@ export function ThreadViewport({ messages, loading, sessionId }: ThreadViewportP
   if (!sessionId) {
     return (
       <div className="w-full text-center animate-enter-up">
-        <BrandAvatar className="mx-auto mb-5 h-16 w-16" fullCharacter />
+        <PetSprite className="mx-auto mb-5" />
         <h2 className="font-display text-[clamp(1.8rem,4vw,2.45rem)] font-normal leading-tight tracking-[-0.035em] text-foreground/95">
           {welcome}
         </h2>

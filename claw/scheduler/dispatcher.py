@@ -53,6 +53,9 @@ def create_cron_dispatcher(
     on_session_resolve: SessionResolveHook | None = None,
     on_turn_active: Callable[[str], None] | None = None,
     on_turn_idle: Callable[[str], None] | None = None,
+    on_turn_start: Callable[[str, str], None] | None = None,
+    on_turn_finish: Callable[[str, bool, Optional[str]], None] | None = None,
+    event_handler: Callable[[str, Any], None] | None = None,
 ):
     """Build an async dispatcher for cron job execution.
 
@@ -78,6 +81,15 @@ def create_cron_dispatcher(
         Called just before ``run_agent_turn`` with *session_key*.
     on_turn_idle : callable | None
         Called after ``run_agent_turn`` completes (in the ``finally`` block).
+    on_turn_start : callable | None
+        Called with ``(session_key, message)`` right before the agent turn
+        begins — e.g. to update desktop-pet state.
+    on_turn_finish : callable | None
+        Called with ``(session_key, failed, reply)`` after the agent turn
+        completes — e.g. to trigger a pet animation + bubble.
+    event_handler : callable | None
+        Called with ``(session_key, event)`` for each ``TurnEvent`` emitted
+        during the agent turn (mirrors ``/chat``'s ``event_callback``).
     """
 
     async def dispatch(job) -> str | None:
@@ -100,7 +112,7 @@ def create_cron_dispatcher(
                     f"session={sid} message={job.payload.message[:80]}..."
                 )
 
-                # Resolve session (create if needed, recover for QQ)
+                # Resolve session (use most recent if not found, create only as last resort)
                 if not session_store.exists(sid):
                     if on_session_resolve is not None:
                         recovered = on_session_resolve(
@@ -109,10 +121,17 @@ def create_cron_dispatcher(
                         if recovered is not None:
                             sid = recovered
                     if not session_store.exists(sid):
-                        session_store.create_session(session_id=sid)
+                        # 使用最近的 session 而非新建
+                        recent = session_store.list_summaries()
+                        if recent:
+                            sid = recent[0].session_id
+                        if not session_store.exists(sid):
+                            session_store.create_session(session_id=sid)
 
                 if on_turn_active is not None:
                     on_turn_active(sid)
+                if on_turn_start is not None:
+                    on_turn_start(sid, job.payload.message)
 
                 def _run_bound_turn():
                     """Run the turn with all thread/context-local state bound."""
@@ -138,6 +157,11 @@ def create_cron_dispatcher(
                             tool_registry=tool_registry,
                             llm_client=llm_client,
                             input_event="cron_trigger",
+                            event_callback=(
+                                lambda event: event_handler(sid, event)
+                                if event_handler is not None
+                                else None
+                            ),
                         )
                     finally:
                         if cron_token is not None and hasattr(
@@ -146,11 +170,18 @@ def create_cron_dispatcher(
                             cron_tool.reset_cron_context(cron_token)
                         set_turn_session_id(None)
 
+                failed = False
+                reply: str | None = None
                 try:
                     reply = await asyncio.to_thread(_run_bound_turn)
+                except Exception:
+                    failed = True
+                    raise
                 finally:
                     if on_turn_idle is not None:
                         on_turn_idle(sid)
+                    if on_turn_finish is not None:
+                        on_turn_finish(sid, failed, reply)
 
                 # Deliver reply via the origin channel
                 if reply:

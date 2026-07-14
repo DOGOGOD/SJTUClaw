@@ -8,6 +8,13 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
+# 动画名白名单，与 claw.pet.app.ANIMATIONS 的键保持一致。
+_VALID_ANIMATIONS = frozenset({
+    "idle", "running-right", "running-left", "waving", "jumping",
+    "failed", "waiting", "running", "review",
+})
+
+
 @dataclass
 class _TaskState:
     session_id: str
@@ -17,6 +24,8 @@ class _TaskState:
     animation: str = "running"
     updated_at: float = field(default_factory=time.time)
     finished_at: float | None = None
+    # 过期时间（秒）：finished_at 之后多久从 snapshot 中清除
+    ttl: float = 8.0
 
 
 class PetStateBroker:
@@ -87,12 +96,33 @@ class PetStateBroker:
             else:
                 state.phase, state.message, state.animation = "complete", "任务已完成", "review"
 
+    def notify(self, session_id: str, message: str, animation: str = "jumping") -> None:
+        """显示一条短暂通知（用于定时任务完成、对话回复等）。
+
+        通知会覆盖该 session 的当前状态，并在 ``finished_at`` 之后
+        随 ``snapshot()`` 的过期清理一同消失（默认约 15 秒）。
+
+        消息上限 500 字符（经空白规范化），桌宠端再根据 100 字阈值
+        做截断 + 展开/收起处理。
+        """
+        with self._lock:
+            state = _TaskState(
+                session_id=session_id,
+                task="",
+                phase="notify",
+                message=_compact(message, 500),
+                animation=animation if animation in _VALID_ANIMATIONS else "jumping",
+                ttl=15.0,
+            )
+            state.finished_at = time.time()
+            self._tasks[session_id] = state
+
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             now = time.time()
             stale = [
                 sid for sid, task in self._tasks.items()
-                if task.finished_at is not None and now - task.finished_at > 8
+                if task.finished_at is not None and now - task.finished_at > task.ttl
             ]
             for sid in stale:
                 self._tasks.pop(sid, None)

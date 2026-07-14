@@ -246,14 +246,12 @@ SJTUClaw/
 │   ├── test_unlimited_approval.py   # 无限模式审批测试
 │   └── test_web_tools.py            # 网络工具测试
 │
-├── web/                               # Web UI 构建产物（Vite build 输出，已 gitignore）
 ├── data/                              # 运行时数据（已 gitignore）
 │   ├── sessions/                     # Session JSONL 文件
 │   ├── memory/                       # 记忆 Markdown 文件
 │   ├── cron/                         # 定时任务存储
 │   ├── pets/                         # 用户自定义宠物
 │   └── media/                        # 媒体文件
-├── docs/                              # 文档
 ├── pyproject.toml                     # 项目元数据（sjtuclaw 命令注册）
 ├── requirements.txt                   # 依赖清单（精确版本）
 └── .env.example                       # 环境变量模板（含所有可配置项）

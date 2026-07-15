@@ -89,6 +89,10 @@
   }
   html, body, #root { min-height: 100%; height: 100%; }
   button, input, textarea, select { font: inherit; }
+
+  /* Keep the single explicit visibility control for secret fields. */
+  input.api-key-input::-ms-reveal,
+  input.api-key-input::-ms-clear { display: none; }
   ::selection { background: hsl(var(--primary) / 0.18); }
 }
 

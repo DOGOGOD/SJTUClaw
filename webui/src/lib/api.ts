@@ -262,6 +262,72 @@ export async function saveSoul(content: string): Promise<{ ok: boolean }> {
 
 // ---------------------------------------------------------------------------
 
+export async function fetchLLMSettings(): Promise<{ ok: boolean; settings: import("@/lib/types").LLMSettings }> {
+  return request("/settings/llm");
+}
+
+export async function saveLLMSettings(data: {
+  baseUrl: string;
+  apiKey?: string;
+  model: string;
+  contextWindow: number;
+  contextUsageRatio: number;
+  maxOutputTokens: number;
+  consolidationRatio: number;
+}): Promise<{ ok: boolean; settings: import("@/lib/types").LLMSettings }> {
+  return request("/settings/llm", {
+    method: "PUT",
+    body: JSON.stringify(data),
+  });
+}
+
+export async function fetchChannelSettings(): Promise<{
+  ok: boolean;
+  settings: { qq: import("@/lib/types").QQChannelSettings };
+  status: import("@/lib/types").QQConnectionStatus;
+}> {
+  return request("/settings/channel");
+}
+
+export async function saveQQChannelSettings(data: {
+  enabled: boolean;
+  appId: string;
+  clientSecret?: string;
+  allowFrom: string;
+  msgFormat: "markdown" | "text";
+  ackMessage: string;
+}): Promise<{
+  ok: boolean;
+  settings: { qq: import("@/lib/types").QQChannelSettings };
+  status: import("@/lib/types").QQConnectionStatus;
+}> {
+  return request("/settings/channel/qq", {
+    method: "PUT",
+    body: JSON.stringify(data),
+  });
+}
+
+export async function startQQOnboard(): Promise<{
+  ok: boolean;
+  taskId: string;
+  connectUrl: string;
+  qrImage: string;
+}> {
+  return request("/settings/channel/qq/onboard/start", { method: "POST" });
+}
+
+export async function pollQQOnboard(taskId: string): Promise<{
+  ok: boolean;
+  status: "pending" | "completed" | "expired";
+  message?: string;
+  settings?: { qq: import("@/lib/types").QQChannelSettings };
+  connection?: import("@/lib/types").QQConnectionStatus;
+}> {
+  return request(`/settings/channel/qq/onboard/${encodeURIComponent(taskId)}`);
+}
+
+// ---------------------------------------------------------------------------
+
 export async function fetchMemories(): Promise<{ ok: boolean; memories: import("@/lib/types").MemoryEntry[] }> {
   return request("/memories");
 }
@@ -345,6 +411,27 @@ export async function rejectApproval(id: string, reason?: string): Promise<{ ok:
 
 export async function fetchSkills(): Promise<{ ok: boolean; skills: import("@/lib/types").SkillInfo[] }> {
   return request("/skills");
+}
+
+export async function uploadSkillPackage(file: File, replace = false): Promise<{
+  ok: boolean;
+  skill: { name: string; description: string; fileCount: number; path: string };
+  message: string;
+}> {
+  const form = new FormData();
+  form.append("file", file);
+  return request(`/skills/upload?replace=${replace ? "true" : "false"}`, {
+    method: "POST",
+    body: form,
+  });
+}
+
+export async function removeSkill(name: string): Promise<{
+  ok: boolean;
+  removed: { name: string; message: string };
+  message: string;
+}> {
+  return request(`/skills/${encodeURIComponent(name)}`, { method: "DELETE" });
 }
 
 // ---------------------------------------------------------------------------

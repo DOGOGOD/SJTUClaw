@@ -246,6 +246,35 @@ export interface PetInfo {
   readOnly: boolean;
 }
 
-export type SettingsSection = "prompt" | "soul" | "memory" | "cron" | "skills" | "workspace" | "pet";
+export interface LLMSettings {
+  baseUrl: string;
+  apiKeyMasked: string;
+  apiKeyConfigured: boolean;
+  model: string;
+  contextWindow: number;
+  contextUsageRatio: number;
+  maxOutputTokens: number;
+  consolidationRatio: number;
+}
+
+export interface QQChannelSettings {
+  enabled: boolean;
+  appId: string;
+  clientSecretMasked: string;
+  allowFrom: string;
+  msgFormat: "markdown" | "text";
+  ackMessage: string;
+}
+
+export interface QQConnectionStatus {
+  enabled: boolean;
+  configured: boolean;
+  running: boolean;
+  starting?: boolean;
+  appId: string;
+  message: string;
+}
+
+export type SettingsSection = "prompt" | "soul" | "memory" | "cron" | "skills" | "workspace" | "pet" | "channel" | "llm";
 
 export type ShellView = "chat" | "settings";

@@ -10,6 +10,7 @@ Start the server::
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import mimetypes
@@ -18,6 +19,7 @@ import queue
 import shutil
 import threading
 import uuid
+from io import BytesIO
 from urllib.parse import unquote, urlparse
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
@@ -41,6 +43,8 @@ from claw.agent.events import (
 from claw.agent.loop import run_agent_turn
 from claw.approval.manager import ApprovalManager, ApprovalRequest, ApprovalStatus
 from claw.config import (
+    ConfigError,
+    LLMConfig,
     DATA_DIR,
     load_heartbeat_config,
     MEMORY_DIR,
@@ -72,6 +76,12 @@ from claw.memory.reflection import ReflectionManager
 from claw.pet.catalog import PetCatalog, PetCatalogError
 from claw.pet.process import PetProcessManager
 from claw.pet.state import PetStateBroker
+from claw.runtime_settings import (
+    load_runtime_settings_raw,
+    replace_runtime_settings_raw,
+    setting_value,
+    update_runtime_settings,
+)
 
 # -- QQ channel support ---------------------------------------------------------
 from claw.channels.qq import QQChannel, QQConfig
@@ -80,15 +90,66 @@ from claw.channels.qq_interactions import QQInteraction, parse_approval_button_d
 
 logger = logging.getLogger(__name__)
 
+_LLM_NOT_CONFIGURED_MESSAGE = "LLM 未配置，请先在设置中的 LLM 设置里填写 Base_url、API Key 和模型名称。"
+
+
+class RuntimeLLMClient:
+    """Mutable LLM client holder so WebUI can start before LLM is configured."""
+
+    def __init__(self) -> None:
+        self._client: LLMClient | None = None
+        self._config = LLMConfig(api_key="", base_url="https://api.openai.com/v1", model="")
+        self.error_message = _LLM_NOT_CONFIGURED_MESSAGE
+
+    @property
+    def config(self) -> LLMConfig:
+        return self._client.config if self._client is not None else self._config
+
+    @property
+    def configured(self) -> bool:
+        cfg = self.config
+        return self._client is not None and bool(cfg.api_key and cfg.base_url and cfg.model)
+
+    def set_config(self, config: LLMConfig) -> None:
+        self._client = LLMClient(config)
+        self._config = config
+        self.error_message = ""
+
+    def clear(self, message: str | None = None) -> None:
+        self._client = None
+        self.error_message = message or _LLM_NOT_CONFIGURED_MESSAGE
+
+    def _require_client(self) -> LLMClient:
+        if self._client is None:
+            raise LLMError(self.error_message or _LLM_NOT_CONFIGURED_MESSAGE)
+        return self._client
+
+    def chat(self, *args, **kwargs):
+        return self._require_client().chat(*args, **kwargs)
+
+    def chat_with_tools(self, *args, **kwargs):
+        return self._require_client().chat_with_tools(*args, **kwargs)
+
+
+def _load_initial_llm() -> tuple[LLMConfig, RuntimeLLMClient]:
+    client = RuntimeLLMClient()
+    try:
+        config = load_config()
+        client.set_config(config)
+        return config, client
+    except ConfigError as exc:
+        client.clear(_LLM_NOT_CONFIGURED_MESSAGE)
+        logger.warning("LLM 未配置，WebUI 将以设置模式启动: %s", exc)
+        return client.config, client
+
 # ---------------------------------------------------------------------------
 # Shared runtime (initialised once at startup)
 # ---------------------------------------------------------------------------
 
-_config = load_config()
+_config, _llm_client = _load_initial_llm()
 _system_prompt = load_system_prompt()
 _soul = load_soul()
 
-_llm_client = LLMClient(_config)
 _session_store = SessionStore(SESSIONS_DIR)
 _memory_store = MemoryStore(MEMORY_DIR)
 _compact_cfg = load_compaction_config()
@@ -146,6 +207,14 @@ def _persist_agent_fallback(session_id: str, message: str) -> str:
     except Exception:
         logger.exception("无法持久化 Agent 异常兜底消息: session=%s", session_id)
     return message
+
+
+def _llm_missing_reply() -> str:
+    return _LLM_NOT_CONFIGURED_MESSAGE
+
+
+def _llm_ready() -> bool:
+    return bool(getattr(_llm_client, "configured", False))
 
 # -- Cron service (must be created before register_all_tools) --------------
 _cron_store_path = DATA_DIR / "cron" / "jobs.json"
@@ -312,7 +381,7 @@ _reflection_mgr = ReflectionManager(
 
 # -- Compaction worker (v3: with idle auto-compaction) --------------------
 _compact_llm: LLMClient | None = None
-if _compact_cfg.model:
+if _compact_cfg.model and (_compact_cfg.api_key or _llm_ready()):
     from claw.config import LLMConfig as LC
     _compact_llm_config = LC(
         api_key=_compact_cfg.api_key or _config.api_key,
@@ -497,6 +566,7 @@ def _cancel_all_active_turns() -> int:
 # QQ channel instance (started in lifespan if QQ_ENABLED=true)
 _qq_channel: QQChannel | None = None
 _qq_task: asyncio.Task | None = None
+_qq_onboard_tasks: dict[str, dict[str, Any]] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -662,6 +732,16 @@ async def _qq_message_handler(
             return _execute_slash_command(content, session_key)
         finally:
             _set_turn_session_id(None)
+
+    if not _llm_ready():
+        reply = _llm_missing_reply()
+        try:
+            session.append_message("user", content)
+            session.append_message("assistant", reply)
+            _session_store.save(session)
+        except Exception:
+            logger.exception("无法持久化 QQ LLM 未配置提示: session=%s", session_key)
+        return reply
 
     cancel_event = _register_active_turn(session_key)
     if cancel_event is None:
@@ -930,6 +1010,32 @@ async def handle_chat(req: ChatRequest):
             "autoMode": _auto_mode.get(sid, False),
             "unlimitedMode": _workspace_manager.is_unlimited(sid),
             "title": session.title,
+        }
+
+    if not _llm_ready():
+        reply = _llm_missing_reply()
+        try:
+            session = _session_store.get(sid)
+            session.append_message("user", req.message)
+            session.append_message("assistant", reply)
+            _session_store.save(session)
+            messages = visible_session_messages(session)
+            title = session.title
+        except Exception:
+            messages = [
+                {"role": "user", "content": req.message},
+                {"role": "assistant", "content": reply},
+            ]
+            title = None
+        return {
+            "ok": True,
+            "type": "config_required",
+            "sessionId": sid,
+            "reply": reply,
+            "messages": messages,
+            "autoMode": _auto_mode.get(sid, False),
+            "unlimitedMode": _workspace_manager.is_unlimited(sid),
+            "title": title,
         }
 
     downloads_before = set(list_downloads())
@@ -2113,6 +2219,350 @@ def _cron_job_to_dict(job) -> dict:
 
 
 # ==========================================================================
+# WebUI runtime settings
+# ==========================================================================
+
+
+def _masked(value: str) -> str:
+    value = value.strip()
+    if not value:
+        return ""
+    if len(value) <= 8:
+        return "********"
+    return f"{value[:4]}****{value[-4:]}"
+
+
+def _int_setting(name: str, default: int) -> int:
+    raw = setting_value(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _float_setting(name: str, default: float) -> float:
+    raw = setting_value(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def _llm_settings_payload() -> dict[str, Any]:
+    api_key = setting_value("LLM_API_KEY", "").strip()
+    return {
+        "baseUrl": setting_value("LLM_BASE_URL", "https://api.openai.com/v1").strip(),
+        "apiKeyMasked": _masked(api_key),
+        "apiKeyConfigured": bool(api_key),
+        "model": setting_value("LLM_MODEL", "").strip(),
+        "contextWindow": _int_setting("LLM_CONTEXT_WINDOW", 32000),
+        "contextUsageRatio": _float_setting("LLM_CONTEXT_USAGE_RATIO", 0.8),
+        "maxOutputTokens": _int_setting("LLM_MAX_OUTPUT_TOKENS", 4096),
+        "consolidationRatio": _float_setting("LLM_CONSOLIDATION_RATIO", 0.5),
+    }
+
+
+def _qq_settings_payload() -> dict[str, Any]:
+    cfg = load_qq_config()
+    return {
+        "enabled": cfg.enabled,
+        "appId": cfg.app_id,
+        "clientSecretMasked": _masked(cfg.client_secret),
+        "allowFrom": ",".join(cfg.allow_from),
+        "msgFormat": "markdown" if cfg.markdown_support else "text",
+        "ackMessage": cfg.ack_message,
+    }
+
+
+def _qq_connection_status() -> dict[str, Any]:
+    cfg = load_qq_config()
+    configured = bool(cfg.app_id and cfg.client_secret)
+    ws = getattr(_qq_channel, "_ws", None)
+    task_done = bool(_qq_task and _qq_task.done())
+    running = bool(_qq_channel and _qq_channel.is_running and ws and not ws.closed)
+    starting = bool(
+        cfg.enabled
+        and configured
+        and _qq_channel
+        and not task_done
+        and not running
+    )
+    if running:
+        message = "QQ 通道已连接"
+    elif cfg.enabled and not configured:
+        message = "QQ 通道已启用，但 QQ_APP_ID 或 QQ_CLIENT_SECRET 未配置"
+    elif starting:
+        message = "QQ 通道连接中"
+    elif cfg.enabled and task_done:
+        message = "QQ 通道连接失败，请检查 AppID / Client Secret 或 QQ 开放平台配置"
+    elif cfg.enabled:
+        message = "QQ 通道已启用，等待连接"
+    else:
+        message = "QQ 通道未启用"
+    return {
+        "enabled": cfg.enabled,
+        "configured": configured,
+        "running": running,
+        "starting": starting,
+        "appId": cfg.app_id,
+        "message": message,
+    }
+
+
+def _validate_url(value: str, field_name: str) -> None:
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise HTTPException(status_code=400, detail=f"{field_name} 必须是完整的 http/https URL")
+
+
+def _apply_llm_runtime_config() -> None:
+    global _config
+    settings = _llm_settings_payload()
+    api_key = setting_value("LLM_API_KEY", "").strip()
+    if not api_key:
+        raise HTTPException(status_code=400, detail="请填写 LLM API Key")
+    if not settings["model"]:
+        raise HTTPException(status_code=400, detail="请填写 LLM 模型名称")
+    _validate_url(settings["baseUrl"], "Base_url")
+
+    _config = LLMConfig(
+        api_key=api_key,
+        base_url=settings["baseUrl"],
+        model=settings["model"],
+        context_window=settings["contextWindow"],
+        context_usage_ratio=settings["contextUsageRatio"],
+        max_output_tokens=settings["maxOutputTokens"],
+        consolidation_ratio=settings["consolidationRatio"],
+    )
+    _llm_client.set_config(_config)
+
+
+async def _apply_qq_runtime_config() -> None:
+    global _qq_channel, _qq_task
+    cfg = load_qq_config()
+
+    if _qq_channel is not None:
+        await _qq_channel.stop()
+        _qq_channel = None
+    if _qq_task is not None and not _qq_task.done():
+        _qq_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await _qq_task
+    _qq_task = None
+
+    if not cfg.enabled:
+        return
+    if not cfg.app_id or not cfg.client_secret:
+        return
+
+    _qq_channel = QQChannel(QQConfig(
+        enabled=True,
+        app_id=cfg.app_id,
+        client_secret=cfg.client_secret,
+        allow_from=list(cfg.allow_from),
+        markdown_support=cfg.markdown_support,
+        ack_message=cfg.ack_message,
+    ))
+    _qq_channel.set_message_handler(_qq_message_handler)
+    _qq_channel.set_interaction_handler(_qq_interaction_handler)
+    _qq_task = asyncio.create_task(_qq_channel.start())
+
+
+async def _ensure_qq_runtime_started() -> None:
+    cfg = load_qq_config()
+    if not cfg.enabled or not cfg.app_id or not cfg.client_secret:
+        return
+    if _qq_channel is not None and _qq_channel.is_running and not (_qq_task and _qq_task.done()):
+        return
+    await _apply_qq_runtime_config()
+
+
+class LLMSettingsRequest(BaseModel):
+    base_url: str = Field(alias="baseUrl")
+    api_key: str | None = Field(default=None, alias="apiKey")
+    model: str
+    context_window: int = Field(alias="contextWindow")
+    context_usage_ratio: float = Field(alias="contextUsageRatio")
+    max_output_tokens: int = Field(alias="maxOutputTokens")
+    consolidation_ratio: float = Field(alias="consolidationRatio")
+
+
+class QQSettingsRequest(BaseModel):
+    enabled: bool
+    app_id: str = Field(default="", alias="appId")
+    client_secret: str | None = Field(default=None, alias="clientSecret")
+    allow_from: str = Field(default="", alias="allowFrom")
+    msg_format: str = Field(default="markdown", alias="msgFormat")
+    ack_message: str = Field(default="", alias="ackMessage")
+
+
+@app.get("/settings/llm")
+def get_llm_settings():
+    return {"ok": True, "settings": _llm_settings_payload()}
+
+
+@app.put("/settings/llm")
+def update_llm_settings(req: LLMSettingsRequest):
+    _validate_url(req.base_url.strip(), "Base_url")
+    if not req.model.strip():
+        raise HTTPException(status_code=400, detail="请填写 LLM 模型名称")
+    if req.context_window < 1024:
+        raise HTTPException(status_code=400, detail="Context window 不能小于 1024")
+    if req.context_usage_ratio <= 0 or req.context_usage_ratio > 1:
+        raise HTTPException(status_code=400, detail="Context usage ratio 必须在 0 到 1 之间")
+    if req.max_output_tokens < 1:
+        raise HTTPException(status_code=400, detail="Max output tokens 必须大于 0")
+    if req.consolidation_ratio <= 0 or req.consolidation_ratio > 1:
+        raise HTTPException(status_code=400, detail="Consolidation ratio 必须在 0 到 1 之间")
+
+    previous_settings = load_runtime_settings_raw()
+    updates: dict[str, Any] = {
+        "LLM_BASE_URL": req.base_url,
+        "LLM_MODEL": req.model,
+        "LLM_CONTEXT_WINDOW": req.context_window,
+        "LLM_CONTEXT_USAGE_RATIO": req.context_usage_ratio,
+        "LLM_MAX_OUTPUT_TOKENS": req.max_output_tokens,
+        "LLM_CONSOLIDATION_RATIO": req.consolidation_ratio,
+    }
+    if req.api_key:
+        updates["LLM_API_KEY"] = req.api_key
+    update_runtime_settings(updates)
+    try:
+        _apply_llm_runtime_config()
+    except HTTPException:
+        replace_runtime_settings_raw(previous_settings)
+        raise
+    except Exception as exc:
+        replace_runtime_settings_raw(previous_settings)
+        raise HTTPException(status_code=400, detail=f"LLM 配置应用失败: {exc}") from exc
+    return {"ok": True, "settings": _llm_settings_payload()}
+
+
+@app.get("/settings/channel")
+async def get_channel_settings():
+    await _ensure_qq_runtime_started()
+    return {
+        "ok": True,
+        "settings": {"qq": _qq_settings_payload()},
+        "status": _qq_connection_status(),
+    }
+
+
+@app.put("/settings/channel/qq")
+async def update_qq_settings(req: QQSettingsRequest):
+    if req.enabled and not req.app_id.strip():
+        raise HTTPException(status_code=400, detail="启用 QQ 通道前请填写 QQ_APP_ID")
+    if req.msg_format not in {"markdown", "text"}:
+        raise HTTPException(status_code=400, detail="QQ_MSG_FORMAT 只能是 markdown 或 text")
+
+    updates: dict[str, Any] = {
+        "QQ_ENABLED": "true" if req.enabled else "false",
+        "QQ_APP_ID": req.app_id,
+        "QQ_ALLOW_FROM": req.allow_from,
+        "QQ_MSG_FORMAT": req.msg_format,
+        "QQ_ACK_MESSAGE": req.ack_message,
+    }
+    if req.client_secret:
+        updates["QQ_CLIENT_SECRET"] = req.client_secret
+    update_runtime_settings(updates)
+    await _apply_qq_runtime_config()
+    return {
+        "ok": True,
+        "settings": {"qq": _qq_settings_payload()},
+        "status": _qq_connection_status(),
+    }
+
+
+def _make_qr_data_uri(text: str) -> str:
+    try:
+        import qrcode
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail="缺少 qrcode 依赖，无法生成二维码") from exc
+    image = qrcode.make(text)
+    buffer = BytesIO()
+    image.save(buffer, format="PNG")
+    encoded = base64.b64encode(buffer.getvalue()).decode("ascii")
+    return f"data:image/png;base64,{encoded}"
+
+
+def _prune_qq_onboard_tasks(max_age_seconds: int = 600) -> None:
+    now = datetime.now(timezone.utc).timestamp()
+    stale = [
+        task_id for task_id, task in _qq_onboard_tasks.items()
+        if now - float(task.get("created_at", 0)) > max_age_seconds
+    ]
+    for task_id in stale:
+        _qq_onboard_tasks.pop(task_id, None)
+
+
+@app.post("/settings/channel/qq/onboard/start")
+def start_qq_onboard():
+    _prune_qq_onboard_tasks()
+    try:
+        from claw.channels.qq_onboard import _create_bind_task, build_connect_url
+
+        task_id, aes_key = _create_bind_task()
+        connect_url = build_connect_url(task_id)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"创建 QQ 扫码任务失败: {exc}") from exc
+
+    _qq_onboard_tasks[task_id] = {
+        "aes_key": aes_key,
+        "created_at": datetime.now(timezone.utc).timestamp(),
+    }
+    return {
+        "ok": True,
+        "taskId": task_id,
+        "connectUrl": connect_url,
+        "qrImage": _make_qr_data_uri(connect_url),
+    }
+
+
+@app.get("/settings/channel/qq/onboard/{task_id}")
+async def poll_qq_onboard(task_id: str):
+    _prune_qq_onboard_tasks()
+    task = _qq_onboard_tasks.get(task_id)
+    if not task:
+        return {"ok": True, "status": "expired", "message": "二维码已过期，请重新发起扫码连接"}
+
+    try:
+        from claw.channels.qq_crypto import decrypt_secret
+        from claw.channels.qq_onboard import BindStatus, _poll_bind_result
+
+        status, app_id, encrypted_secret, user_openid = _poll_bind_result(task_id)
+    except Exception as exc:
+        return {"ok": True, "status": "pending", "message": f"等待扫码确认: {exc}"}
+
+    if status == BindStatus.EXPIRED:
+        _qq_onboard_tasks.pop(task_id, None)
+        return {"ok": True, "status": "expired", "message": "二维码已过期，请重新发起扫码连接"}
+    if status != BindStatus.COMPLETED:
+        return {"ok": True, "status": "pending", "message": "等待手机 QQ 扫码确认"}
+
+    client_secret = decrypt_secret(encrypted_secret, str(task["aes_key"]))
+    allow_from = user_openid or setting_value("QQ_ALLOW_FROM", "*")
+    update_runtime_settings({
+        "QQ_ENABLED": "true",
+        "QQ_APP_ID": app_id,
+        "QQ_CLIENT_SECRET": client_secret,
+        "QQ_ALLOW_FROM": allow_from,
+        "QQ_MSG_FORMAT": setting_value("QQ_MSG_FORMAT", "markdown"),
+    })
+    _qq_onboard_tasks.pop(task_id, None)
+    await _apply_qq_runtime_config()
+    return {
+        "ok": True,
+        "status": "completed",
+        "settings": {"qq": _qq_settings_payload()},
+        "connection": _qq_connection_status(),
+    }
+
+
+# ==========================================================================
 # QQ channel status endpoint
 # ==========================================================================
 
@@ -2186,6 +2636,31 @@ async def handle_chat_stream(req: ChatRequest):
 
         return StreamingResponse(
             _command_events(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    if not _llm_ready():
+        reply = _llm_missing_reply()
+        try:
+            session = _session_store.get(sid)
+            session.append_message("user", req.message)
+            session.append_message("assistant", reply)
+            _session_store.save(session)
+        except Exception:
+            logger.exception("无法持久化 LLM 未配置提示: session=%s", sid)
+
+        async def _config_required_events():
+            yield _event_to_sse(FinalEvent(content=reply))
+            yield f"data: {json.dumps({'type': '_session_info', 'sessionId': sid, 'autoMode': _auto_mode.get(sid, False), 'unlimitedMode': _workspace_manager.is_unlimited(sid)}, ensure_ascii=False)}\n\n"
+            yield "data: {\"type\": \"_done\"}\n\n"
+
+        return StreamingResponse(
+            _config_required_events(),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",

@@ -144,32 +144,33 @@ def load_config() -> LLMConfig:
             blank.
     """
     _ensure_dotenv_loaded()
+    from claw.runtime_settings import setting_value
 
-    values = {name: os.getenv(name, "").strip() for name in _REQUIRED_VARS}
+    values = {name: setting_value(name, "").strip() for name in _REQUIRED_VARS}
     missing = [name for name, value in values.items() if not value]
 
     if missing:
         raise ConfigError(_missing_config_message(missing))
 
-    context_window_str = os.getenv("LLM_CONTEXT_WINDOW", "").strip()
+    context_window_str = setting_value("LLM_CONTEXT_WINDOW", "").strip()
     try:
         context_window = int(context_window_str) if context_window_str else _DEFAULT_CONTEXT_WINDOW
     except ValueError:
         context_window = _DEFAULT_CONTEXT_WINDOW
 
-    usage_ratio_str = os.getenv("LLM_CONTEXT_USAGE_RATIO", "").strip()
+    usage_ratio_str = setting_value("LLM_CONTEXT_USAGE_RATIO", "").strip()
     try:
         context_usage_ratio = float(usage_ratio_str) if usage_ratio_str else _DEFAULT_CONTEXT_USAGE_RATIO
     except ValueError:
         context_usage_ratio = _DEFAULT_CONTEXT_USAGE_RATIO
 
-    max_output_str = os.getenv("LLM_MAX_OUTPUT_TOKENS", "").strip()
+    max_output_str = setting_value("LLM_MAX_OUTPUT_TOKENS", "").strip()
     try:
         max_output_tokens = int(max_output_str) if max_output_str else _DEFAULT_MAX_OUTPUT_TOKENS
     except ValueError:
         max_output_tokens = _DEFAULT_MAX_OUTPUT_TOKENS
 
-    consolidation_ratio_str = os.getenv("LLM_CONSOLIDATION_RATIO", "").strip()
+    consolidation_ratio_str = setting_value("LLM_CONSOLIDATION_RATIO", "").strip()
     try:
         consolidation_ratio = float(consolidation_ratio_str) if consolidation_ratio_str else _DEFAULT_CONSOLIDATION_RATIO
     except ValueError:
@@ -263,14 +264,15 @@ class QQChannelConfig:
 def load_qq_config() -> QQChannelConfig:
     """Load QQ channel configuration from environment variables."""
     _ensure_dotenv_loaded()
+    from claw.runtime_settings import setting_value
 
-    enabled = os.getenv("QQ_ENABLED", "false").strip().lower() in ("true", "1", "yes")
-    app_id = os.getenv("QQ_APP_ID", "").strip()
-    client_secret = os.getenv("QQ_CLIENT_SECRET", "").strip()
-    allow_from_raw = os.getenv("QQ_ALLOW_FROM", "").strip()
+    enabled = setting_value("QQ_ENABLED", "false").strip().lower() in ("true", "1", "yes")
+    app_id = setting_value("QQ_APP_ID", "").strip()
+    client_secret = setting_value("QQ_CLIENT_SECRET", "").strip()
+    allow_from_raw = setting_value("QQ_ALLOW_FROM", "").strip()
     allow_from = [u.strip() for u in allow_from_raw.split(",") if u.strip()] if allow_from_raw else []
-    markdown_support = os.getenv("QQ_MSG_FORMAT", "markdown").strip() == "markdown"
-    ack_message = os.getenv("QQ_ACK_MESSAGE", "").strip()
+    markdown_support = setting_value("QQ_MSG_FORMAT", "markdown").strip() == "markdown"
+    ack_message = setting_value("QQ_ACK_MESSAGE", "").strip()
 
     return QQChannelConfig(
         enabled=enabled,

@@ -200,6 +200,7 @@ class QQChannel(BaseChannel):
         try:
             await self._listen_loop()
         finally:
+            self._running = False
             if self._http_client:
                 await self._http_client.aclose()
                 self._http_client = None

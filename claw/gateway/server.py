@@ -1479,6 +1479,23 @@ class SetWorkspaceRequest(BaseModel):
     path: str = Field(..., min_length=1)
 
 
+def _enable_native_dialog_dpi_awareness() -> None:
+    """Opt the process into native DPI scaling before opening Tk dialogs."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        try:
+            # PER_MONITOR_AWARE_V2 avoids Windows bitmap-upscaling the dialog.
+            user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+        except (AttributeError, OSError):
+            user32.SetProcessDPIAware()
+    except (AttributeError, OSError, ValueError):
+        return
+
+
 def _pick_workspace_directory() -> str:
     """Open a native folder picker on the machine running the Gateway."""
     try:
@@ -1488,6 +1505,7 @@ def _pick_workspace_directory() -> str:
         raise RuntimeError("当前 Python 环境不支持原生文件夹选择器") from exc
 
     try:
+        _enable_native_dialog_dpi_awareness()
         root = tk.Tk()
     except Exception as exc:
         raise RuntimeError("当前 Gateway 无法打开图形文件夹选择器") from exc

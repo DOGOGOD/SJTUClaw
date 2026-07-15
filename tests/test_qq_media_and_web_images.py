@@ -180,6 +180,42 @@ def test_workspace_endpoint_normalizes_quotes_and_file_uri(monkeypatch, tmp_path
     assert response["workspace"] == str(tmp_path)
 
 
+def test_native_workspace_picker_enables_dpi_before_opening_tk(monkeypatch):
+    import sys
+    import types
+
+    from claw.gateway import server
+
+    calls = []
+
+    class _FakeRoot:
+        def withdraw(self):
+            calls.append("withdraw")
+
+        def attributes(self, *args):
+            calls.append(("attributes", args))
+
+        def destroy(self):
+            calls.append("destroy")
+
+    fake_filedialog = types.SimpleNamespace(
+        askdirectory=lambda **kwargs: calls.append(("askdirectory", kwargs)) or r"C:\workspace"
+    )
+    fake_tk = types.ModuleType("tkinter")
+    fake_tk.Tk = lambda: calls.append("Tk") or _FakeRoot()
+    fake_tk.filedialog = fake_filedialog
+
+    monkeypatch.setattr(server, "_enable_native_dialog_dpi_awareness", lambda: calls.append("dpi"))
+    monkeypatch.setitem(sys.modules, "tkinter", fake_tk)
+    monkeypatch.setitem(sys.modules, "tkinter.filedialog", fake_filedialog)
+
+    path = server._pick_workspace_directory()
+
+    assert path == r"C:\workspace"
+    assert calls[0] == "dpi"
+    assert calls[1] == "Tk"
+
+
 def test_native_workspace_picker_runs_off_event_loop(monkeypatch):
     from claw.gateway import server
 

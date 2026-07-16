@@ -18,10 +18,12 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from claw.context.budget import ContextBudget
 from claw.memory.store import MemoryStore
 from claw.session.models import Session
+from claw.utils import default_timezone_name
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -87,9 +89,14 @@ def _build_runtime_context(
     supplemental_lines: list[str] | None = None,
 ) -> str:
     """Build an untrusted runtime metadata block appended after user content."""
-    now = datetime.now()
-    tz_suffix = f" ({timezone})" if timezone else ""
-    lines = [f"当前时间: {now.isoformat(timespec='seconds')}{tz_suffix}"]
+    tz_name = timezone or default_timezone_name()
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        tz_name = default_timezone_name()
+        tz = ZoneInfo(tz_name)
+    now = datetime.now(tz)
+    lines = [f"当前时间: {now.isoformat(timespec='seconds')} ({tz_name})"]
     if channel:
         lines.append(f"Channel: {channel}")
     if chat_id:

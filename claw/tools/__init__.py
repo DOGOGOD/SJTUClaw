@@ -8,6 +8,7 @@ from claw.tools.base import (
     normalize_tool_schema,
     standardize_tool_result,
 )
+from claw.utils import default_timezone_name
 
 __all__ = [
     "Tool",
@@ -31,7 +32,7 @@ def register_all_tools(
     memory_store=None,
     include_cron_tool: bool = False,
     cron_service=None,
-    default_timezone: str = "UTC",
+    default_timezone: str | None = None,
 ) -> None:
     """Register read-only AND advanced tools in *registry*.
 
@@ -81,7 +82,7 @@ def register_all_tools(
     if include_cron_tool and cron_service is not None:
         from claw.tools.cron_tool import CronTool
 
-        cron_tool = CronTool(cron_service, default_timezone)
+        cron_tool = CronTool(cron_service, default_timezone or default_timezone_name())
         if session_id_provider is not None:
             # Set context if session provider is available
             try:

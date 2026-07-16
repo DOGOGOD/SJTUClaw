@@ -13,9 +13,17 @@ export function formatTime(iso: string): string {
   const pad = (n: number) => String(n).padStart(2, "0");
   const time = `${pad(d.getHours())}:${pad(d.getMinutes())}`;
   if (d.toDateString() === now.toDateString()) return time;
-  const diff = Math.floor((now.getTime() - d.getTime()) / 86400000);
-  if (diff === 1) return "昨天";
-  if (diff < 7) return `${diff}天前`;
+
+  const calendarDay = (value: Date) => Date.UTC(
+    value.getFullYear(),
+    value.getMonth(),
+    value.getDate()
+  );
+  const daysAgo = Math.round(
+    (calendarDay(now) - calendarDay(d)) / 86_400_000
+  );
+  if (daysAgo === 1) return "昨天";
+  if (daysAgo > 1 && daysAgo < 7) return `${daysAgo}天前`;
   return `${d.getMonth() + 1}/${d.getDate()}`;
 }
 

@@ -34,7 +34,7 @@ from claw.prompts import PromptLoadError, load_soul, load_system_prompt
 from claw.session.store import SessionStore
 from claw.skills.registry import SkillRegistry
 from claw.tools.base import ToolRegistry
-from claw.utils import force_utf8_stdio
+from claw.utils import default_timezone_name, force_utf8_stdio
 from claw.workspace.manager import WorkspaceManager
 from claw.pet.catalog import PetCatalog
 from claw.pet.process import PetProcessManager
@@ -71,6 +71,7 @@ def main() -> int:
         soul,
         memory_store,
         workspace_path=str(SESSIONS_DIR.parent),
+        timezone=default_timezone_name(),
         workspace_manager=workspace_manager,
     )
 

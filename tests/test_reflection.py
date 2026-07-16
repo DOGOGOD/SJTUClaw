@@ -22,6 +22,7 @@ from claw.memory.reflection import (
     _now_iso,
     _parse_facts_from_response,
     _same_day,
+    _time_matches,
 )
 from claw.memory.store import MemoryStore
 from claw.session.store import SessionStore
@@ -260,6 +261,33 @@ class TestSameDay:
         assert _same_day("not-a-date", "2026-07-08T10:00:00") is False
         assert _same_day("2026-07-08T10:00:00", "") is False
         assert _same_day("", "") is False
+
+
+# =============================================================================
+# _time_matches
+# =============================================================================
+
+
+class TestTimeMatches:
+    def test_uses_default_timezone(self, monkeypatch):
+        import claw.memory.reflection as reflection
+
+        monkeypatch.setattr(reflection, "default_timezone_name", lambda: "America/New_York")
+
+        class FakeDateTime:
+            @classmethod
+            def now(cls, tz=None):
+                assert getattr(tz, "key", "") == "America/New_York"
+                return datetime(2026, 7, 16, 9, 30, tzinfo=tz)
+
+            @staticmethod
+            def fromisoformat(value):
+                return datetime.fromisoformat(value)
+
+        monkeypatch.setattr(reflection, "datetime", FakeDateTime)
+
+        assert _time_matches("09:30") is True
+        assert _time_matches("01:30") is False
 
 
 # =============================================================================

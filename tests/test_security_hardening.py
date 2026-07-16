@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import socket
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
@@ -55,6 +57,41 @@ def test_active_turn_registration_is_exclusive():
     server._unregister_active_turn("same-session", first)
     assert server._register_active_turn("same-session") is not None
     server._active_turns.clear()
+
+
+def test_gateway_one_shot_cron_honors_explicit_timezone(monkeypatch):
+    from claw.gateway import server
+
+    captured = {}
+    sentinel_job = object()
+
+    monkeypatch.setattr(server._session_store, "exists", lambda session_id: True)
+    monkeypatch.setattr(
+        server._cron_service,
+        "add_job",
+        lambda **kwargs: captured.update(kwargs) or sentinel_job,
+    )
+    monkeypatch.setattr(server, "_cron_job_to_dict", lambda job: {"captured": job is sentinel_job})
+
+    result = server.create_cron_job(
+        server.CreateCronJobRequest(
+            message="wake up",
+            at="2026-07-16T09:30:00",
+            tz="America/New_York",
+            sessionId="default",
+        )
+    )
+
+    expected = datetime(
+        2026,
+        7,
+        16,
+        9,
+        30,
+        tzinfo=ZoneInfo("America/New_York"),
+    )
+    assert captured["schedule"].at_ms == int(expected.timestamp() * 1000)
+    assert result == {"ok": True, "job": {"captured": True}}
 
 
 def test_qq_group_enforces_member_allowlist(monkeypatch):

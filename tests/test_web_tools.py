@@ -84,6 +84,45 @@ def test_fetch_extracts_html_and_decodes_utf8(monkeypatch):
     assert not result["truncated"]
 
 
+def test_fetch_returns_html_metadata_and_links(monkeypatch):
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *a, **k: PUBLIC_DNS)
+
+    html = """
+    <html>
+      <head>
+        <title>Doc title</title>
+        <meta name="description" content="Short page summary">
+        <meta name="robots" content="noindex">
+        <link rel="canonical" href="/canonical">
+      </head>
+      <body>
+        <a href="/docs">Docs</a>
+        <a href="http://127.0.0.1/private">Private</a>
+        <a href="/docs#section">Duplicate docs</a>
+      </body>
+    </html>
+    """
+
+    def handler(request):
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/html; charset=utf-8"},
+            text=html,
+            request=request,
+        )
+
+    result = _fetch(
+        "https://example.com/page",
+        WebToolConfig(max_retries=0),
+        max_chars=5000,
+        client_factory=_mock_client(handler),
+    )
+    assert result["description"] == "Short page summary"
+    assert result["canonical_url"] == "https://example.com/canonical"
+    assert result["robots"] == "noindex"
+    assert result["links"] == [{"text": "Docs", "url": "https://example.com/docs"}]
+
+
 def test_fetch_revalidates_redirect_target(monkeypatch):
     monkeypatch.setattr(socket, "getaddrinfo", lambda *a, **k: PUBLIC_DNS)
 
@@ -145,6 +184,41 @@ def test_search_uses_duckduckgo_without_key(monkeypatch):
     payload = json.loads(result.content)
     assert payload["provider"] == "duckduckgo"
     assert payload["results"][0]["title"] == "Example result"
+
+
+def test_search_filters_unsafe_and_duplicate_results(monkeypatch):
+    from claw.tools import web
+
+    page = """
+    <div class="result">
+      <a class="result__a" href="https://example.com/a#top">Example A</a>
+      <a class="result__snippet">First snippet</a>
+    </div>
+    <div class="result">
+      <a class="result__a" href="https://example.com/a">Duplicate A</a>
+      <a class="result__snippet">Duplicate snippet</a>
+    </div>
+    <div class="result">
+      <a class="result__a" href="http://127.0.0.1/admin">Local result</a>
+      <a class="result__snippet">Unsafe snippet</a>
+    </div>
+    <div class="result">
+      <a class="result__a" href="https://example.com/no-snippet">No snippet result</a>
+    </div>
+    """
+
+    def handler(request):
+        return httpx.Response(200, text=page, request=request)
+
+    monkeypatch.setattr(web, "_client", _mock_client(handler))
+    tool = create_web_search_tool(WebToolConfig(tavily_api_key="", max_retries=0))
+    result = tool.handler({"query": "sjtu claw", "max_results": 10})
+    assert result.ok
+    payload = json.loads(result.content)
+    assert [item["url"] for item in payload["results"]] == [
+        "https://example.com/a#top",
+        "https://example.com/no-snippet",
+    ]
 
 
 def test_search_falls_back_to_bing_when_duckduckgo_is_empty(monkeypatch):

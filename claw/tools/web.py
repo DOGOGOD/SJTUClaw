@@ -18,7 +18,7 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from typing import Any, Callable, Iterable
-from urllib.parse import parse_qs, unquote, urljoin, urlsplit, urlunsplit
+from urllib.parse import parse_qs, urldefrag, unquote, urljoin, urlsplit, urlunsplit
 
 import httpx
 
@@ -185,24 +185,93 @@ def validate_public_url(url: str) -> str:
     return _resolve_public_target(url)[0]
 
 
+def _clamp_int(value: Any, default: int, low: int, high: int) -> int:
+    try:
+        return min(high, max(low, int(value)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _search_result_url_allowed(url: str) -> bool:
+    """Cheaply reject obviously unsafe URLs without doing DNS for search pages."""
+    parts = urlsplit(url)
+    if parts.scheme.lower() not in {"http", "https"} or not parts.hostname:
+        return False
+    if parts.username is not None or parts.password is not None:
+        return False
+    host = parts.hostname.rstrip(".").lower()
+    if host == "localhost" or host.endswith((".localhost", ".local", ".internal")):
+        return False
+    try:
+        literal = ipaddress.ip_address(host.split("%", 1)[0])
+    except ValueError:
+        return True
+    return _is_public_ip(str(literal))
+
+
+def _dedupe_links(links: Iterable[dict[str, str]]) -> list[dict[str, str]]:
+    seen: set[str] = set()
+    deduped: list[dict[str, str]] = []
+    for link in links:
+        url = str(link.get("url", "")).strip()
+        text = " ".join(str(link.get("text", "")).split())
+        if not _search_result_url_allowed(url):
+            continue
+        key = urldefrag(url)[0].rstrip("/")
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append({"text": text[:300], "url": url[:4096]})
+    return deduped
+
+
 class _TextExtractor(HTMLParser):
     _SKIP = {"script", "style", "noscript", "svg", "template"}
 
-    def __init__(self) -> None:
+    def __init__(self, base_url: str, *, max_links: int = 40) -> None:
         super().__init__(convert_charrefs=True)
+        self.base_url = base_url
+        self.max_links = max_links
         self.skip_depth = 0
         self.title_depth = 0
         self.title: list[str] = []
+        self.description = ""
+        self.canonical_url = ""
+        self.robots = ""
         self.parts: list[str] = []
+        self.links: list[dict[str, str]] = []
+        self._current_link: dict[str, str] | None = None
+        self._link_text: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         tag = tag.lower()
+        attr = {key.lower(): value for key, value in attrs if key}
+        if tag == "meta":
+            name = (attr.get("name") or attr.get("property") or "").lower()
+            content = " ".join((attr.get("content") or "").split())
+            if content and name in {"description", "og:description"} and not self.description:
+                self.description = content
+            elif content and name == "robots":
+                self.robots = content
+        elif tag == "link":
+            rels = set((attr.get("rel") or "").lower().split())
+            href = attr.get("href") or ""
+            if "canonical" in rels and href and not self.canonical_url:
+                self.canonical_url = urljoin(self.base_url, href)
+        elif tag == "a" and len(self.links) < self.max_links:
+            href = attr.get("href") or ""
+            absolute = urljoin(self.base_url, href)
+            if urlsplit(absolute).scheme.lower() in {"http", "https"}:
+                self._current_link = {"url": absolute[:4096], "text": ""}
+                self._link_text = []
         if tag in self._SKIP:
             self.skip_depth += 1
         if tag == "title":
             self.title_depth += 1
-        if tag in {"p", "div", "br", "li", "h1", "h2", "h3", "tr"}:
+        if tag in {"article", "section", "p", "div", "br", "li", "h1", "h2", "h3", "tr"}:
             self.parts.append("\n")
+        elif tag in {"td", "th"}:
+            self.parts.append(" ")
 
     def handle_endtag(self, tag: str) -> None:
         tag = tag.lower()
@@ -210,18 +279,33 @@ class _TextExtractor(HTMLParser):
             self.skip_depth -= 1
         if tag == "title" and self.title_depth:
             self.title_depth -= 1
+        if tag == "a" and self._current_link is not None:
+            self._current_link["text"] = " ".join("".join(self._link_text).split())[:300]
+            if self._current_link["text"] or self._current_link["url"]:
+                self.links.append(self._current_link)
+            self._current_link = None
+            self._link_text = []
 
     def handle_data(self, data: str) -> None:
         if self.skip_depth:
             return
         if self.title_depth:
             self.title.append(data)
+        if self._current_link is not None:
+            self._link_text.append(data)
         self.parts.append(data)
 
-    def result(self) -> tuple[str, str]:
+    def result(self) -> dict[str, Any]:
         title = " ".join(" ".join(self.title).split())
         lines = [" ".join(line.split()) for line in "".join(self.parts).splitlines()]
-        return title, "\n".join(line for line in lines if line)
+        return {
+            "title": title,
+            "description": self.description,
+            "canonical_url": self.canonical_url,
+            "robots": self.robots,
+            "content": "\n".join(line for line in lines if line),
+            "links": _dedupe_links(self.links),
+        }
 
 
 class _DuckDuckGoParser(HTMLParser):
@@ -236,6 +320,7 @@ class _DuckDuckGoParser(HTMLParser):
         attr = dict(attrs)
         classes = set((attr.get("class") or "").split())
         if tag == "a" and "result__a" in classes:
+            self._finish_current()
             href = attr.get("href") or ""
             query = parse_qs(urlsplit(href).query)
             if "uddg" in query:
@@ -255,14 +340,21 @@ class _DuckDuckGoParser(HTMLParser):
             self._capture = ""
         elif tag in {"a", "div"} and self._capture == "snippet":
             self._current["snippet"] = " ".join("".join(self._text).split())
-            if self._current["title"] and self._current["url"]:
-                self.results.append(self._current)
-            self._current = None
+            self._finish_current()
             self._capture = ""
 
     def handle_data(self, data: str) -> None:
         if self._capture:
             self._text.append(data)
+
+    def close(self) -> None:
+        self._finish_current()
+        super().close()
+
+    def _finish_current(self) -> None:
+        if self._current is not None and self._current["title"] and self._current["url"]:
+            self.results.append(self._current)
+        self._current = None
 
 
 def _decode_body(body: bytes, content_type: str, encoding: str | None = None) -> str:
@@ -344,10 +436,20 @@ def _fetch(
                     body, byte_truncated = _read_limited(response.iter_bytes(), config.max_response_bytes)
                     text = _decode_body(body, content_type, response.encoding)
                     title = ""
+                    description = ""
+                    canonical_url = ""
+                    robots = ""
+                    links: list[dict[str, str]] = []
                     if "html" in content_type or "<html" in text[:500].lower():
-                        parser = _TextExtractor()
+                        parser = _TextExtractor(current)
                         parser.feed(text)
-                        title, text = parser.result()
+                        parsed = parser.result()
+                        title = parsed["title"]
+                        description = parsed["description"]
+                        canonical_url = parsed["canonical_url"]
+                        robots = parsed["robots"]
+                        text = parsed["content"]
+                        links = parsed["links"]
                     text = html.unescape(text)
                     char_truncated = len(text) > max_chars
                     if char_truncated:
@@ -358,7 +460,11 @@ def _fetch(
                         "status_code": response.status_code,
                         "content_type": content_type.split(";", 1)[0] or "unknown",
                         "title": title,
+                        "description": html.unescape(description),
+                        "canonical_url": canonical_url,
+                        "robots": robots,
                         "content": text,
+                        "links": links,
                         "truncated": byte_truncated or char_truncated,
                     }
         except WebSecurityError:
@@ -409,15 +515,20 @@ def _request_text(
 
 def _safe_search_results(results: Iterable[dict[str, str]], max_results: int) -> list[dict[str, str]]:
     safe: list[dict[str, str]] = []
+    seen: set[str] = set()
     for item in results:
         url = str(item.get("url", "")).strip()
-        if urlsplit(url).scheme.lower() not in {"http", "https"}:
+        if not _search_result_url_allowed(url):
             continue
+        key = urldefrag(url)[0].rstrip("/")
+        if key in seen:
+            continue
+        seen.add(key)
         safe.append(
             {
-                "title": str(item.get("title", ""))[:500],
+                "title": " ".join(str(item.get("title", "")).split())[:500],
                 "url": url[:4096],
-                "snippet": str(item.get("snippet", ""))[:2000],
+                "snippet": " ".join(str(item.get("snippet", "")).split())[:2000],
             }
         )
         if len(safe) >= max_results:
@@ -461,6 +572,7 @@ def _search_duckduckgo(query: str, max_results: int, config: WebToolConfig) -> l
     )
     parser = _DuckDuckGoParser()
     parser.feed(text)
+    parser.close()
     return _safe_search_results(parser.results, max_results)
 
 
@@ -489,7 +601,8 @@ def create_web_fetch_tool(config: WebToolConfig | None = None) -> Tool:
 
     def handler(args: dict[str, Any]) -> ToolResult:
         try:
-            result = _fetch(args["url"], cfg, max_chars=args.get("max_chars", 30000))
+            max_chars = _clamp_int(args.get("max_chars"), 30000, 1000, 100000)
+            result = _fetch(args["url"], cfg, max_chars=max_chars)
             return ToolResult(ok=True, content=json.dumps(result, ensure_ascii=False))
         except WebSecurityError as exc:
             return ToolResult(ok=False, error=str(exc))
@@ -522,7 +635,7 @@ def create_web_search_tool(config: WebToolConfig | None = None) -> Tool:
 
     def handler(args: dict[str, Any]) -> ToolResult:
         query = args["query"].strip()
-        max_results = args.get("max_results", 5)
+        max_results = _clamp_int(args.get("max_results"), 5, 1, 10)
         if not query:
             return ToolResult(ok=False, error="web_search 失败：query 不能只包含空白字符")
         providers: list[tuple[str, Callable]] = []

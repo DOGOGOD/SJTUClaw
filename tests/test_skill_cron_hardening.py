@@ -89,6 +89,26 @@ def test_cron_service_rejects_ambiguous_or_non_runnable_schedules(tmp_path: Path
         service.add_job("bad-cron", CronSchedule(kind="cron", expr="not cron"), "x")
 
 
+def test_cron_service_missing_timezone_uses_default_timezone():
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from claw.scheduler.service import _compute_next_run
+    from claw.scheduler.types import CronSchedule
+    from claw.utils import default_timezone_name
+
+    tz_name = default_timezone_name()
+    base = datetime(2026, 7, 16, 8, 30, tzinfo=ZoneInfo(tz_name))
+    expected = datetime(2026, 7, 16, 9, 0, tzinfo=ZoneInfo(tz_name))
+
+    next_run = _compute_next_run(
+        CronSchedule(kind="cron", expr="0 9 * * *"),
+        int(base.timestamp() * 1000),
+    )
+
+    assert next_run == int(expected.timestamp() * 1000)
+
+
 def test_cron_tool_requires_exactly_one_timing_parameter(tmp_path: Path):
     from claw.scheduler.service import CronService
     from claw.tools.cron_tool import CronTool
@@ -126,6 +146,53 @@ def test_cron_tool_returns_error_for_invalid_numeric_input(tmp_path: Path):
 
     assert not result.ok
     assert "positive integer" in (result.error or "")
+
+
+def test_cron_tool_defaults_cron_expr_to_default_timezone(tmp_path: Path):
+    from claw.scheduler.service import CronService
+    from claw.tools.cron_tool import CronTool
+    from claw.utils import default_timezone_name
+
+    service = CronService(tmp_path / "jobs.json")
+    tool = CronTool(service)
+    tool.set_context("session", "cli", "chat")
+
+    result = tool.execute_sync(
+        {
+            "action": "add",
+            "name": "daily",
+            "message": "hello",
+            "cron_expr": "0 9 * * *",
+        }
+    )
+
+    assert result.ok
+    [job] = service.list_jobs()
+    assert job.schedule.tz == default_timezone_name()
+
+
+def test_cli_cron_list_displays_next_run_in_default_timezone(tmp_path: Path):
+    from types import SimpleNamespace
+
+    from claw.cli.commands import _handle_cron_command
+    from claw.scheduler.service import CronService
+    from claw.scheduler.types import CronSchedule
+    from claw.utils import default_timezone_name
+
+    service = CronService(tmp_path / "jobs.json")
+    service.add_job(
+        "daily",
+        CronSchedule(kind="cron", expr="0 9 * * *"),
+        "hello",
+        session_key="session",
+        origin_channel="cli",
+        origin_chat_id="session",
+    )
+
+    output = _handle_cron_command(["list"], SimpleNamespace(cron_service=service))
+
+    assert "下次:" in output
+    assert f"({default_timezone_name()})" in output
 
 
 def test_cron_dispatcher_binds_context_inside_worker_thread(tmp_path: Path, monkeypatch):

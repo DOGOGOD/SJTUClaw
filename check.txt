@@ -1,0 +1,13 @@
+session、workspace系统 ?
+memory系统 ?
+compact系统 ?
+上下文组装系统
+tool系统  X 
+skill系统  X
+cron系统  X
+loop系统 X
+gateway
+桌宠  X
+webui X
+QQ 富媒体消息验证
+WEBUI实时响应

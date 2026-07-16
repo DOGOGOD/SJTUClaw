@@ -42,6 +42,8 @@ from typing import Any, Callable, Coroutine, Literal
 
 from filelock import FileLock
 
+from claw.utils import default_timezone_name
+
 
 
 from claw.scheduler.session_turns import is_bound_cron_job
@@ -122,7 +124,7 @@ def _compute_next_run(schedule: CronSchedule, now_ms: int) -> int | None:
 
             base_time = now_ms / 1000
 
-            tz = ZoneInfo(schedule.tz) if schedule.tz else datetime.now().astimezone().tzinfo
+            tz = ZoneInfo(schedule.tz or default_timezone_name())
 
             base_dt = datetime.fromtimestamp(base_time, tz=tz)
 
@@ -194,7 +196,7 @@ def _validate_schedule_for_add(schedule: CronSchedule) -> None:
 
 
 
-        tz = ZoneInfo(schedule.tz) if schedule.tz else datetime.now().astimezone().tzinfo
+        tz = ZoneInfo(schedule.tz or default_timezone_name())
 
         croniter(schedule.expr, datetime.now(tz=tz)).get_next(datetime)
 
@@ -2466,7 +2468,12 @@ class CronService:
 
 
 
-            ts = datetime.fromtimestamp(run_at_ms / 1000).strftime("%Y%m%d_%H%M%S")
+            from zoneinfo import ZoneInfo
+
+            ts = datetime.fromtimestamp(
+                run_at_ms / 1000,
+                tz=ZoneInfo(default_timezone_name()),
+            ).strftime("%Y%m%d_%H%M%S")
 
             output_file = job_dir / f"{ts}.md"
 

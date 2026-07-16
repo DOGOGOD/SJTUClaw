@@ -2,7 +2,7 @@
 
 All tools in this module observe the environment without side effects:
 
-    current_time  - return the current UTC time in ISO-8601 format
+    current_time  - return the current local time in ISO-8601 format
     list_dir      - list files and subdirectories in a directory
     read_file     - read the contents of a text file
 
@@ -18,11 +18,13 @@ directory rather than the process CWD.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from typing import Any, Callable
 
 from claw.tools.base import Tool, ToolResult
+from claw.utils import default_timezone_name
 from claw.workspace.manager import WorkspaceManager, WorkspaceError
 
 # Maximum file size before truncation: 64 KiB of UTF-8 text.
@@ -88,21 +90,16 @@ def _resolve_path(
 
 def _handle_current_time(args: dict[str, Any]) -> ToolResult:
     """Return the current time, optionally in a specific timezone."""
-    tz_name: str | None = args.get("tz")
-    if tz_name:
-        try:
-            from zoneinfo import ZoneInfo
-            tz = ZoneInfo(tz_name)
-        except Exception:
-            return ToolResult(
-                ok=False,
-                error=f"unknown timezone: \"{tz_name}\". Use IANA timezone like \"Asia/Shanghai\" or \"America/New_York\".",
-            )
-        now = datetime.now(tz).isoformat(timespec="seconds")
-        return ToolResult(ok=True, content=f"{now} ({tz_name})")
-
-    now_utc = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    return ToolResult(ok=True, content=now_utc)
+    tz_name = str(args.get("tz") or default_timezone_name()).strip() or default_timezone_name()
+    try:
+        tz = ZoneInfo(tz_name)
+    except Exception:
+        return ToolResult(
+            ok=False,
+            error=f"unknown timezone: \"{tz_name}\". Use IANA timezone like \"Asia/Shanghai\" or \"America/New_York\".",
+        )
+    now = datetime.now(tz).isoformat(timespec="seconds")
+    return ToolResult(ok=True, content=f"{now} ({tz_name})")
 
 
 def _make_list_dir_handler(
@@ -236,7 +233,7 @@ def create_current_time_tool() -> Tool:
     return Tool(
         name="current_time",
         description=(
-            "Get the current date and time. Returns UTC when tz is not set. "
+            f"Get the current date and time. Defaults to {default_timezone_name()} when tz is not set. "
             "Pass tz (e.g. \"Asia/Shanghai\") to get time in a specific timezone."
         ),
         input_schema={
@@ -244,7 +241,7 @@ def create_current_time_tool() -> Tool:
             "properties": {
                 "tz": {
                     "type": "string",
-                    "description": "IANA timezone name (optional), e.g. \"Asia/Shanghai\" or \"America/New_York\". Returns UTC if omitted.",
+                    "description": f"IANA timezone name (optional), e.g. \"Asia/Shanghai\" or \"America/New_York\". Returns {default_timezone_name()} if omitted.",
                 },
             },
             "required": [],

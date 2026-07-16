@@ -8,6 +8,7 @@ forwarded to the LLM as ordinary chat messages.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from zoneinfo import ZoneInfo
 
 from claw.approval.manager import ApprovalManager
 from claw.context.compaction import (
@@ -19,6 +20,7 @@ from claw.llm.client import LLMClient
 from claw.memory.store import MemoryStore, MemoryStoreError
 from claw.session.store import SessionNotFoundError, SessionStore, SessionStoreError
 from claw.tools.base import ToolRegistry
+from claw.utils import default_timezone_name
 from claw.workspace.manager import WorkspaceManager, WorkspaceError
 
 _COMMAND_PREFIXES = (
@@ -876,8 +878,12 @@ def _handle_cron_command(args: list[str], state: RuntimeState) -> str:
                     lines.append(f"    上次: {j.state.last_status}")
                 if j.state.next_run_at_ms:
                     from datetime import datetime
-                    dt = datetime.fromtimestamp(j.state.next_run_at_ms / 1000)
-                    lines.append(f"    下次: {dt.isoformat()}")
+                    tz_name = j.schedule.tz or default_timezone_name()
+                    dt = datetime.fromtimestamp(
+                        j.state.next_run_at_ms / 1000,
+                        tz=ZoneInfo(tz_name),
+                    )
+                    lines.append(f"    下次: {dt.isoformat()} ({tz_name})")
             return "\n".join(lines)
         except Exception as exc:
             return f"错误: {exc}"

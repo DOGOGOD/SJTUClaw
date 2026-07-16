@@ -112,13 +112,15 @@ class ReflectionConfig:
 # ---------------------------------------------------------------------------
 
 
-from claw.utils import now_iso as _now_iso
+from claw.utils import default_timezone_name, now_iso as _now_iso
 
 
 def _time_matches(configured_time: str) -> bool:
     """Check whether the current wall-clock time (HH:MM) equals *configured_time*."""
     try:
-        now = datetime.now()
+        from zoneinfo import ZoneInfo
+
+        now = datetime.now(ZoneInfo(default_timezone_name()))
         hhmm = f"{now.hour:02d}:{now.minute:02d}"
         return hhmm == configured_time
     except Exception:

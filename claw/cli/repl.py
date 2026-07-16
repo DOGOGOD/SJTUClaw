@@ -17,6 +17,7 @@ from claw.session.store import SessionStore
 from claw.session.title import auto_title_if_first_turn
 from claw.tools.base import ToolRegistry
 from claw.tools import register_all_tools
+from claw.utils import default_timezone_name
 from claw.workspace.manager import WorkspaceManager
 
 EXIT_COMMANDS = {"/exit"}
@@ -112,7 +113,7 @@ def run_repl(
     if cron_service is not None:
         from claw.tools.cron_tool import CronTool
 
-        cron_tool = CronTool(cron_service)
+        cron_tool = CronTool(cron_service, default_timezone=default_timezone_name())
         cron_tool.set_context(
             session_key=initial_session.session_id,
             channel="cli",

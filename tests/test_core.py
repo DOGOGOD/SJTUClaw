@@ -5,6 +5,7 @@ Compaction trigger/failure-protection, ToolRegistry param validation,
 Workspace boundary enforcement, Approval approve/reject flow.
 """
 import json
+import re
 import shutil
 import tempfile
 from pathlib import Path
@@ -59,6 +60,68 @@ def am():
 def cb(ms):
     from claw.context.builder import ContextBuilder
     return ContextBuilder("sp", "soul", ms)
+
+
+# ═════════════════════════════════════════════════════════════════════
+# Timezone detection
+# ═════════════════════════════════════════════════════════════════════
+
+
+class TestTimezoneDetection:
+    def test_loads_explicit_timezone_from_dotenv_before_detection(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        import claw.config as config
+        import claw.utils as utils
+
+        env_path = tmp_path / ".env"
+        env_path.write_text("CLAW_TIMEZONE=America/Los_Angeles\n", encoding="utf-8")
+        monkeypatch.delenv("CLAW_TIMEZONE", raising=False)
+        monkeypatch.setattr(config, "ENV_PATH", env_path)
+        monkeypatch.setattr(config, "_dotenv_loaded", False)
+        utils.detect_system_timezone.cache_clear()
+        try:
+            assert utils.detect_system_timezone() == "America/Los_Angeles"
+        finally:
+            utils.detect_system_timezone.cache_clear()
+
+    def test_prefers_explicit_env_timezone(self, monkeypatch):
+        import claw.utils as utils
+
+        monkeypatch.setenv("CLAW_TIMEZONE", "America/New_York")
+        utils.detect_system_timezone.cache_clear()
+        try:
+            assert utils.detect_system_timezone() == "America/New_York"
+        finally:
+            utils.detect_system_timezone.cache_clear()
+
+    def test_falls_back_to_tz_env(self, monkeypatch):
+        import claw.utils as utils
+
+        monkeypatch.delenv("CLAW_TIMEZONE", raising=False)
+        monkeypatch.setenv("TZ", "Europe/Paris")
+        monkeypatch.setattr(utils, "_timezone_from_tzlocal", lambda: None)
+        monkeypatch.setattr(utils, "_timezone_from_localtime_symlink", lambda: None)
+        utils.detect_system_timezone.cache_clear()
+        try:
+            assert utils.detect_system_timezone() == "Europe/Paris"
+        finally:
+            utils.detect_system_timezone.cache_clear()
+
+    def test_falls_back_to_shanghai_when_detection_fails(self, monkeypatch):
+        import claw.utils as utils
+
+        monkeypatch.setenv("CLAW_TIMEZONE", "Not/AZone")
+        monkeypatch.delenv("TZ", raising=False)
+        monkeypatch.setattr(utils, "_timezone_from_tzlocal", lambda: None)
+        monkeypatch.setattr(utils, "_timezone_from_localtime_symlink", lambda: None)
+        utils.detect_system_timezone.cache_clear()
+        try:
+            assert utils.detect_system_timezone() == "Asia/Shanghai"
+        finally:
+            utils.detect_system_timezone.cache_clear()
 
 
 # ═════════════════════════════════════════════════════════════════════
@@ -145,6 +208,17 @@ class TestContextBuilder:
         all_text = " ".join(m["content"] for m in cb.build_messages(s))
         assert "可用 Skills" not in all_text
 
+    def test_runtime_context_uses_default_timezone(self, cb, ss):
+        from claw.utils import default_timezone_name
+
+        s = ss.create_session()
+        s.append_message("user", "现在几点")
+        messages = cb.build_messages(s)
+
+        assert "当前时间:" in messages[-1]["content"]
+        assert f"({default_timezone_name()})" in messages[-1]["content"]
+        assert re.search(r"当前时间: .*[+-]\d{2}:\d{2}", messages[-1]["content"])
+
 
 # ═════════════════════════════════════════════════════════════════════
 # Compaction
@@ -207,6 +281,16 @@ class TestToolRegistry:
 
     def test_execute_ok(self, reg):
         assert reg.execute_by_name("current_time", {}).ok
+
+    def test_current_time_uses_default_timezone(self, reg):
+        from claw.utils import default_timezone_name
+
+        result = reg.execute_by_name("current_time", {})
+
+        assert result.ok
+        assert result.content is not None
+        assert f"({default_timezone_name()})" in result.content
+        assert re.search(r"[+-]\d{2}:\d{2}", result.content)
 
     def test_unknown_tool(self, reg):
         r = reg.execute_by_name("fake", {})

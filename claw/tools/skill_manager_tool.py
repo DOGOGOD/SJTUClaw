@@ -303,7 +303,9 @@ def _delete_skill(name: str) -> dict:
     if archive_target.exists():
         # Append timestamp to avoid collision
         from datetime import datetime
-        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        from claw.utils import default_tz
+
+        ts = datetime.now(default_tz()).strftime("%Y%m%d-%H%M%S")
         archive_target = ARCHIVE_DIR / f"{name}-{ts}"
 
     shutil.move(str(skill_dir), str(archive_target))

@@ -671,7 +671,7 @@ function CronSection({ activeSessionId }: { activeSessionId?: string | null }) {
   const [name, setName] = useState(""); const [message, setMessage] = useState("");
   const [scheduleKind, setScheduleKind] = useState<"every" | "cron" | "at">("every");
   const [everySeconds, setEverySeconds] = useState(""); const [cronExpr, setCronExpr] = useState("");
-  const [tz, setTz] = useState("Asia/Shanghai"); const [at, setAt] = useState("");
+  const [tz, setTz] = useState(""); const [at, setAt] = useState("");
   const [targetSessionId, setTargetSessionId] = useState("");
   const [loading, setLoading] = useState(true); const [status, setStatus] = useState("");
 
@@ -695,8 +695,16 @@ function CronSection({ activeSessionId }: { activeSessionId?: string | null }) {
       const payload: Record<string, unknown> = { message: message.trim(), sessionId: sid };
       if (name.trim()) payload.name = name.trim();
       if (scheduleKind === "every") payload.everySeconds = parseInt(everySeconds) || 3600;
-      else if (scheduleKind === "cron") { if (!cronExpr.trim()) { setStatus("请填写 cron 表达式"); return; } payload.cronExpr = cronExpr.trim(); payload.tz = tz.trim() || "UTC"; }
-      else { if (!at.trim()) { setStatus("请填写 ISO 时间"); return; } payload.at = at.trim(); }
+      else if (scheduleKind === "cron") {
+        if (!cronExpr.trim()) { setStatus("请填写 cron 表达式"); return; }
+        payload.cronExpr = cronExpr.trim();
+        if (tz.trim()) payload.tz = tz.trim();
+      }
+      else {
+        if (!at.trim()) { setStatus("请填写 ISO 时间"); return; }
+        payload.at = at.trim();
+        if (tz.trim()) payload.tz = tz.trim();
+      }
       const d = await createCronJob(payload as any);
       if (d.ok) { setStatus(`已为 session ${sid} 创建定时任务`); setMessage(""); setName(""); setEverySeconds(""); setCronExpr(""); setAt(""); refresh(); } else setStatus("创建失败");
     } catch (e: any) { setStatus(e.message || "创建失败"); }
@@ -731,8 +739,8 @@ function CronSection({ activeSessionId }: { activeSessionId?: string | null }) {
           </select>
         </div>
         {scheduleKind === "every" && <div><label className="text-[11px] font-medium text-muted-foreground">间隔（秒）</label><Input value={everySeconds} onChange={(e) => setEverySeconds(e.target.value)} placeholder="3600（1 小时）" className="mt-1" /></div>}
-        {scheduleKind === "cron" && (<div className="flex gap-3"><div className="flex-1"><label className="text-[11px] font-medium text-muted-foreground">表达式</label><Input value={cronExpr} onChange={(e) => setCronExpr(e.target.value)} placeholder="0 9 * * 1-5" className="mt-1" /></div><div className="w-36"><label className="text-[11px] font-medium text-muted-foreground">时区</label><Input value={tz} onChange={(e) => setTz(e.target.value)} className="mt-1" /></div></div>)}
-        {scheduleKind === "at" && <div><label className="text-[11px] font-medium text-muted-foreground">时间（ISO）</label><Input value={at} onChange={(e) => setAt(e.target.value)} placeholder="2026-07-11T15:30:00" className="mt-1" /></div>}
+        {scheduleKind === "cron" && (<div className="flex gap-3"><div className="flex-1"><label className="text-[11px] font-medium text-muted-foreground">表达式</label><Input value={cronExpr} onChange={(e) => setCronExpr(e.target.value)} placeholder="0 9 * * 1-5" className="mt-1" /></div><div className="w-36"><label className="text-[11px] font-medium text-muted-foreground">时区</label><Input value={tz} onChange={(e) => setTz(e.target.value)} placeholder="自动（系统时区）" className="mt-1" /></div></div>)}
+        {scheduleKind === "at" && <div className="flex gap-3"><div className="flex-1"><label className="text-[11px] font-medium text-muted-foreground">时间（ISO）</label><Input value={at} onChange={(e) => setAt(e.target.value)} placeholder="2026-07-11T15:30:00" className="mt-1" /></div><div className="w-36"><label className="text-[11px] font-medium text-muted-foreground">时区</label><Input value={tz} onChange={(e) => setTz(e.target.value)} placeholder="自动（系统时区）" className="mt-1" /></div></div>}
         <div className="flex items-center gap-3 pt-1"><Button size="sm" onClick={handleCreate}>创建</Button>{status && <span className="text-xs text-muted-foreground">{status}</span>}</div>
       </div>
       {jobs.length === 0 && <p className="text-sm text-muted-foreground/60">暂无定时作业</p>}

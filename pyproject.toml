@@ -18,6 +18,7 @@ dependencies = [
     "httpx>=0.25.0",
     "qrcode>=7.0",
     "cryptography>=41.0",
+    "tzlocal>=5.0",
 ]
 
 [project.scripts]

@@ -108,7 +108,16 @@ describe("ThreadViewport user messages", () => {
       view.container.querySelectorAll(".katex-display"),
       view.container.innerHTML
     ).toHaveLength(1);
-    expect(view.container.textContent).not.toContain("\\oint");
-    expect(view.container.textContent).not.toContain("\\partial");
+
+    const visibleMath = Array.from(
+      view.container.querySelectorAll<HTMLElement>(".katex-html")
+    ).map((node) => node.textContent || "").join("");
+    expect(visibleMath).not.toContain("\\oint");
+    expect(visibleMath).not.toContain("\\partial");
+
+    const annotations = Array.from(
+      view.container.querySelectorAll("annotation[encoding='application/x-tex']")
+    ).map((node) => node.textContent || "");
+    expect(annotations.some((value) => value.includes("\\oint"))).toBe(true);
   });
 });

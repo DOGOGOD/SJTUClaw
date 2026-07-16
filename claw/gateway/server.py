@@ -82,6 +82,7 @@ from claw.runtime_settings import (
     setting_value,
     update_runtime_settings,
 )
+from claw.utils import default_timezone_name
 
 # -- QQ channel support ---------------------------------------------------------
 from claw.channels.qq import QQChannel, QQConfig
@@ -160,6 +161,7 @@ _context_builder = ContextBuilder(
     _soul,
     _memory_store,
     workspace_path=str(PROJECT_ROOT),
+    timezone=default_timezone_name(),
     workspace_manager=_workspace_manager,
 )
 
@@ -231,7 +233,7 @@ register_all_tools(
     memory_store=_memory_store,
     include_cron_tool=True,
     cron_service=_cron_service,
-    default_timezone="Asia/Shanghai",
+    default_timezone=default_timezone_name(),
 )
 
 # -- Heartbeat system job -----------------------------------------------
@@ -2091,7 +2093,7 @@ def create_cron_job(req: CreateCronJobRequest):
     if req.every_seconds:
         schedule = CronSchedule(kind="every", every_ms=req.every_seconds * 1000)
     elif req.cron_expr:
-        effective_tz = req.tz or "Asia/Shanghai"
+        effective_tz = req.tz or default_timezone_name()
         try:
             ZoneInfo(effective_tz)
         except Exception:
@@ -2106,7 +2108,12 @@ def create_cron_job(req: CreateCronJobRequest):
                 detail=f"无效的 ISO 日期时间格式: {req.at}",
             )
         if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=ZoneInfo("Asia/Shanghai"))
+            effective_tz = req.tz or default_timezone_name()
+            try:
+                tz = ZoneInfo(effective_tz)
+            except Exception:
+                raise HTTPException(status_code=400, detail=f"未知时区: {effective_tz}")
+            dt = dt.replace(tzinfo=tz)
         at_ms = int(dt.timestamp() * 1000)
         schedule = CronSchedule(kind="at", at_ms=at_ms)
         delete_after = True

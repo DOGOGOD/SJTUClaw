@@ -9,6 +9,7 @@ from typing import Any
 from claw.scheduler.service import CronService
 from claw.scheduler.types import CronJob, CronJobState, CronSchedule
 from claw.tools.base import Tool, ToolResult
+from claw.utils import default_timezone_name
 
 
 class CronTool(Tool):
@@ -20,10 +21,10 @@ class CronTool(Tool):
     def __init__(
         self,
         cron_service: CronService,
-        default_timezone: str = "UTC",
+        default_timezone: str | None = None,
     ):
         self._cron = cron_service
-        self._default_timezone = default_timezone
+        self._default_timezone = default_timezone or default_timezone_name()
         self._session_key: ContextVar[str] = ContextVar("cron_session_key", default="")
         self._origin_channel: ContextVar[str] = ContextVar("cron_origin_channel", default="")
         self._origin_chat_id: ContextVar[str] = ContextVar("cron_origin_chat_id", default="")
@@ -335,9 +336,9 @@ class CronTool(Tool):
     # -- Formatting -----------------------------------------------------------
 
     @staticmethod
-    def _display_timezone(schedule: CronSchedule, fallback: str = "UTC") -> str:
+    def _display_timezone(schedule: CronSchedule, fallback: str | None = None) -> str:
         """Pick the most human-meaningful timezone for display."""
-        return schedule.tz or fallback
+        return schedule.tz or fallback or default_timezone_name()
 
     @staticmethod
     def _format_timestamp(ms: int, tz_name: str) -> str:

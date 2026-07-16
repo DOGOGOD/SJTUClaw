@@ -8,6 +8,8 @@ import sys
 import threading
 from pathlib import Path
 
+from claw.paths import is_frozen
+
 
 class PetProcessManager:
     def __init__(self, gateway_url: str, data_dir: Path):
@@ -25,15 +27,25 @@ class PetProcessManager:
         with self._lock:
             if self._process is not None and self._process.poll() is None:
                 return False
-            command = [
-                sys.executable,
-                "-m",
-                "claw.pet",
-                "--gateway-url",
-                self.gateway_url,
-                "--data-dir",
-                str(self.data_dir),
-            ]
+            if is_frozen():
+                command = [
+                    sys.executable,
+                    "--pet",
+                    "--gateway-url",
+                    self.gateway_url,
+                    "--data-dir",
+                    str(self.data_dir),
+                ]
+            else:
+                command = [
+                    sys.executable,
+                    "-m",
+                    "claw.pet",
+                    "--gateway-url",
+                    self.gateway_url,
+                    "--data-dir",
+                    str(self.data_dir),
+                ]
             kwargs: dict = {
                 "stdin": subprocess.DEVNULL,
                 "stdout": subprocess.DEVNULL,

@@ -110,7 +110,7 @@ def install_skill_package_bytes(
         "name": validated.skill_name,
         "description": validated.description,
         "fileCount": len([m for m in validated.members if not m.is_dir]),
-        "path": str(target_dir.relative_to(PROJECT_ROOT)),
+        "path": _display_path(target_dir),
     }
 
 
@@ -135,6 +135,13 @@ def remove_skill_completely(name: str) -> dict:
     except Exception:
         pass
     return {"name": name, "message": f"Skill '{name}' 已彻底删除"}
+
+
+def _display_path(path: Path) -> str:
+    try:
+        return str(path.relative_to(PROJECT_ROOT))
+    except ValueError:
+        return str(path)
 
 
 def find_skill_dir(name: str) -> Path | None:

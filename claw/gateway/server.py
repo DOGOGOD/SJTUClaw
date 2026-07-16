@@ -83,6 +83,7 @@ from claw.runtime_settings import (
     update_runtime_settings,
 )
 from claw.utils import default_timezone_name
+from claw.paths import prompts_dir, web_dir
 
 # -- QQ channel support ---------------------------------------------------------
 from claw.channels.qq import QQChannel, QQConfig
@@ -516,7 +517,7 @@ app.add_middleware(GatewaySecurityMiddleware)
 app.add_middleware(RequestLoggingMiddleware)
 
 # Web UI is served at the end of the file (after all API routes).
-_WEB_DIR = PROJECT_ROOT / "web"
+_WEB_DIR = web_dir()
 
 # Per-session AUTO mode flag (in-memory, resets on restart)
 _auto_mode: dict[str, bool] = {}
@@ -2060,7 +2061,7 @@ def trigger_reflection():
 
 
 def _write_prompt_file(filename: str, content: str) -> None:
-    target = PROJECT_ROOT / "prompts" / filename
+    target = prompts_dir() / filename
     tmp = target.with_suffix(".tmp")
     tmp.write_text(content, encoding="utf-8")
     tmp.replace(target)

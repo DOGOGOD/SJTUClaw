@@ -18,13 +18,14 @@ import platform as _platform
 from pathlib import Path
 
 from claw.config import PROJECT_ROOT
+from claw.paths import prompts_dir
 from claw.prompts.templates import render, render_file
 
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
 
-PROMPTS_DIR = PROJECT_ROOT / "prompts"
+PROMPTS_DIR = prompts_dir()
 SYSTEM_PROMPT_PATH = PROMPTS_DIR / "system_prompt.md"
 SOUL_PATH = PROMPTS_DIR / "soul.md"
 IDENTITY_PATH = PROMPTS_DIR / "identity.md"

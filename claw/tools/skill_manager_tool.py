@@ -33,9 +33,10 @@ from pathlib import Path
 from typing import Any
 
 from claw.config import PROJECT_ROOT
+from claw.paths import skills_dir
 from claw.tools.base import Tool, ToolResult
 
-SKILLS_DIR = PROJECT_ROOT / "skills"
+SKILLS_DIR = skills_dir()
 ARCHIVE_DIR = SKILLS_DIR / ".archive"
 
 # Characters allowed in skill names (filesystem-safe)
@@ -188,8 +189,15 @@ def _create_skill(name: str, content: str, category: str | None = None) -> dict:
     return {
         "success": True,
         "message": f"Skill '{name}' 已创建",
-        "path": str(skill_dir.relative_to(PROJECT_ROOT)),
+        "path": _display_path(skill_dir),
     }
+
+
+def _display_path(path: Path) -> str:
+    try:
+        return str(path.relative_to(PROJECT_ROOT))
+    except ValueError:
+        return str(path)
 
 
 def _edit_skill(name: str, content: str) -> dict:

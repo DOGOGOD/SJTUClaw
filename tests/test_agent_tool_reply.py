@@ -35,6 +35,31 @@ class _SequenceLLM:
         return item
 
 
+class _RecordingSequenceLLM(_SequenceLLM):
+    def __init__(self, *items):
+        super().__init__(*items)
+        self.requests = []
+
+    def chat_with_tools(self, messages, tool_defs):
+        self.requests.append(messages)
+        return super().chat_with_tools(messages, tool_defs)
+
+
+class _ProtocolContext(_Context):
+    def build_messages(self, session, **kwargs):
+        return [message.to_dict() for message in session.messages]
+
+
+class _SkillContext(_ProtocolContext):
+    def build_skill_injection_message(self, skill_name, user_task):
+        return f"[skill:{skill_name}]\n{user_task}"
+
+
+class _SkillRegistry:
+    def get_skill(self, name):
+        return object() if name == "focused-skill" else None
+
+
 def _registry() -> ToolRegistry:
     registry = ToolRegistry()
     registry.register(
@@ -88,6 +113,166 @@ def test_llm_failure_after_tool_produces_persisted_final_reply(tmp_path):
     assert finals[0].content == reply
 
 
+def test_tool_result_replay_uses_native_protocol_fields(tmp_path):
+    store = _store(tmp_path, "native-tool-protocol")
+    client = _RecordingSequenceLLM(
+        AgentResponse(
+            tool_calls=[
+                ToolCallRequest(name="probe", args={}, call_id="call-probe")
+            ]
+        ),
+        AgentResponse(final="探测完成"),
+    )
+
+    reply = run_agent_turn(
+        "native-tool-protocol",
+        "请执行探测",
+        session_store=store,
+        context_builder=_ProtocolContext(),
+        tool_registry=_registry(),
+        llm_client=client,
+    )
+
+    assert reply == "探测完成"
+    assert "任务处理简报" not in reply
+    second_request = client.requests[1]
+    assistant_call = next(
+        message
+        for message in second_request
+        if message["role"] == "assistant" and message.get("tool_calls")
+    )
+    tool_result = next(
+        message for message in second_request if message["role"] == "tool"
+    )
+    assert assistant_call["tool_calls"][0]["id"] == "call-probe"
+    assert assistant_call["tool_calls"][0]["function"]["name"] == "probe"
+    assert tool_result["tool_call_id"] == "call-probe"
+    assert tool_result["name"] == "probe"
+
+    saved = store.get("native-tool-protocol")
+    assert saved.messages[-3].tool_calls
+    assert saved.messages[-2].tool_call_id == "call-probe"
+
+
+def test_batched_skill_injection_follows_all_tool_results(tmp_path):
+    store = _store(tmp_path, "skill-tool-protocol")
+    registry = _registry()
+    registry.register(
+        Tool(
+            name="use_skill",
+            description="load a skill",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "skill_name": {"type": "string"},
+                    "reason": {"type": "string"},
+                },
+                "required": ["skill_name"],
+            },
+            handler=lambda args: ToolResult(ok=True, content="不应直接执行"),
+            safety_level="skill_select",
+        )
+    )
+    client = _RecordingSequenceLLM(
+        AgentResponse(
+            tool_calls=[
+                ToolCallRequest(
+                    name="use_skill",
+                    args={"skill_name": "focused-skill", "reason": "匹配任务"},
+                    call_id="call-skill",
+                ),
+                ToolCallRequest(name="probe", args={}, call_id="call-probe"),
+            ]
+        ),
+        AgentResponse(final="任务完成"),
+    )
+
+    reply = run_agent_turn(
+        "skill-tool-protocol",
+        "请执行组合任务",
+        session_store=store,
+        context_builder=_SkillContext(),
+        tool_registry=registry,
+        llm_client=client,
+        skill_registry=_SkillRegistry(),
+    )
+
+    assert reply == "任务完成"
+    assert "任务处理简报" not in reply
+    second_request = client.requests[1]
+    call_index = next(
+        index
+        for index, message in enumerate(second_request)
+        if message["role"] == "assistant" and message.get("tool_calls")
+    )
+    assert [message["role"] for message in second_request[call_index + 1 :]] == [
+        "tool",
+        "tool",
+        "user",
+    ]
+    assert second_request[call_index + 1]["tool_call_id"] == "call-skill"
+    assert second_request[call_index + 2]["tool_call_id"] == "call-probe"
+    assert second_request[call_index + 3]["content"].startswith("[skill:focused-skill]")
+
+
+def test_duplicate_tool_call_ids_are_normalized(tmp_path):
+    store = _store(tmp_path, "duplicate-call-ids")
+    session = store.get("duplicate-call-ids")
+    session.append_message(
+        "assistant",
+        "",
+        tool_calls=[
+            {
+                "id": "duplicate",
+                "type": "function",
+                "function": {"name": "probe", "arguments": "{}"},
+            }
+        ],
+    )
+    session.append_message(
+        "tool",
+        "历史结果",
+        tool_call_id="duplicate",
+        name="probe",
+    )
+    store.save(session)
+    client = _RecordingSequenceLLM(
+        AgentResponse(
+            tool_calls=[
+                ToolCallRequest(name="probe", args={}, call_id="duplicate"),
+                ToolCallRequest(name="probe", args={}, call_id="duplicate"),
+            ]
+        ),
+        AgentResponse(final="完成"),
+    )
+
+    reply = run_agent_turn(
+        "duplicate-call-ids",
+        "执行两次探测",
+        session_store=store,
+        context_builder=_ProtocolContext(),
+        tool_registry=_registry(),
+        llm_client=client,
+    )
+
+    assert reply == "完成"
+    second_request = client.requests[1]
+    assistant_indexes = [
+        index
+        for index, message in enumerate(second_request)
+        if message.get("tool_calls")
+    ]
+    assistant_call = second_request[assistant_indexes[-1]]
+    declared_ids = [call["id"] for call in assistant_call["tool_calls"]]
+    result_ids = [
+        message["tool_call_id"]
+        for message in second_request[assistant_indexes[-1] + 1 :]
+        if message["role"] == "tool"
+    ]
+    assert len(set(declared_ids)) == 2
+    assert result_ids == declared_ids
+
+
 def test_empty_final_after_tool_is_replaced_with_visible_reply(tmp_path):
     store = _store(tmp_path, "empty-after-tool")
     client = _SequenceLLM(
@@ -111,6 +296,26 @@ def test_empty_final_after_tool_is_replaced_with_visible_reply(tmp_path):
     assert store.get("empty-after-tool").messages[-1].content == reply
 
 
+def test_truncated_final_includes_failure_brief(tmp_path):
+    store = _store(tmp_path, "truncated-final")
+
+    reply = run_agent_turn(
+        "truncated-final",
+        "生成较长回答",
+        session_store=store,
+        context_builder=_Context(),
+        tool_registry=_registry(),
+        llm_client=_SequenceLLM(
+            AgentResponse(final="这是未完整的回答", finish_reason="length")
+        ),
+    )
+
+    assert reply.startswith("这是未完整的回答")
+    assert "任务处理简报" in reply
+    assert "状态：部分完成" in reply
+    assert "输出长度限制" in reply
+
+
 def test_unrecognized_response_gets_non_empty_fallback(tmp_path):
     store = _store(tmp_path, "invalid-response")
     events = []
@@ -126,6 +331,8 @@ def test_unrecognized_response_gets_non_empty_fallback(tmp_path):
     )
 
     assert reply.strip()
+    assert "任务处理简报" in reply
+    assert "状态：未完成" in reply
     assert store.get("invalid-response").messages[-1].role == "assistant"
     assert isinstance(events[-1], FinalEvent)
 

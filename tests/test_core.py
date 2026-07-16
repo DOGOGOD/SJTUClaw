@@ -219,6 +219,18 @@ class TestContextBuilder:
         assert f"({default_timezone_name()})" in messages[-1]["content"]
         assert re.search(r"当前时间: .*[+-]\d{2}:\d{2}", messages[-1]["content"])
 
+    def test_legacy_orphan_tool_message_becomes_assistant_context(self, cb, ss):
+        s = ss.create_session()
+        s.append_message("user", "我是谁")
+        s.append_message("tool", '{"tool":"recall","result":"用户名是 Guztchian"}')
+
+        messages = cb.build_messages(s)
+
+        assert messages[-1]["role"] == "assistant"
+        assert messages[-1]["content"].startswith("[历史工具结果]")
+        assert "Guztchian" in messages[-1]["content"]
+        assert "tool_call_id" not in messages[-1]
+
 
 # ═════════════════════════════════════════════════════════════════════
 # Compaction

@@ -19,13 +19,14 @@ import webbrowser
 import uvicorn
 
 from claw.config import PROJECT_ROOT
+from claw.paths import web_dir
 from claw.utils import force_utf8_stdio
 
 
 def _webui_exists() -> bool:
     """Check whether the built web UI is present."""
-    web_dir = PROJECT_ROOT / "web"
-    return (web_dir / "index.html").exists() and (web_dir / "assets").is_dir()
+    directory = web_dir()
+    return (directory / "index.html").exists() and (directory / "assets").is_dir()
 
 
 def main() -> int:

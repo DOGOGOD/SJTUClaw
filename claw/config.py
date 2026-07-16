@@ -12,14 +12,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from dotenv import load_dotenv
+from claw.paths import data_dir, env_example_path, env_path, resource_root
 
-# claw/config.py -> claw/ -> project root
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-ENV_PATH = PROJECT_ROOT / ".env"
-ENV_EXAMPLE_PATH = PROJECT_ROOT / ".env.example"
+# Source checkout root in development; bundled resource root in packaged builds.
+PROJECT_ROOT = resource_root()
+ENV_PATH = env_path()
+ENV_EXAMPLE_PATH = env_example_path()
 
 # Runtime data (sessions, memory, ...). Entirely gitignored.
-DATA_DIR = PROJECT_ROOT / "data"
+DATA_DIR = data_dir()
 SESSIONS_DIR = DATA_DIR / "sessions"
 MEMORY_DIR = DATA_DIR / "memory"
 

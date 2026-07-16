@@ -11,18 +11,34 @@ __pycache__/
 *.pyc
 *.pyo
 .pytest_cache/
+.pytest-tmp*/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.mypy_cache/
+.ruff_cache/
 .venv/
 venv/
 *.egg-info/
 /build/
+/dist/
+/.venv-build/
 
 # Node
 node_modules/
 /.pnpm-store/
+npm-debug.log*
+pnpm-debug.log*
+yarn-debug.log*
+yarn-error.log*
 
 # Generated runtime artifacts
 /claw_shell_*.txt
 /skills/.usage.json
+*.log
+*.tmp
+*.bak
 
 # Web UI build output
 web/
@@ -31,6 +47,8 @@ web/
 .vscode/
 .idea/
 .DS_Store
+Thumbs.db
+Desktop.ini
 
 # Agent
 .claude

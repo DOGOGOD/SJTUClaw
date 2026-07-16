@@ -496,6 +496,20 @@ def run_agent_turn(
             compact = compact[:177] + "..."
         tool_outcomes.append({"tool": tool_name, "status": status, "detail": compact})
 
+    def _record_serialized_outcome(tool_name: str, content: str) -> None:
+        """Record a structured tool observation without trusting its shape."""
+        try:
+            payload = json.loads(content)
+        except (TypeError, json.JSONDecodeError):
+            _record_outcome(tool_name, "error", "工具返回了无法解析的结果")
+            return
+        if not isinstance(payload, dict):
+            _record_outcome(tool_name, "error", "工具返回了非对象结果")
+            return
+        ok = payload.get("ok") is True
+        detail = payload.get("result", "")
+        _record_outcome(tool_name, "ok" if ok else "error", str(detail))
+
     def _completion_brief(status: str, reason: str) -> str:
         labels = {
             "completed": "已完成",
@@ -515,6 +529,9 @@ def run_agent_turn(
         if unsuccessful:
             names = list(dict.fromkeys(item["tool"] for item in unsuccessful))
             lines.append(f"- 未成功：{len(unsuccessful)} 次操作（{', '.join(names)}）")
+            details = [item["detail"] for item in unsuccessful if item["detail"]]
+            if details:
+                lines.append(f"- 最近问题：{details[-1]}")
         if reason:
             lines.append(f"- 说明：{reason}")
         return "\n".join(lines)
@@ -582,13 +599,16 @@ def run_agent_turn(
 
         nonlocal reply_finished
         final_text = text if isinstance(text, str) else ""
+        effective_status = status
+        if effective_status == "completed" and not final_text.strip():
+            effective_status = "partial" if tool_outcomes else "failed"
 
-
-        if not final_text.strip():
-
-
-            reason = empty_reason or "模型没有生成有效回复，已根据本轮执行记录生成简报。"
-            final_text = _completion_brief(status, reason)
+        # Successful answers stay clean. Abnormal termination remains visible
+        # even when the model managed to produce some partial text.
+        if effective_status != "completed":
+            reason = empty_reason or "任务未正常完成，已保留本轮执行记录。"
+            brief = _completion_brief(effective_status, reason)
+            final_text = f"{final_text.rstrip()}\n\n{brief}" if final_text.strip() else brief
 
         if reply_finished:
             logger.warning("忽略重复的 turn 终止请求: session=%s", session_id)
@@ -607,8 +627,11 @@ def run_agent_turn(
 
         _emit_event(FinalEvent(content=final_text))
 
-        metric_status = "ok" if status == "completed" else status
-        metrics.finalize(status=metric_status, error="" if status == "completed" else empty_reason)
+        metric_status = "ok" if effective_status == "completed" else effective_status
+        metrics.finalize(
+            status=metric_status,
+            error="" if effective_status == "completed" else empty_reason,
+        )
         with _metrics_lock:
             aggregator = _session_aggregators.setdefault(session_id, TurnMetricsAggregator())
             monitor = _session_health_monitors.setdefault(session_id, LoopHealthMonitor())
@@ -915,6 +938,11 @@ def run_agent_turn(
 
 
                 ),
+                status=(
+                    "completed"
+                    if final_text.strip()
+                    else ("partial" if tool_outcomes else "failed")
+                ),
 
 
             )
@@ -937,14 +965,64 @@ def run_agent_turn(
                     status="partial" if tool_outcomes else "failed",
                 )
 
+            native_tool_calls = []
+            used_call_ids = {
+                str(call.get("id"))
+                for message in session.messages
+                for call in (message.tool_calls or [])
+                if isinstance(call, dict) and call.get("id")
+            }
+            for index, tc in enumerate(response.tool_calls, start=1):
+                call_id = str(getattr(tc, "call_id", "") or "").strip()
+                if not call_id or call_id in used_call_ids:
+                    base_id = f"tool_{turn_count}_{index}"
+                    call_id = base_id
+                    suffix = 2
+                    while call_id in used_call_ids:
+                        call_id = f"{base_id}_{suffix}"
+                        suffix += 1
+                used_call_ids.add(call_id)
+                tc.call_id = call_id
+                native_tool_calls.append(
+                    {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.name,
+                            "arguments": json.dumps(tc.args, ensure_ascii=False),
+                        },
+                    }
+                )
+            session.append_message("assistant", "", tool_calls=native_tool_calls)
+
+            def append_tool_result(tc, content: str) -> None:
+                session.append_message(
+                    "tool",
+                    content,
+                    tool_call_id=tc.call_id,
+                    name=tc.name,
+                )
+
+
+            pending_skill_injections: list[str] = []
+            batch_cancelled = False
 
             for tc in response.tool_calls:
 
-                if tool_limit_reached:
-                    break
+                if cancel_event is not None and cancel_event.is_set():
+                    batch_cancelled = True
+                    cancel_message = "用户已终止本轮任务，工具未执行。"
+                    append_tool_result(
+                        tc,
+                        json.dumps(
+                            {"tool": tc.name, "ok": False, "result": cancel_message},
+                            ensure_ascii=False,
+                        ),
+                    )
+                    _record_outcome(tc.name, "blocked", cancel_message)
+                    continue
 
-
-                if tool_calls_used >= _MAX_TOOL_CALLS_PER_TURN:
+                if tool_limit_reached or tool_calls_used >= _MAX_TOOL_CALLS_PER_TURN:
 
 
                     tool_limit_reached = True
@@ -962,12 +1040,8 @@ def run_agent_turn(
                     )
 
 
-                    session.append_message(
-
-
-                        "tool",
-
-
+                    append_tool_result(
+                        tc,
                         json.dumps(
 
 
@@ -1023,12 +1097,8 @@ def run_agent_turn(
                     )
 
 
-                    session.append_message(
-
-
-                        "tool",
-
-
+                    append_tool_result(
+                        tc,
                         json.dumps(
 
 
@@ -1045,6 +1115,7 @@ def run_agent_turn(
 
 
                     print(f"[tool_result] use_skill: {msg}")
+                    _record_outcome("use_skill", "ok", msg)
 
 
                     continue
@@ -1059,7 +1130,7 @@ def run_agent_turn(
                 if _is_skill_select(tc.name) and not skill_already_injected_for_turn:
 
 
-                    result = _handle_skill_select(
+                    result, injected = _handle_skill_select(
 
 
                         tc.args,
@@ -1086,26 +1157,11 @@ def run_agent_turn(
                     )
 
 
-                    if result is not None:
-
-
-                        # Rejected or failed — record but keep the door open
-
-
-                        session.append_message("tool", result)
-
-
-                        _save_safe(session_store, session)
-
-
-                    else:
-
-
-                        # Successfully injected
-
-
+                    append_tool_result(tc, result)
+                    _record_serialized_outcome("use_skill", result)
+                    if injected is not None:
+                        pending_skill_injections.append(injected)
                         skill_already_injected_for_turn = True
-
 
                     continue
 
@@ -1158,7 +1214,7 @@ def run_agent_turn(
                     )
 
 
-                    session.append_message("tool", result_content)
+                    append_tool_result(tc, result_content)
 
                     _record_outcome(tc.name, "rejected", "当前通道不支持交互式审批")
 
@@ -1376,7 +1432,7 @@ def run_agent_turn(
                                 }, ensure_ascii=False)
 
 
-                            session.append_message("tool", result_content)
+                            append_tool_result(tc, result_content)
 
                             _record_outcome(tc.name, "rejected", reason)
 
@@ -1396,7 +1452,7 @@ def run_agent_turn(
                 # ---- Execute the tool ---------------------------------------
 
 
-                call_id = getattr(tc, "call_id", "") or f"tool_{turn_count}_{tool_calls_used}"
+                call_id = tc.call_id
 
 
                 _emit_event(
@@ -1502,7 +1558,7 @@ def run_agent_turn(
                     logger.warning("检测到无进展的重复工具调用: %s", call_signature)
 
 
-                session.append_message("tool", tool_msg_content)
+                append_tool_result(tc, tool_msg_content)
 
 
                 _emit_event(
@@ -1562,8 +1618,17 @@ def run_agent_turn(
 
 
 
+            for injected in pending_skill_injections:
+                session.append_message("user", injected)
+
             _save_safe(session_store, session)
 
+            if batch_cancelled:
+                return _finish_reply(
+                    None,
+                    empty_reason="用户已终止本轮任务；已完成的操作和结果仍然保留。",
+                    status="cancelled",
+                )
 
             continue
 
@@ -1587,6 +1652,7 @@ def run_agent_turn(
 
 
             empty_reason="模型没有返回可处理的内容，本轮任务已安全结束。请重试。",
+            status="partial" if tool_outcomes else "failed",
 
 
         )
@@ -1637,7 +1703,7 @@ def _handle_skill_select(
     skill_registry,
 
 
-) -> str | None:
+) -> tuple[str, str | None]:
 
 
     """Handle a ``use_skill`` tool call.
@@ -1664,13 +1730,7 @@ def _handle_skill_select(
     Returns:
 
 
-        A tool-observation JSON string to append to the session, or None
-
-
-        if the skill was approved and injected (in which case the caller
-
-
-        continues the loop).
+        A tool-observation JSON string and optional skill-injection message.
 
 
     """
@@ -1703,7 +1763,7 @@ def _handle_skill_select(
             ensure_ascii=False,
 
 
-        )
+        ), None
 
 
 
@@ -1724,7 +1784,7 @@ def _handle_skill_select(
             ensure_ascii=False,
 
 
-        )
+        ), None
 
 
 
@@ -1771,7 +1831,7 @@ def _handle_skill_select(
                     "result": f"skill 审批流程异常，已安全拒绝: {exc}",
                 },
                 ensure_ascii=False,
-            )
+            ), None
 
 
 
@@ -1807,7 +1867,7 @@ def _handle_skill_select(
                 ensure_ascii=False,
 
 
-            )
+            ), None
 
 
 
@@ -1846,7 +1906,8 @@ def _handle_skill_select(
     injected = context_builder.build_skill_injection_message(skill_name, user_task)
 
 
-    session.append_message("user", injected)
+    # The caller appends the matching tool result before this injected user
+    # message so the native function-calling sequence remains valid.
 
 
 
@@ -1855,13 +1916,16 @@ def _handle_skill_select(
     _record_skill_usage(session, skill_name, user_task, "auto", auto_reason)
 
 
-    _save_safe(session_store, session)
+    # The caller saves after appending both protocol messages.
 
 
 
 
 
-    return None  # Signal success — the loop continues with skill content injected
+    return json.dumps(
+        {"tool": "use_skill", "ok": True, "result": f"skill \"{skill_name}\" 已加载"},
+        ensure_ascii=False,
+    ), injected
 
 
 

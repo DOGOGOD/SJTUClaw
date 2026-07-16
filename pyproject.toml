@@ -23,6 +23,11 @@ dependencies = [
 
 [project.scripts]
 sjtuclaw = "claw.cli.main:main"
+sjtuclaw-desktop = "claw.desktop:main"
+
+[project.optional-dependencies]
+desktop = ["pywebview>=5.0"]
+build = ["pyinstaller>=6.0", "pywebview>=5.0"]
 
 [build-system]
 requires = ["setuptools>=75", "wheel"]

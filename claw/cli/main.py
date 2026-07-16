@@ -12,12 +12,13 @@ from __future__ import annotations
 
 import argparse
 import sys
-from pathlib import Path
+
+from claw.config import ENV_EXAMPLE_PATH, ENV_PATH, PROJECT_ROOT
 
 
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
-_ENV_PATH = _PROJECT_ROOT / ".env"
-_ENV_EXAMPLE = _PROJECT_ROOT / ".env.example"
+_PROJECT_ROOT = PROJECT_ROOT
+_ENV_PATH = ENV_PATH
+_ENV_EXAMPLE = ENV_EXAMPLE_PATH
 
 
 # ---------------------------------------------------------------------------

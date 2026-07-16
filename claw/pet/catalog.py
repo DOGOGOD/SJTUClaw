@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, BinaryIO
 
 from PIL import Image
+from claw.paths import pet_assets_dir
 
 
 _PET_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
@@ -52,7 +53,7 @@ class PetCatalog:
     def __init__(self, data_dir: Path, bundled_dir: Path | None = None):
         self._root = Path(data_dir) / "pet"
         self._user_pets = Path(data_dir) / "pets"
-        self._bundled = bundled_dir or Path(__file__).with_name("assets")
+        self._bundled = bundled_dir or pet_assets_dir()
         self._settings_path = self._root / "settings.json"
         self._lock = threading.RLock()
         self._root.mkdir(parents=True, exist_ok=True)

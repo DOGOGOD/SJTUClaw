@@ -254,6 +254,14 @@ class ContextBuilder:
         unconsolidated = session.get_unconsolidated_messages()
         for i, msg in enumerate(unconsolidated):
             msg_dict = msg.to_dict()
+            # Legacy sessions may contain orphan tool messages without the
+            # matching assistant tool_calls entry. Strict providers reject
+            # those messages, so preserve them as ordinary assistant context.
+            if msg.role == "tool" and not msg.tool_call_id:
+                msg_dict = {
+                    "role": "assistant",
+                    "content": f"[历史工具结果]\n{msg.content}",
+                }
             if (
                 msg.role == "user"
                 and i == len(unconsolidated) - 1

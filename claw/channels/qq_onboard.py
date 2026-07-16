@@ -254,9 +254,9 @@ def qr_register(timeout_seconds: int = 600) -> Optional[dict]:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    from pathlib import Path as _Path
+    from claw.config import ENV_PATH
 
-    _env_path = _Path(__file__).resolve().parent.parent.parent / ".env"
+    _env_path = ENV_PATH
 
     print("=" * 56)
     print("  QQ Bot 配置")

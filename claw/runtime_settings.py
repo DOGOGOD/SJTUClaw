@@ -12,9 +12,10 @@ from pathlib import Path
 from typing import Any
 
 from cryptography.fernet import Fernet, InvalidToken
+from claw.paths import data_dir, resource_root
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DATA_DIR = PROJECT_ROOT / "data"
+PROJECT_ROOT = resource_root()
+DATA_DIR = data_dir()
 SETTINGS_DIR = DATA_DIR / "settings"
 SETTINGS_PATH = SETTINGS_DIR / "runtime_settings.json"
 KEY_PATH = SETTINGS_DIR / "runtime_settings.key"

@@ -45,12 +45,13 @@ from typing import Any
 import yaml
 
 from claw.config import PROJECT_ROOT
+from claw.paths import skills_dir
 
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
 
-SKILLS_DIR = PROJECT_ROOT / "skills"
+SKILLS_DIR = skills_dir()
 
 # Frontmatter regex (for stripping YAML)
 _STRIP_FRONTMATTER_RE = re.compile(

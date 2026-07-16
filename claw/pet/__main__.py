@@ -6,10 +6,11 @@ import argparse
 import sys
 from pathlib import Path
 
+from claw.config import DATA_DIR
 from claw.pet.app import run_desktop_pet
 
 
-DEFAULT_DATA_DIR = Path(__file__).resolve().parents[2] / "data"
+DEFAULT_DATA_DIR = DATA_DIR
 
 
 def main() -> int:

@@ -28,32 +28,77 @@ SJTUClaw 将多轮对话、工具调用、长期记忆、Skill、定时任务和
 
 ```text
 SJTUClaw/
-├── claw/
-│   ├── agent/          # Agent Loop、事件和运行时预算
-│   ├── context/        # 上下文构造与压缩
-│   ├── llm/            # OpenAI 兼容的 LLM 客户端
-│   ├── session/        # 会话模型与 JSONL 持久化
-│   ├── memory/         # 长期记忆与每日反思
-│   ├── tools/          # 文件、Shell、联网、Skill、Cron 等工具
-│   ├── gateway/        # FastAPI Gateway、REST API、SSE
-│   ├── channels/       # QQ Bot 通道
-│   ├── scheduler/      # Cron 与 Heartbeat 调度
-│   ├── skills/         # Skill 注册与使用统计
-│   ├── pet/            # tkinter 桌面宠物
-│   ├── desktop.py      # Windows 桌面应用启动器
-│   ├── paths.py        # 源码版与安装版资源/数据路径
-│   └── cli/            # CLI 与 REPL
-├── prompts/            # System Prompt 与 Soul
-├── skills/             # 可复用 Skill 数据目录
-├── webui/              # React + TypeScript 前端源码
-├── web/                # Web UI 构建产物
-├── packaging/windows/  # PyInstaller、Inno Setup 与应用图标
-├── tests/              # 后端与前端测试
-├── data/               # 运行时数据，默认不提交
-├── docs/               # 配置、测试和项目文档
-├── pyproject.toml      # Python 项目与 CLI 配置
-└── .env.example        # 环境变量模板
+├── claw/                         # Python 主程序
+│   ├── agent/                    # Agent Loop、预算、事件、健康监控
+│   ├── approval/                 # 高风险工具审批管理
+│   ├── channels/                 # 外部渠道，目前以 QQ Bot 为主
+│   ├── cli/                      # CLI 入口、REPL、命令解析
+│   ├── context/                  # Context Builder、Compact、治理与 Token 预算
+│   ├── gateway/                  # FastAPI Gateway、REST API、SSE、上传服务
+│   ├── llm/                      # OpenAI Compatible 客户端与协议适配
+│   ├── memory/                   # 长期记忆存储与 Reflection
+│   ├── pet/                      # 桌面宠物进程与资源管理
+│   ├── prompts/                  # Prompt 模板加载
+│   ├── scheduler/                # Cron、Heartbeat、任务分发与状态持久化
+│   ├── session/                  # Session/Message 模型、标题与 JSONL Store
+│   ├── skills/                   # Skill Registry、安装、统计与状态管理
+│   ├── tools/                    # 文件、Shell、网页、附件、Memory、Cron、Skill 等工具
+│   ├── workspace/                # Workspace 绑定、路径解析、边界检查
+│   ├── config.py                 # 配置加载与运行时入口配置
+│   ├── runtime_settings.py       # Web UI 可写设置与敏感配置持久化
+│   ├── desktop.py                # Windows 桌面壳，启动本地 Gateway 与 pywebview
+│   ├── paths.py                  # 源码版、PyInstaller 版、安装版路径切换
+│   ├── main.py                   # 应用主入口
+│   └── utils.py                  # 通用工具函数
+├── prompts/                      # identity、system prompt、soul、tool contract 等文本资源
+├── skills/                       # 内置 Skill 目录
+│   ├── course-report/
+│   ├── material-summary/
+│   └── presentation-outline/
+├── webui/                        # React + TypeScript + Vite 前端源码
+│   ├── src/
+│   │   ├── components/           # 线程视图、设置面板、通用 UI 组件
+│   │   ├── hooks/                # 会话、主题、拖拽等前端 hooks
+│   │   ├── i18n/                 # 国际化文案与语言资源
+│   │   ├── lib/                  # API 客户端、类型、命令与工具函数
+│   │   ├── providers/            # React provider 封装
+│   │   ├── test/                 # 前端测试辅助
+│   │   ├── types/                # 前端类型定义
+│   │   ├── globals.css
+│   │   └── main.tsx
+│   ├── public/                   # 前端静态资源与宠物图片
+│   ├── package.json
+│   └── vite.config.ts
+├── web/                          # 已构建的 Web UI 静态产物，供 Gateway/桌面版直接加载
+├── packaging/
+│   └── windows/
+│       ├── build.ps1             # 一键构建脚本
+│       ├── SJTUClaw.spec         # PyInstaller 打包规格
+│       ├── SJTUClaw.iss          # Inno Setup 安装脚本
+│       └── assets/SJTUClaw.ico   # Windows 程序与快捷方式图标
+├── docs/
+│   ├── configuration.md          # 配置说明
+│   ├── testing.md                # 测试与开发说明
+│   ├── windows-packaging.md      # Windows 安装包构建说明
+│   └── images/                   # README 与文档截图
+├── tests/                        # pytest 后端测试与少量前端/集成测试
+├── data/                         # 源码运行时数据目录
+├── build/                        # 本地构建中间产物
+├── dist/                         # PyInstaller 与安装包输出目录
+├── requirements.txt              # Python 依赖列表
+├── pyproject.toml                # Python 项目元数据与 `sjtuclaw` CLI 入口
+├── .env.example                  # 环境变量模板
+├── SJTUClaw.md                   # 课程任务说明
+└── 中期报告.md                    # 当前阶段报告
 ```
+
+结构说明：
+
+- `claw/` 是核心运行时，桌面端、CLI、Web、QQ 和调度器最终都会汇入同一套 Agent Loop。
+- `webui/` 是完整前端工程，开发时由 Vite 提供热更新，发布时构建到 `web/`。
+- `packaging/windows/` 负责 Windows 桌面端分发，先用 PyInstaller 冻结 Python 程序，再用 Inno Setup 生成标准安装包。
+- `prompts/`、`skills/` 和 `data/` 分别对应静态 Prompt 资源、内置 Skill 资源和源码运行时的可写数据。
+- `docs/` 放配置、测试和打包文档；`中期报告.md` 是课程阶段性说明，内容会比 README 更简洁。
 
 ## 使用方式
 

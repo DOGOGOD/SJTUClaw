@@ -275,6 +275,13 @@ export interface QQConnectionStatus {
   message: string;
 }
 
+export type UserAvatarSelection = "initial" | "person" | "cat" | "dog" | "fox" | "panda" | "custom";
+
+export interface UserAvatarSettings {
+  avatarId: UserAvatarSelection;
+  customImage: string;
+}
+
 export type SettingsSection = "prompt" | "soul" | "memory" | "cron" | "skills" | "workspace" | "pet" | "channel" | "llm";
 
 export type ShellView = "chat" | "settings";

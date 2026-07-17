@@ -10,7 +10,8 @@ import { BrandAvatar } from "@/components/BrandAvatar";
 import { PetSprite } from "@/components/PetSprite";
 import { cn } from "@/lib/utils";
 import { useTheme } from "@/hooks/useTheme";
-import type { ChatMessage } from "@/lib/types";
+import { fetchUserAvatarSettings, saveUserAvatarSettings } from "@/lib/api";
+import type { ChatMessage, UserAvatarSelection } from "@/lib/types";
 import { ToolCallCard, InlineToolCalls } from "./ToolCallCard";
 
 /** Local error boundary so a syntax-highlighter crash doesn't take down the whole chat. */
@@ -182,7 +183,6 @@ const USER_AVATARS = [
 ] as const;
 
 type UserAvatarId = (typeof USER_AVATARS)[number]["id"];
-type UserAvatarSelection = UserAvatarId | "custom";
 
 const USER_AVATAR_STORAGE_KEY = "sjtuclaw.user-avatar";
 const USER_AVATAR_IMAGE_STORAGE_KEY = "sjtuclaw.user-avatar-image";
@@ -214,6 +214,18 @@ function loadUserAvatar(): UserAvatarSelection {
     }
   } catch {}
   return "initial";
+}
+
+function cacheUserAvatarSettings(avatarId: UserAvatarSelection, customImage = "") {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(USER_AVATAR_STORAGE_KEY, avatarId);
+    if (customImage) {
+      window.localStorage.setItem(USER_AVATAR_IMAGE_STORAGE_KEY, customImage);
+    } else if (avatarId !== "custom") {
+      window.localStorage.removeItem(USER_AVATAR_IMAGE_STORAGE_KEY);
+    }
+  } catch {}
 }
 
 function prepareUserAvatarImage(file: File): Promise<string> {
@@ -697,19 +709,37 @@ const MessageBubble = memo(function MessageBubble({
 export function ThreadViewport({ messages, loading, sessionId }: ThreadViewportProps) {
   const [userAvatarId, setUserAvatarId] = useState<UserAvatarSelection>(loadUserAvatar);
   const [userAvatarImage, setUserAvatarImage] = useState(loadUserAvatarImage);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchUserAvatarSettings()
+      .then(({ settings }) => {
+        if (cancelled) return;
+        const nextImage = settings.customImage || "";
+        const nextAvatar = settings.avatarId === "custom" && !nextImage ? "initial" : settings.avatarId;
+        setUserAvatarImage(nextImage);
+        setUserAvatarId(nextAvatar);
+        cacheUserAvatarSettings(nextAvatar, nextImage);
+      })
+      .catch(() => {
+        // Local storage remains the fallback for source runs or older gateways.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const handleUserAvatarChange = useCallback((avatarId: UserAvatarSelection) => {
     setUserAvatarId(avatarId);
-    try {
-      window.localStorage.setItem(USER_AVATAR_STORAGE_KEY, avatarId);
-    } catch {}
-  }, []);
+    const customImage = avatarId === "custom" ? userAvatarImage : "";
+    cacheUserAvatarSettings(avatarId, customImage);
+    saveUserAvatarSettings({ avatarId, customImage }).catch(() => {});
+  }, [userAvatarImage]);
   const handleUserAvatarImageChange = useCallback((dataUrl: string) => {
     setUserAvatarImage(dataUrl);
     setUserAvatarId("custom");
-    try {
-      window.localStorage.setItem(USER_AVATAR_IMAGE_STORAGE_KEY, dataUrl);
-      window.localStorage.setItem(USER_AVATAR_STORAGE_KEY, "custom");
-    } catch {}
+    cacheUserAvatarSettings("custom", dataUrl);
+    saveUserAvatarSettings({ avatarId: "custom", customImage: dataUrl }).catch(() => {});
   }, []);
   const welcome = useMemo(() => {
     const greetings = [

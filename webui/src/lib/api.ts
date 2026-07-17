@@ -281,6 +281,23 @@ export async function saveLLMSettings(data: {
   });
 }
 
+export async function fetchUserAvatarSettings(): Promise<{
+  ok: boolean;
+  settings: import("@/lib/types").UserAvatarSettings;
+}> {
+  return request("/settings/ui/avatar");
+}
+
+export async function saveUserAvatarSettings(data: import("@/lib/types").UserAvatarSettings): Promise<{
+  ok: boolean;
+  settings: import("@/lib/types").UserAvatarSettings;
+}> {
+  return request("/settings/ui/avatar", {
+    method: "PUT",
+    body: JSON.stringify(data),
+  });
+}
+
 export async function fetchChannelSettings(): Promise<{
   ok: boolean;
   settings: { qq: import("@/lib/types").QQChannelSettings };

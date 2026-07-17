@@ -2304,6 +2304,24 @@ def _qq_settings_payload() -> dict[str, Any]:
     }
 
 
+_UI_AVATAR_IDS = {"initial", "person", "cat", "dog", "fox", "panda", "custom"}
+_UI_AVATAR_IMAGE_MAX_CHARS = 1_500_000
+
+
+def _ui_avatar_payload() -> dict[str, Any]:
+    raw_avatar = setting_value("UI_USER_AVATAR", "initial").strip()
+    avatar_id = raw_avatar if raw_avatar in _UI_AVATAR_IDS else "initial"
+    image = setting_value("UI_USER_AVATAR_IMAGE", "").strip()
+    if not image.startswith("data:image/"):
+        image = ""
+    if avatar_id == "custom" and not image:
+        avatar_id = "initial"
+    return {
+        "avatarId": avatar_id,
+        "customImage": image,
+    }
+
+
 def _qq_connection_status() -> dict[str, Any]:
     cfg = load_qq_config()
     configured = bool(cfg.app_id and cfg.client_secret)
@@ -2426,6 +2444,11 @@ class QQSettingsRequest(BaseModel):
     ack_message: str = Field(default="", alias="ackMessage")
 
 
+class UIAvatarSettingsRequest(BaseModel):
+    avatar_id: str = Field(alias="avatarId")
+    custom_image: str = Field(default="", alias="customImage")
+
+
 @app.get("/settings/llm")
 def get_llm_settings():
     return {"ok": True, "settings": _llm_settings_payload()}
@@ -2466,6 +2489,31 @@ def update_llm_settings(req: LLMSettingsRequest):
         replace_runtime_settings_raw(previous_settings)
         raise HTTPException(status_code=400, detail=f"LLM 配置应用失败: {exc}") from exc
     return {"ok": True, "settings": _llm_settings_payload()}
+
+
+@app.get("/settings/ui/avatar")
+def get_ui_avatar_settings():
+    return {"ok": True, "settings": _ui_avatar_payload()}
+
+
+@app.put("/settings/ui/avatar")
+def update_ui_avatar_settings(req: UIAvatarSettingsRequest):
+    avatar_id = req.avatar_id.strip()
+    custom_image = req.custom_image.strip()
+    if avatar_id not in _UI_AVATAR_IDS:
+        raise HTTPException(status_code=400, detail="未知的用户头像")
+    if custom_image and not custom_image.startswith("data:image/"):
+        raise HTTPException(status_code=400, detail="自定义头像必须是图片 data URL")
+    if len(custom_image) > _UI_AVATAR_IMAGE_MAX_CHARS:
+        raise HTTPException(status_code=400, detail="自定义头像图片过大")
+    if avatar_id == "custom" and not custom_image:
+        raise HTTPException(status_code=400, detail="自定义头像缺少图片数据")
+
+    update_runtime_settings({
+        "UI_USER_AVATAR": avatar_id,
+        "UI_USER_AVATAR_IMAGE": custom_image if avatar_id == "custom" else "",
+    })
+    return {"ok": True, "settings": _ui_avatar_payload()}
 
 
 @app.get("/settings/channel")

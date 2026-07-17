@@ -164,6 +164,7 @@ npm run dev         # http://127.0.0.1:5173
 ```powershell
 .\packaging\windows\build.ps1
 ```
+需要将build.ps1中的Inno Setup路径修改为本地真实路径
 
 构建产物：
 

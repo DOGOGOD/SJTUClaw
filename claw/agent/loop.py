@@ -275,10 +275,11 @@ def get_session_metrics_summary(session_id: str) -> dict[str, Any] | None:
 
 
 def _is_outside_workspace(tool_name: str, args: dict) -> bool:
-    """Check if a tool call targets a path outside the workspace.
+    """Conservatively flag arguments that may reference an external path.
 
-    In unlimited mode, operations outside the workspace always
-    require explicit approval — even when auto_mode is on.
+    This is a lexical diagnostic only: an absolute path can still be inside
+    the active workspace, so approval decisions must not rely on it.  The
+    workspace-aware tool handlers perform the authoritative boundary check.
     """
     # Check path-like arguments
     path_str = args.get("path") or args.get("file_path") or args.get("file")
@@ -440,10 +441,13 @@ def run_agent_turn(
             background compaction after the turn completes.
 
 
-        auto_mode: if True, skip approval for write/shell tools (within
+        auto_mode: if True, skip approval for write/shell tools while the
 
 
-            workspace only; outside-workspace ops still require approval).
+            workspace sandbox remains active.  Tool handlers still reject
+
+
+            operations that escape the workspace.
 
 
         unlimited_mode: if True, the session is in unlimited mode. Shell
@@ -1234,19 +1238,22 @@ def run_agent_turn(
 
 
 
-                    # Security: determine if this operation is potentially
+                    # In sandboxed mode, file and shell handlers enforce the
 
 
-                    # dangerous and should bypass auto_mode approval.
+                    # workspace boundary themselves.  Do not infer an escape
 
 
-                    # 1. Operations targeting paths outside the workspace
+                    # merely because the model used an absolute path: it may
 
 
-                    #    ALWAYS require explicit approval.
+                    # still point inside the workspace, and the old heuristic
 
 
-                    # 2. In unlimited mode, every write/shell tool ALWAYS
+                    # caused intermittent approval prompts in AUTO mode.
+
+
+                    # In unlimited mode, every write/shell tool ALWAYS
 
 
                     #    requires approval because relative paths and shell
@@ -1255,34 +1262,13 @@ def run_agent_turn(
                     #    commands can also resolve outside the workspace.
 
 
-                    outside_ws = _is_outside_workspace(tc.name, tc.args)
-
-
-                    force_approval = outside_ws or unlimited_mode
+                    force_approval = unlimited_mode
 
 
 
 
 
                     if force_approval:
-
-
-                        if outside_ws:
-
-
-                            logger.warning(
-
-
-                                "tool %s targets path outside workspace, "
-
-
-                                "forcing approval even in AUTO mode",
-
-
-                                tc.name,
-
-
-                            )
 
 
                         if unlimited_mode:

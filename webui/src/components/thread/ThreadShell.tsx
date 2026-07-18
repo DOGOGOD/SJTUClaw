@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { PanelLeft, Moon, Sun, ShieldCheck, Zap } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ThreadViewport } from "./ThreadViewport";
@@ -41,6 +41,10 @@ export function ThreadShell({
   hideSidebarToggle = false,
 }: ThreadShellProps) {
   const [autoScroll, setAutoScroll] = useState(false);
+  const messageHistory = useMemo(
+    () => messages.filter((message) => message.role === "user").map((message) => message.content),
+    [messages]
+  );
   const {
     ref: viewportRef,
     dragScrollProps: messageDragProps,
@@ -126,7 +130,7 @@ export function ThreadShell({
           <div className="mx-auto flex min-h-full w-full max-w-[760px] flex-col justify-center pb-[8vh]">
             <ThreadViewport messages={messages} loading={loading} sessionId={sessionId} />
             <div className="mt-8">
-              <ThreadComposer onSend={onSend} onAttach={onAttach} sessionId={sessionId} sending={sending} home />
+              <ThreadComposer onSend={onSend} onAttach={onAttach} sessionId={sessionId} messageHistory={messageHistory} sending={sending} home />
             </div>
             <p className="mt-3 text-center text-[10px] text-muted-foreground/55 select-none">
               Claw 可能会犯错，请核对重要信息
@@ -145,7 +149,7 @@ export function ThreadShell({
           </div>
           <div className="host-no-drag shrink-0 bg-gradient-to-t from-background via-background to-background/80 px-3 pb-3 pt-2 md:px-6 md:pb-5">
             <div className="mx-auto max-w-[880px]">
-              <ThreadComposer onSend={onSend} onStop={onStop} onAttach={onAttach} sessionId={sessionId} sending={sending} />
+              <ThreadComposer onSend={onSend} onStop={onStop} onAttach={onAttach} sessionId={sessionId} messageHistory={messageHistory} sending={sending} />
             </div>
             <p className="mt-2 text-center text-[10px] text-muted-foreground/50 select-none">
               Enter 发送　Shift+Enter 换行　输入 / 查看命令

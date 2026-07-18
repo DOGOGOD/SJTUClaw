@@ -24,7 +24,11 @@ import httpx
 
 from claw.tools.base import Tool, ToolResult
 
-_USER_AGENT = "SJTUClaw/0.1 (+https://github.com/SJTUClaw)"
+_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36 "
+    "SJTUClaw/0.1"
+)
 _TRANSIENT_STATUS = {408, 425, 429, 500, 502, 503, 504}
 _TEXT_CONTENT_TYPES = (
     "text/",
@@ -115,7 +119,7 @@ def _is_proxy_fake_ip(address: str) -> bool:
         return False
 
 
-def _resolve_public_target(url: str) -> tuple[str, str, str, str]:
+def _resolve_public_target(url: str, address_index: int = 0) -> tuple[str, str, str, str]:
     """Return normalized URL plus an IP-pinned connection target.
 
     The HTTP client must not resolve the hostname again after validation;
@@ -165,7 +169,14 @@ def _resolve_public_target(url: str) -> tuple[str, str, str, str]:
             _is_public_ip(address) or _is_proxy_fake_ip(address) for address in addresses
         ):
             raise WebSecurityError("internal/private URL detected: 主机解析到非公网地址")
-        selected_address = sorted(addresses)[0]
+        ordered_addresses = sorted(
+            addresses,
+            key=lambda address: (
+                ipaddress.ip_address(address.split("%", 1)[0]).version == 6,
+                address,
+            ),
+        )
+        selected_address = ordered_addresses[address_index % len(ordered_addresses)]
     else:
         if not _is_public_ip(str(literal)):
             raise WebSecurityError("internal/private URL detected: 禁止访问非公网地址")
@@ -319,7 +330,7 @@ class _DuckDuckGoParser(HTMLParser):
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         attr = dict(attrs)
         classes = set((attr.get("class") or "").split())
-        if tag == "a" and "result__a" in classes:
+        if tag == "a" and classes.intersection({"result__a", "result-link"}):
             self._finish_current()
             href = attr.get("href") or ""
             query = parse_qs(urlsplit(href).query)
@@ -328,7 +339,9 @@ class _DuckDuckGoParser(HTMLParser):
             self._current = {"title": "", "url": href, "snippet": ""}
             self._capture = "title"
             self._text = []
-        elif self._current is not None and "result__snippet" in classes:
+        elif self._current is not None and classes.intersection(
+            {"result__snippet", "result-snippet"}
+        ):
             self._capture = "snippet"
             self._text = []
 
@@ -377,7 +390,11 @@ def _client(config: WebToolConfig) -> httpx.Client:
         timeout=timeout,
         follow_redirects=False,
         trust_env=config.trust_env_proxy,
-        headers={"User-Agent": _USER_AGENT, "Accept": "text/html,application/json,text/plain,*/*;q=0.5"},
+        headers={
+            "User-Agent": _USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml,application/json,text/plain,*/*;q=0.5",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.7",
+        },
     )
 
 
@@ -396,6 +413,16 @@ def _read_limited(chunks: Iterable[bytes], limit: int) -> tuple[bytes, bool]:
     return bytes(data), truncated
 
 
+def _is_text_content_type(content_type: str) -> bool:
+    media_type = content_type.split(";", 1)[0].strip().lower()
+    return (
+        not media_type
+        or any(media_type.startswith(prefix) for prefix in _TEXT_CONTENT_TYPES)
+        or media_type.endswith("+json")
+        or media_type.endswith("+xml")
+    )
+
+
 def _fetch(
     url: str,
     config: WebToolConfig,
@@ -408,7 +435,9 @@ def _fetch(
     redirects = 0
     while True:
         try:
-            current, connect_url, host_header, sni_hostname = _resolve_public_target(current)
+            current, connect_url, host_header, sni_hostname = _resolve_public_target(
+                current, attempts
+            )
             with client_factory(config) as client:
                 with client.stream(
                     "GET",
@@ -431,7 +460,7 @@ def _fetch(
                         continue
                     response.raise_for_status()
                     content_type = response.headers.get("content-type", "").lower()
-                    if content_type and not any(content_type.startswith(t) for t in _TEXT_CONTENT_TYPES):
+                    if not _is_text_content_type(content_type):
                         raise RuntimeError(f"不支持的响应类型：{content_type.split(';', 1)[0]}")
                     body, byte_truncated = _read_limited(response.iter_bytes(), config.max_response_bytes)
                     text = _decode_body(body, content_type, response.encoding)
@@ -484,15 +513,49 @@ def _request_text(
     json_data: dict[str, Any] | None = None,
     form_data: dict[str, Any] | None = None,
     params: dict[str, Any] | None = None,
+    headers: dict[str, str] | None = None,
 ) -> str:
-    """Request text with the same retry and size guarantees as web_fetch."""
+    """Request provider text with bounded, SSRF-safe redirect handling."""
+    current = url
+    current_method = method.upper()
+    current_json = json_data
+    current_form = form_data
+    current_params = params
     attempts = 0
+    redirects = 0
     while True:
         try:
+            current, connect_url, host_header, sni_hostname = _resolve_public_target(
+                current, attempts
+            )
+            request_headers = dict(headers or {})
+            request_headers["Host"] = host_header
             with _client(config) as client:
                 with client.stream(
-                    method, url, json=json_data, data=form_data, params=params
+                    current_method,
+                    connect_url,
+                    json=current_json,
+                    data=current_form,
+                    params=current_params,
+                    headers=request_headers,
+                    extensions={"sni_hostname": sni_hostname},
                 ) as response:
+                    if response.status_code in {301, 302, 303, 307, 308}:
+                        location = response.headers.get("location", "")
+                        if not location:
+                            raise RuntimeError("搜索服务返回重定向但未提供 Location")
+                        redirects += 1
+                        if redirects > 5:
+                            raise RuntimeError("搜索服务重定向次数超过上限（5）")
+                        current = urljoin(current, location)
+                        current_params = None
+                        if response.status_code == 303 or (
+                            response.status_code in {301, 302} and current_method == "POST"
+                        ):
+                            current_method = "GET"
+                            current_json = None
+                            current_form = None
+                        continue
                     if response.status_code in _TRANSIENT_STATUS and attempts < config.max_retries:
                         attempts += 1
                         time.sleep(min(0.25 * (2 ** (attempts - 1)), 1.0))
@@ -569,6 +632,22 @@ def _search_duckduckgo(query: str, max_results: int, config: WebToolConfig) -> l
         "https://html.duckduckgo.com/html/",
         config,
         form_data={"q": query},
+    )
+    parser = _DuckDuckGoParser()
+    parser.feed(text)
+    parser.close()
+    results = _safe_search_results(parser.results, max_results)
+    if results:
+        return results
+
+    # DuckDuckGo maintains a separate lightweight frontend whose markup and
+    # throttling are independent from the HTML endpoint.  It is a useful
+    # no-key fallback when the primary page serves a challenge or empty shell.
+    text = _request_text(
+        "GET",
+        "https://lite.duckduckgo.com/lite/",
+        config,
+        params={"q": query},
     )
     parser = _DuckDuckGoParser()
     parser.feed(text)
@@ -653,7 +732,8 @@ def create_web_search_tool(config: WebToolConfig | None = None) -> Tool:
                 continue
             if results:
                 break
-        if not results and failures:
+            failures.append(f"{provider}: 未返回可用结果")
+        if not results:
             return ToolResult(
                 ok=False,
                 error="web_search 所有搜索后端均失败：" + "；".join(failures),
@@ -661,7 +741,13 @@ def create_web_search_tool(config: WebToolConfig | None = None) -> Tool:
         return ToolResult(
             ok=True,
             content=json.dumps(
-                {"query": query, "provider": provider, "result_count": len(results), "results": results},
+                {
+                    "query": query,
+                    "provider": provider,
+                    "result_count": len(results),
+                    "results": results,
+                    "fallback_errors": failures,
+                },
                 ensure_ascii=False,
             ),
         )
@@ -669,8 +755,8 @@ def create_web_search_tool(config: WebToolConfig | None = None) -> Tool:
     return Tool(
         name="web_search",
         description=(
-            "搜索互联网并返回标题、URL 和摘要。配置 TAVILY_API_KEY 时使用 Tavily，"
-            "否则使用 DuckDuckGo，并在无结果或故障时回退到 Bing。"
+            "搜索互联网并返回标题、URL 和摘要。配置 TAVILY_API_KEY 时优先使用 Tavily；"
+            "无 API Key 时使用 DuckDuckGo 双端点，并在无结果或故障时回退到 Bing。"
             "需要读取结果全文时再调用 web_fetch。"
         ),
         input_schema={

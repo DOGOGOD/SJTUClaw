@@ -12,6 +12,7 @@ interface ThreadComposerProps {
   sending?: boolean;
   onAttach?: (file: File) => void;
   sessionId?: string | null;
+  messageHistory?: string[];
   home?: boolean;
 }
 
@@ -22,6 +23,7 @@ export function ThreadComposer({
   sending = false,
   onAttach,
   sessionId,
+  messageHistory,
   home = false,
 }: ThreadComposerProps) {
   const [value, setValue] = useState("");
@@ -29,9 +31,16 @@ export function ThreadComposer({
   const [wsPath, setWsPath] = useState("");
   const [wsDisplay, setWsDisplay] = useState("");
   const [wsError, setWsError] = useState("");
+  const [sendError, setSendError] = useState("");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const wsRef = useRef<HTMLDivElement>(null);
+  const valueRef = useRef("");
+  const historyRef = useRef(new Map<string, string[]>());
+  const historyIndexRef = useRef<number | null>(null);
+  const historyDraftRef = useRef("");
+
+  const historyKey = sessionId || "__home__";
 
   useEffect(() => {
     if (!sessionId) {
@@ -51,6 +60,24 @@ export function ThreadComposer({
   }, [disabled, sessionId]);
 
   useEffect(() => {
+    historyIndexRef.current = null;
+    historyDraftRef.current = "";
+    setSendError("");
+  }, [sessionId]);
+
+  useEffect(() => {
+    if (!messageHistory) return;
+    const currentHistory = historyRef.current.get(historyKey) || [];
+    const isCurrent = currentHistory.length === messageHistory.length &&
+      currentHistory.every((entry, index) => entry === messageHistory[index]);
+    if (!isCurrent) {
+      historyRef.current.set(historyKey, [...messageHistory]);
+      historyIndexRef.current = null;
+      historyDraftRef.current = "";
+    }
+  }, [historyKey, messageHistory]);
+
+  useEffect(() => {
     const handler = (e: MouseEvent) => {
       if (wsRef.current && !wsRef.current.contains(e.target as Node)) setShowWsPicker(false);
     };
@@ -67,15 +94,36 @@ export function ThreadComposer({
 
   useEffect(() => { autoResize(); }, [value, autoResize]);
 
+  const updateValue = useCallback((nextValue: string) => {
+    valueRef.current = nextValue;
+    setValue(nextValue);
+  }, []);
+
   const handleSend = useCallback(async () => {
     const trimmed = value.trim();
     if (!trimmed || disabled || sending) return;
+
+    const history = historyRef.current.get(historyKey) || [];
+    const historyEntryIndex = history.length;
+    history.push(trimmed);
+    historyRef.current.set(historyKey, history);
+    historyIndexRef.current = null;
+    historyDraftRef.current = "";
+    setSendError("");
+
+    // Clear immediately so slow network requests never leave stale text in the composer.
+    updateValue("");
+    if (textareaRef.current) textareaRef.current.style.height = "auto";
+
     try {
       await onSend(trimmed);
-      setValue("");
-      if (textareaRef.current) textareaRef.current.style.height = "auto";
-    } catch {}
-  }, [value, disabled, sending, onSend]);
+    } catch (error) {
+      // A rejected send is not part of the sent-message history.
+      if (history[historyEntryIndex] === trimmed) history.splice(historyEntryIndex, 1);
+      if (valueRef.current === "") updateValue(trimmed);
+      setSendError(error instanceof Error ? error.message : "消息发送失败，请重试。");
+    }
+  }, [value, disabled, sending, historyKey, onSend, updateValue]);
 
   const handleStop = useCallback(async () => {
     if (!onStop) return;
@@ -83,7 +131,10 @@ export function ThreadComposer({
   }, [onStop]);
 
   const handleKeyDown = useCallback(
-    (e: React.KeyboardEvent) => {
+    (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+      // Enter confirms an IME candidate before it should be treated as send.
+      if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) return;
+
       if (e.key === "Enter" && !e.shiftKey) {
         e.preventDefault();
         if (sending && onStop) {
@@ -91,10 +142,50 @@ export function ThreadComposer({
         } else {
           handleSend();
         }
+        return;
+      }
+
+      if (
+        (e.key === "ArrowUp" || e.key === "ArrowDown") &&
+        !e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey
+      ) {
+        const history = historyRef.current.get(historyKey) || [];
+        if (history.length === 0) return;
+
+        const currentIndex = historyIndexRef.current;
+        if (e.key === "ArrowUp") {
+          e.preventDefault();
+          let nextIndex = currentIndex;
+          if (nextIndex === null) {
+            historyDraftRef.current = valueRef.current;
+            nextIndex = history.length - 1;
+          } else if (nextIndex > 0) {
+            nextIndex -= 1;
+          }
+          historyIndexRef.current = nextIndex;
+          updateValue(history[nextIndex]);
+        } else if (currentIndex !== null) {
+          e.preventDefault();
+          if (currentIndex < history.length - 1) {
+            const nextIndex = currentIndex + 1;
+            historyIndexRef.current = nextIndex;
+            updateValue(history[nextIndex]);
+          } else {
+            historyIndexRef.current = null;
+            updateValue(historyDraftRef.current);
+          }
+        }
       }
     },
-    [handleSend, handleStop, sending, onStop]
+    [handleSend, handleStop, historyKey, sending, onStop, updateValue]
   );
+
+  const handleValueChange = useCallback((e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    updateValue(e.target.value);
+    historyIndexRef.current = null;
+    historyDraftRef.current = "";
+    if (sendError) setSendError("");
+  }, [sendError, updateValue]);
 
   const handleAttach = useCallback(() => fileInputRef.current?.click(), []);
   const handleFileChange = useCallback(
@@ -157,7 +248,7 @@ export function ThreadComposer({
       <textarea
         ref={textareaRef}
         value={value}
-        onChange={(e) => setValue(e.target.value)}
+        onChange={handleValueChange}
         onKeyDown={handleKeyDown}
         placeholder={home ? "Claw 能帮你做些什么？" : "继续对话..."}
         disabled={disabled}
@@ -167,6 +258,8 @@ export function ThreadComposer({
           home && "min-h-[58px]"
         )}
       />
+
+      {sendError && <p role="alert" className="px-1 pt-1 text-[11px] leading-relaxed text-destructive">{sendError}</p>}
 
       <div className="mt-2 flex items-center gap-1.5">
       {/* Workspace selector */}

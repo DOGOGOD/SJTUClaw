@@ -46,6 +46,10 @@ function Shell() {
     if (!activeSessionId) {
       setMessages([]);
       setMessagesLoading(false);
+      // AUTO and UNLIMITED are session-scoped.  Reset stale badges when the
+      // user opens a new-chat draft; the new session starts with both off.
+      setAutoMode(false);
+      setUnlimitedMode(false);
       return;
     }
     if (freshlyCreatedSessionRef.current === activeSessionId) {

@@ -436,6 +436,43 @@ class TestApprovalGateEnforcement:
 
         assert len(tracker.calls) == 0
 
+    def test_sandboxed_auto_mode_absolute_path_does_not_prompt_for_approval(
+        self, store, context_builder
+    ):
+        """The workspace-aware tool handler, not a path-string heuristic,
+        decides whether an absolute path is allowed.
+
+        Models sometimes emit an absolute path that still points inside the
+        workspace.  AUTO mode must not intermittently prompt solely because
+        the spelling changed from relative to absolute.
+        """
+        session = store.create_session(session_id="auto-absolute")
+        store.save(session)
+        tools = {"write_file": _FakeTool("write_file", safety_level="write")}
+        registry = _FakeToolRegistry(tools)
+
+        tool_call = MagicMock()
+        tool_call.name = "write_file"
+        tool_call.args = {"file_path": "/workspace/src/main.py", "content": "x"}
+        client = _FakeLLMClient([
+            _FakeLLMResponse(is_tool_call=True, tool_calls=[tool_call]),
+            _FakeLLMResponse(final="done"),
+        ])
+        tracker = _ApprovalCallTracker(decision="approved")
+
+        run_agent_turn(
+            "auto-absolute", "test",
+            session_store=store,
+            context_builder=context_builder,
+            tool_registry=registry,
+            llm_client=client,
+            approval_handler=tracker,
+            auto_mode=True,
+            unlimited_mode=False,
+        )
+
+        assert tracker.calls == []
+
     def test_non_auto_mode_always_requires_approval(
         self, store, context_builder
     ):

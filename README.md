@@ -16,6 +16,7 @@ SJTUClaw 将多轮对话、工具调用、长期记忆、Skill、定时任务和
 
 - **统一 Agent Loop**：CLI、Web UI、QQ Bot、Heartbeat 和 Cron 共享 `run_agent_turn()`。
 - **工具调用与安全审批**：支持文件读写、Shell、联网、下载、记忆、Skill 和 Cron 工具，并按安全级别控制执行。
+- **可控执行模式**：提供按 Session 隔离的 AUTO 与 UNLIMITED 模式，可在自动执行效率和文件系统安全边界之间明确切换。
 - **上下文与长期记忆**：支持 Session 持久化、上下文压缩、Markdown 记忆和每日 Reflection。
 - **Skill 系统**：通过 `SKILL.md` 组织可复用工作流，支持发现、加载和管理。
 - **多入口与实时反馈**：Web UI 通过 SSE 展示 Agent 事件，QQ Bot 支持私聊、群聊和内联审批。
@@ -157,6 +158,36 @@ npm run dev         # http://127.0.0.1:5173
 
 源码方式默认在项目目录下使用 `data/`、`prompts/` 和 `skills/`；安装版则使用 `%APPDATA%\SJTUClaw\data` 保存可写数据。两种方式共用同一套 Agent、Tool、Memory、Skill、Scheduler 和 Gateway 代码，主要区别在启动入口、资源路径和运行数据位置。
 
+### AUTO 与 UNLIMITED 模式
+
+SJTUClaw 默认对写入和 Shell 等高风险工具进行审批，并将文件及命令操作限制在当前 Session 绑定的 workspace 内。AUTO 和 UNLIMITED 是两个相互独立、按 Session 生效的执行模式；新建 Session 时二者默认均为关闭状态，Gateway 重启后也会恢复为关闭状态。
+
+| 模式 | 作用 | 审批行为 | 文件系统边界 |
+|------|------|----------|--------------|
+| 默认模式 | 使用完整安全保护 | 写入和 Shell 操作逐次审批 | 仅允许访问当前 workspace |
+| AUTO | 减少 workspace 内操作的人工确认 | 自动批准写入和 Shell 操作；Skill 加载确认仍保留 | 仍严格限制在当前 workspace，越界操作由工具拒绝 |
+| UNLIMITED | 解除 workspace 路径限制 | 写入、覆盖、删除和 Shell 操作始终逐次审批，AUTO 无法跳过 | 可访问 workspace 外路径 |
+
+启用或查看 AUTO 模式：
+
+```text
+/auto on       # 开启
+/auto off      # 关闭
+/auto toggle   # 切换
+/auto status   # 查看当前 Session 的状态
+```
+
+启用或查看 UNLIMITED 模式：
+
+```text
+/unlimited on       # 允许访问 workspace 外路径
+/unlimited off      # 恢复 workspace 边界
+/unlimited toggle   # 切换
+/unlimited status   # 查看当前 Session 的状态
+```
+
+> AUTO 不等于取消安全边界：它只省略 workspace 沙箱内写入和 Shell 操作的逐次审批。UNLIMITED 才会解除路径边界，但不会取消危险操作审批。两个模式同时开启时，UNLIMITED 的强制审批规则优先。
+
 ### 构建 Windows 安装包
 
 准备 Python 3.11+、Node.js 18+ 和 Inno Setup 7 后，在项目根目录执行：
@@ -180,6 +211,8 @@ dist\installer\SJTUClaw-Setup-0.1.0.exe
 ```text
 /session new|list|switch|rename|delete
 /workspace set|show|unset
+/auto on|off|toggle|status
+/unlimited on|off|toggle|status
 /cron list|status|disable|enable|delete
 /approvals|approve|reject
 /pet open|close|settings

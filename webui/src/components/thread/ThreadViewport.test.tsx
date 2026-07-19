@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ThreadViewport } from "./ThreadViewport";
 
 beforeEach(() => window.localStorage.clear());
@@ -119,5 +119,59 @@ describe("ThreadViewport user messages", () => {
       view.container.querySelectorAll("annotation[encoding='application/x-tex']")
     ).map((node) => node.textContent || "");
     expect(annotations.some((value) => value.includes("\\oint"))).toBe(true);
+  });
+
+  it("shows rollback only for checkpointed user messages when workspace rollback is enabled", () => {
+    const onRollback = vi.fn().mockResolvedValue(undefined);
+    const view = render(
+      <ThreadViewport
+        messages={[
+          { role: "user", content: "old", messageId: "old" },
+          {
+            role: "user",
+            content: "revertible",
+            messageId: "m1",
+            rollbackCheckpointId: "cp_1",
+            rollbackAvailable: true,
+          },
+          { role: "assistant", content: "answer", rollbackCheckpointId: "cp_1", rollbackAvailable: true },
+        ]}
+        loading={false}
+        sessionId="session-rollback"
+        rollbackEnabled
+        onRollback={onRollback}
+      />
+    );
+
+    const buttons = view.getAllByRole("button", { name: "回退到此消息发送前" });
+    expect(buttons).toHaveLength(1);
+    fireEvent.click(buttons[0]);
+    expect(onRollback).toHaveBeenCalledWith("cp_1");
+  });
+
+  it("hides or disables rollback when unavailable or already rolling back", () => {
+    const message = {
+      role: "user" as const,
+      content: "checkpointed",
+      rollbackCheckpointId: "cp_1",
+      rollbackAvailable: true,
+    };
+    const hidden = render(
+      <ThreadViewport messages={[message]} loading={false} sessionId="s" />
+    );
+    expect(hidden.queryByRole("button", { name: "回退到此消息发送前" })).toBeNull();
+    hidden.unmount();
+
+    const disabled = render(
+      <ThreadViewport
+        messages={[message]}
+        loading={false}
+        sessionId="s"
+        rollbackEnabled
+        rollingBack
+      />
+    );
+    expect(disabled.getByRole("button", { name: "回退到此消息发送前" }))
+      .toHaveProperty("disabled", true);
   });
 });

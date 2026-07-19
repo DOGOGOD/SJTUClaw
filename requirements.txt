@@ -1,5 +1,8 @@
-# Reproducible application environment. Keep this list aligned with
-# pyproject.toml; packaging metadata intentionally retains compatible ranges.
+# Reproducible development, desktop, and packaging environment.
+# Core runtime pins stay within the compatible ranges declared in
+# pyproject.toml; optional desktop/build/test tools are pinned below.
+
+# Core runtime
 openai==2.45.0
 python-dotenv==1.1.0
 fastapi==0.121.1
@@ -15,3 +18,10 @@ httpx==0.28.1
 qrcode==8.2
 cryptography==44.0.1
 tzlocal==5.3.1
+
+# Windows desktop launcher and packaging
+pywebview==6.2.1
+pyinstaller==6.21.0
+
+# Backend test runner
+pytest==9.1.1

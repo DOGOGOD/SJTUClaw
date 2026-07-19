@@ -120,6 +120,8 @@ import threading
 
 import time
 
+import uuid
+
 
 from datetime import datetime, timezone
 
@@ -324,7 +326,7 @@ def _is_outside_workspace(tool_name: str, args: dict) -> bool:
 
 
 
-def run_agent_turn(
+def _run_agent_turn_unlocked(
 
 
     session_id: str,
@@ -379,6 +381,10 @@ def run_agent_turn(
 
 
     input_event: str | None = None,
+
+    _rollback_message_id: str | None = None,
+
+    _rollback_checkpoint_id: str | None = None,
 
 
 ) -> str:
@@ -739,7 +745,13 @@ def run_agent_turn(
         )
 
 
-        session.append_message("user", injected, injected_event=input_event)
+        session.append_message(
+            "user",
+            injected,
+            injected_event=input_event,
+            message_id=_rollback_message_id or f"msg_{uuid.uuid4().hex}",
+            rollback_checkpoint_id=_rollback_checkpoint_id,
+        )
 
 
         _record_skill_usage(
@@ -754,7 +766,13 @@ def run_agent_turn(
     else:
 
 
-        session.append_message("user", user_message, injected_event=input_event)
+        session.append_message(
+            "user",
+            user_message,
+            injected_event=input_event,
+            message_id=_rollback_message_id or f"msg_{uuid.uuid4().hex}",
+            rollback_checkpoint_id=_rollback_checkpoint_id,
+        )
 
 
 
@@ -1651,6 +1669,43 @@ def run_agent_turn(
 
 
 # ---------------------------------------------------------------------------
+
+
+def run_agent_turn(
+    session_id: str,
+    user_message: str,
+    *,
+    rollback_manager=None,
+    **kwargs,
+) -> str:
+    """Run a turn, capturing a workspace checkpoint before user input.
+
+    The workspace lock spans the complete turn so shell changes from sessions
+    sharing one workspace cannot interleave with a checkpoint or restore.
+    """
+    if rollback_manager is None:
+        return _run_agent_turn_unlocked(session_id, user_message, **kwargs)
+
+    session_store = kwargs.get("session_store")
+    if session_store is None:
+        raise TypeError("session_store is required")
+    with rollback_manager.turn_guard(session_id):
+        session = session_store.get(session_id)
+        message_id = f"msg_{uuid.uuid4().hex}"
+        checkpoint_id = rollback_manager.create_turn_checkpoint(
+            session_id,
+            session,
+            message_id=message_id,
+            message_preview=user_message,
+            partial=bool(kwargs.get("unlimited_mode", False)),
+        )
+        return _run_agent_turn_unlocked(
+            session_id,
+            user_message,
+            _rollback_message_id=message_id,
+            _rollback_checkpoint_id=checkpoint_id,
+            **kwargs,
+        )
 
 
 # Skill selection handler

@@ -57,15 +57,22 @@ from claw.config import (
 from claw.context.builder import ContextBuilder
 from claw.context.compaction_worker import CompactionWorker
 from claw.llm.client import LLMClient, LLMError
-from claw.memory.store import MemoryStore
+from claw.memory.store import MemoryStore, MemoryStoreError
 from claw.prompts import load_soul, load_system_prompt
 from claw.session.store import SessionStore, SessionStoreError
 from claw.session.title import auto_title_if_first_turn
 from claw.skills.registry import SkillRegistry
+from claw.skills.management import (
+    MAX_PACKAGE_BYTES,
+    SkillPackageError,
+    install_skill_package_bytes,
+    remove_skill_completely,
+)
 from claw.tools.base import ToolRegistry
 from claw.tools import register_all_tools
 from claw.tools.download import get_download, list_downloads
 from claw.workspace.manager import WorkspaceManager, WorkspaceError
+from claw.workspace.rollback import WorkspaceRollbackManager, RollbackError
 from claw.scheduler.service import CronService
 from claw.scheduler.session_turns import visible_session_messages
 from claw.scheduler.callbacks import (
@@ -156,6 +163,16 @@ _session_store = SessionStore(SESSIONS_DIR)
 _memory_store = MemoryStore(MEMORY_DIR)
 _compact_cfg = load_compaction_config()
 _workspace_manager = WorkspaceManager()
+_rollback_manager = WorkspaceRollbackManager(_workspace_manager, _session_store)
+
+
+def _visible_messages(session) -> list[dict]:
+    return visible_session_messages(
+        session,
+        rollback_checkpoint_ids=_rollback_manager.active_turn_checkpoint_ids(
+            session.session_id
+        ),
+    )
 
 _context_builder = ContextBuilder(
     _system_prompt,
@@ -566,6 +583,11 @@ def _cancel_all_active_turns() -> int:
             e.set()
     return count
 
+
+def _session_turn_active(session_id: str) -> bool:
+    with _active_turns_lock:
+        return session_id in _active_turns
+
 # QQ channel instance (started in lifespan if QQ_ENABLED=true)
 _qq_channel: QQChannel | None = None
 _qq_task: asyncio.Task | None = None
@@ -795,6 +817,7 @@ async def _qq_message_handler(
                 auto_mode=_auto_mode.get(session_key, False),
                 unlimited_mode=_workspace_manager.is_unlimited(session_key),
                 cancel_event=cancel_event,
+                rollback_manager=_rollback_manager,
             )
         finally:
             _set_turn_session_id(None)
@@ -999,7 +1022,7 @@ async def handle_chat(req: ChatRequest):
     if _is_slash_command(command):
         result_text = _execute_slash_command(command, sid)
         session = _session_store.get(sid)
-        messages = visible_session_messages(session)
+        messages = _visible_messages(session)
         messages.extend([
             {"role": "user", "content": command, "_command": True},
             {"role": "assistant", "content": result_text, "_command": True},
@@ -1022,7 +1045,7 @@ async def handle_chat(req: ChatRequest):
             session.append_message("user", req.message)
             session.append_message("assistant", reply)
             _session_store.save(session)
-            messages = visible_session_messages(session)
+            messages = _visible_messages(session)
             title = session.title
         except Exception:
             messages = [
@@ -1071,6 +1094,7 @@ async def handle_chat(req: ChatRequest):
                     unlimited_mode=_workspace_manager.is_unlimited(sid),
                     event_callback=lambda event: _pet_state.handle_event(sid, event),
                     cancel_event=cancel_event,
+                    rollback_manager=_rollback_manager,
                 )
             except Exception:
                 _pet_state.finish_turn(sid, failed=True)
@@ -1102,7 +1126,7 @@ async def handle_chat(req: ChatRequest):
     messages: list[dict[str, Any]] = []
     try:
         session = _session_store.get(sid)
-        messages = visible_session_messages(session)
+        messages = _visible_messages(session)
     except Exception as exc:
         print(f"[gateway] 获取 session 消息失败: {exc}")
 
@@ -1179,7 +1203,12 @@ def _is_slash_command(text: str) -> bool:
     return is_command(text)
 
 
-def _execute_slash_command(command: str, session_id: str) -> str:
+def _execute_slash_command(
+    command: str,
+    session_id: str,
+    *,
+    state_out: dict[str, str] | None = None,
+) -> str:
     """Execute a slash command via the shared CLI command handler.
 
     Constructs a RuntimeState from the module-level globals and delegates
@@ -1189,6 +1218,9 @@ def _execute_slash_command(command: str, session_id: str) -> str:
     from claw.cli.commands import RuntimeState, handle_command
 
     sid = session_id or "default"
+    root = command.strip().split(maxsplit=1)[0].lower() if command.strip() else ""
+    if root == "/workspace" and _session_turn_active(sid):
+        return "[错误] 当前任务正在运行，请先停止任务后再修改 workspace。"
 
     def _stop_impl() -> str:
         found = _cancel_active_turn(sid)
@@ -1211,15 +1243,20 @@ def _execute_slash_command(command: str, session_id: str) -> str:
         current_session_id=sid,
         workspace_manager=_workspace_manager,
         approval_manager=_approval_manager,
+        tool_registry=_tool_registry,
+        skill_registry=_skill_registry,
         reflection_manager=_reflection_mgr,
         cron_service=_cron_service,
         pet_catalog=_pet_catalog,
         pet_process=_pet_process,
+        rollback_manager=_rollback_manager,
         auto_mode=_auto_mode.get(sid, False),
         stop_handler=_stop_impl,
         exit_handler=_exit_impl,
     )
     result = handle_command(command, state, markdown=True)
+    if state_out is not None:
+        state_out["current_session_id"] = state.current_session_id
     if state.auto_mode:
         _auto_mode[sid] = True
     else:
@@ -1244,23 +1281,37 @@ class CommandRequest(BaseModel):
 @app.post("/command")
 def handle_command(req: CommandRequest):
     """Execute a CLI-style command and return the result."""
-    result_text = _execute_slash_command(req.command, req.session_id or "default")
+    root, *args = req.command.split()
+    command_state: dict[str, str] = {}
+    result_text = _execute_slash_command(
+        req.command,
+        req.session_id or "default",
+        state_out=command_state,
+    )
 
     # Determine actions for WebUI
-    root, *args = req.command.split()
     actions: list[str] = []
     switch_to: str | None = None
     sid = req.session_id or "default"
 
     if root == "/session" and args and args[0] == "new":
         actions = ["reload_sessions", "switch_session"]
-        session = _session_store.list_summaries()
-        if session:
-            switch_to = session[0].session_id
+        switch_to = command_state.get("current_session_id")
+    elif root == "/session" and args and args[0] == "switch":
+        actions = ["reload_sessions"]
+        if len(args) > 1 and _session_store.exists(args[1]):
+            actions.append("switch_session")
+            switch_to = command_state.get("current_session_id")
     elif root == "/session" and args and args[0] in ("list", "rename", "delete"):
         actions = ["reload_sessions"]
-    elif root in ("/workspace", "/cron"):
+        if args[0] == "delete" and len(args) > 1 and args[1] == sid:
+            actions.append("clear_session")
+    elif root == "/workspace":
+        actions = ["reload_sessions", "reload_rollback_status"]
+    elif root == "/cron":
         actions = ["reload_sessions"]
+    elif root == "/rollback":
+        actions = ["reload_messages", "reload_sessions", "reload_rollback_status"]
     elif root == "/pet" and (not args or args[0] in ("settings", "config")):
         actions = ["open_pet_settings"]
     elif root == "/exit":
@@ -1268,7 +1319,9 @@ def handle_command(req: CommandRequest):
     elif root == "/auto":
         actions = ["reload_auto_mode"]
     elif root == "/compact":
-        actions = ["reload_messages"]
+        # Compaction preserves the raw visible transcript, so reloading it
+        # only erases the ephemeral command result in the WebUI.
+        actions = []
     elif root == "/unlimited":
         actions = ["reload_unlimited_mode"]
 
@@ -1327,10 +1380,11 @@ def get_messages(session_id: str):
     return {
         "ok": True,
         "sessionId": session_id,
-        "messages": visible_session_messages(session),
+        "messages": _visible_messages(session),
         "summary": session.summary,
         "autoMode": _auto_mode.get(session_id, False),
         "unlimitedMode": _workspace_manager.is_unlimited(session_id),
+        "rollback": _rollback_manager.status(session_id),
     }
 
 
@@ -1539,6 +1593,7 @@ def get_workspace(session_id: str = Query(..., alias="sessionId")):
         "sessionId": session_id,
         "workspace": str(ws) if ws else None,
         "isSet": ws is not None,
+        "rollback": _rollback_manager.status(session_id),
     }
 
 
@@ -1555,22 +1610,112 @@ def set_workspace(req: SetWorkspaceRequest):
             raw_path = raw_path[1:]
     if not raw_path:
         raise HTTPException(status_code=400, detail="workspace 路径不能为空")
+    if _session_turn_active(req.session_id):
+        raise HTTPException(status_code=409, detail="当前任务正在运行，请先停止任务。")
+    get_workspace = getattr(_workspace_manager, "get", None)
+    previous = get_workspace(req.session_id) if callable(get_workspace) else None
     try:
-        resolved = _workspace_manager.set(req.session_id, raw_path)
-    except (WorkspaceError, OSError) as exc:
+        with _rollback_manager.session_guard(req.session_id):
+            resolved = _workspace_manager.set(req.session_id, raw_path)
+            rollback_status = (
+                _rollback_manager.enable(req.session_id, _session_store.get(req.session_id))
+                if _session_store.exists(req.session_id)
+                else _rollback_manager.status(req.session_id)
+            )
+    except (WorkspaceError, RollbackError, OSError) as exc:
+        try:
+            if previous is None:
+                _workspace_manager.unset(req.session_id)
+            else:
+                _workspace_manager.set(req.session_id, str(previous))
+        except (WorkspaceError, OSError):
+            pass
         raise HTTPException(status_code=400, detail=str(exc))
     return {
         "ok": True,
         "sessionId": req.session_id,
         "workspace": str(resolved),
+        "rollback": rollback_status,
     }
 
 
 @app.delete("/workspace")
 def unset_workspace(session_id: str = Query(..., alias="sessionId")):
     """Remove the workspace binding for a session."""
-    _workspace_manager.unset(session_id)
+    if _session_turn_active(session_id):
+        raise HTTPException(status_code=409, detail="当前任务正在运行，请先停止任务。")
+    with _rollback_manager.session_guard(session_id):
+        _rollback_manager.disable(session_id)
+        _workspace_manager.unset(session_id)
     return {"ok": True, "sessionId": session_id}
+
+
+class RollbackRequest(BaseModel):
+    checkpoint_id: str | None = Field(default=None, alias="checkpointId")
+    steps: int | None = Field(default=None, ge=1)
+
+
+def _rollback_target(req: RollbackRequest | None) -> str | int | None:
+    if req is None:
+        return None
+    return req.checkpoint_id or req.steps
+
+
+@app.get("/sessions/{session_id}/rollback")
+def get_rollback_status(session_id: str):
+    if not _session_store.exists(session_id):
+        raise HTTPException(status_code=404, detail=f"Session 不存在: {session_id}")
+    return {
+        "ok": True,
+        "sessionId": session_id,
+        "rollback": _rollback_manager.status(session_id),
+        "checkpoints": _rollback_manager.list_checkpoints(session_id),
+    }
+
+
+@app.post("/sessions/{session_id}/rollback/preview")
+def preview_rollback(session_id: str, req: RollbackRequest | None = None):
+    if _session_turn_active(session_id):
+        raise HTTPException(status_code=409, detail="当前任务正在运行，请先停止任务。")
+    try:
+        preview = _rollback_manager.preview(session_id, _rollback_target(req))
+    except RollbackError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"ok": True, "sessionId": session_id, "preview": preview.to_dict()}
+
+
+@app.post("/sessions/{session_id}/rollback")
+def apply_rollback(session_id: str, req: RollbackRequest | None = None):
+    if _session_turn_active(session_id):
+        raise HTTPException(status_code=409, detail="当前任务正在运行，请先停止任务。")
+    try:
+        result = _rollback_manager.rollback(session_id, _rollback_target(req))
+    except RollbackError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {
+        "ok": True,
+        "sessionId": session_id,
+        "messages": _visible_messages(_session_store.get(session_id)),
+        "result": result,
+        "rollback": _rollback_manager.status(session_id),
+    }
+
+
+@app.post("/sessions/{session_id}/rollback/undo")
+def undo_rollback(session_id: str):
+    if _session_turn_active(session_id):
+        raise HTTPException(status_code=409, detail="当前任务正在运行，请先停止任务。")
+    try:
+        result = _rollback_manager.undo(session_id)
+    except RollbackError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {
+        "ok": True,
+        "sessionId": session_id,
+        "messages": _visible_messages(_session_store.get(session_id)),
+        "result": result,
+        "rollback": _rollback_manager.status(session_id),
+    }
 
 
 # -- Approval ----------------------------------------------------------------
@@ -1831,6 +1976,45 @@ def list_skills():
     }
 
 
+@app.post("/skills/upload")
+async def upload_skill_package(
+    file: UploadFile = File(...),
+    replace: bool = Query(False),
+):
+    """Validate, install, and hot-load a Skill package."""
+    filename = file.filename or "skill-package"
+    try:
+        data = await file.read(MAX_PACKAGE_BYTES + 1)
+        if len(data) > MAX_PACKAGE_BYTES:
+            raise SkillPackageError("上传包超过 20 MiB 限制")
+        installed = install_skill_package_bytes(data, filename, replace=replace)
+        _skill_registry.rescan()
+    except SkillPackageError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    finally:
+        await file.close()
+    return {
+        "ok": True,
+        "skill": installed,
+        "message": f"Skill '{installed['name']}' 已安装",
+    }
+
+
+@app.delete("/skills/{name}")
+def delete_skill(name: str):
+    """Remove a Skill and refresh the shared runtime registry."""
+    try:
+        removed = remove_skill_completely(name)
+        _skill_registry.rescan()
+    except SkillPackageError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {
+        "ok": True,
+        "removed": removed,
+        "message": removed["message"],
+    }
+
+
 @app.get("/skills/{name}")
 def get_skill_detail(name: str):
     """Get full details for a single skill."""
@@ -1901,10 +2085,15 @@ def rename_session(session_id: str, req: RenameSessionRequest):
 def delete_session(session_id: str):
     if not _session_store.exists(session_id):
         raise HTTPException(status_code=404, detail=f"Session 不存在: {session_id}")
-    _session_store.delete(session_id)
-    # Clean up workspace binding and unlimited mode
-    _workspace_manager.unset(session_id)
-    _workspace_manager.set_unlimited(session_id, False)
+    if _session_turn_active(session_id):
+        raise HTTPException(status_code=409, detail="当前任务正在运行，请先停止任务。")
+    with _rollback_manager.session_guard(session_id):
+        # Clean up rollback data and bindings before removing the authoritative
+        # session object; this avoids leaving unreachable checkpoint storage.
+        _rollback_manager.disable(session_id)
+        _workspace_manager.unset(session_id)
+        _workspace_manager.set_unlimited(session_id, False)
+        _session_store.delete(session_id)
     # Clean up attachments directory
     att_dir = _attachments_dir(session_id)
     if att_dir.exists():
@@ -1979,13 +2168,16 @@ class AddMemoryRequest(BaseModel):
 
 @app.post("/memories")
 def add_memory(req: AddMemoryRequest):
-    entry = _memory_store.add(
-        content=req.content,
-        category=req.category,
-        tags=req.tags,
-        importance=req.importance,
-        source_session_id=req.source_session_id,
-    )
+    try:
+        entry = _memory_store.add(
+            content=req.content,
+            category=req.category,
+            tags=req.tags,
+            importance=req.importance,
+            source_session_id=req.source_session_id,
+        )
+    except MemoryStoreError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {
         "ok": True,
         "id": entry.memory_id,
@@ -2774,6 +2966,7 @@ async def handle_chat_stream(req: ChatRequest):
                 unlimited_mode=_workspace_manager.is_unlimited(sid),
                 event_callback=_event_callback,
                 cancel_event=cancel_event,
+                rollback_manager=_rollback_manager,
             )
             # The FinalEvent is emitted inside run_agent_turn, but we
             # also send a session_id + autoMode info event

@@ -5,7 +5,7 @@ import remarkGfm from "remark-gfm";
 import remarkBreaks from "remark-breaks";
 import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
-import { Check, Copy } from "lucide-react";
+import { Check, Copy, Undo2 } from "lucide-react";
 import { BrandAvatar } from "@/components/BrandAvatar";
 import { PetSprite } from "@/components/PetSprite";
 import { cn } from "@/lib/utils";
@@ -47,6 +47,9 @@ interface ThreadViewportProps {
   messages: ChatMessage[];
   loading: boolean;
   sessionId: string | null;
+  rollbackEnabled?: boolean;
+  rollingBack?: boolean;
+  onRollback?: (checkpointId: string) => Promise<void>;
 }
 
 function markdownUrlTransform(url: string, key: string): string {
@@ -522,6 +525,9 @@ const MessageBubble = memo(function MessageBubble({
   userAvatarImage,
   onUserAvatarChange,
   onUserAvatarImageChange,
+  rollbackEnabled,
+  rollingBack,
+  onRollback,
 }: {
   message: ChatMessage;
   sessionId: string | null;
@@ -530,6 +536,9 @@ const MessageBubble = memo(function MessageBubble({
   userAvatarImage: string;
   onUserAvatarChange: (avatarId: UserAvatarSelection) => void;
   onUserAvatarImageChange: (dataUrl: string) => void;
+  rollbackEnabled: boolean;
+  rollingBack: boolean;
+  onRollback?: (checkpointId: string) => Promise<void>;
 }) {
   // Tool call result messages display as enhanced cards
   if (message.role === "tool") {
@@ -612,6 +621,7 @@ const MessageBubble = memo(function MessageBubble({
         )}
       >
         {isUser ? (
+          <>
           <div className="flex min-h-10 items-center rounded-2xl rounded-br-md border border-border/50 bg-secondary/75 px-4 py-2.5 text-[14px] leading-relaxed text-foreground/90 shadow-sm">
             <div className="user-message-content prose prose-sm dark:prose-invert max-w-none prose-p:leading-relaxed">
               <ReactMarkdown
@@ -650,6 +660,20 @@ const MessageBubble = memo(function MessageBubble({
               </ReactMarkdown>
             </div>
           </div>
+          {rollbackEnabled && message.rollbackAvailable && message.rollbackCheckpointId && !message.command && (
+            <button
+              type="button"
+              onClick={() => onRollback?.(message.rollbackCheckpointId!)}
+              disabled={rollingBack}
+              className="mt-1.5 inline-flex items-center gap-1 rounded-md px-1.5 py-1 text-[11px] text-muted-foreground/60 opacity-60 transition hover:bg-secondary hover:text-foreground hover:opacity-100 disabled:cursor-not-allowed disabled:opacity-35"
+              title="回退到此消息发送前"
+              aria-label="回退到此消息发送前"
+            >
+              <Undo2 className="h-3.5 w-3.5" />
+              <span>回退</span>
+            </button>
+          )}
+          </>
         ) : (
           <div className={cn(
             "w-full pt-0.5 text-[14px] leading-relaxed text-foreground/90",
@@ -706,7 +730,7 @@ const MessageBubble = memo(function MessageBubble({
   );
 });
 
-export function ThreadViewport({ messages, loading, sessionId }: ThreadViewportProps) {
+export function ThreadViewport({ messages, loading, sessionId, rollbackEnabled = false, rollingBack = false, onRollback }: ThreadViewportProps) {
   const [userAvatarId, setUserAvatarId] = useState<UserAvatarSelection>(loadUserAvatar);
   const [userAvatarImage, setUserAvatarImage] = useState(loadUserAvatarImage);
 
@@ -820,6 +844,9 @@ export function ThreadViewport({ messages, loading, sessionId }: ThreadViewportP
           userAvatarImage={userAvatarImage}
           onUserAvatarChange={handleUserAvatarChange}
           onUserAvatarImageChange={handleUserAvatarImageChange}
+          rollbackEnabled={rollbackEnabled}
+          rollingBack={rollingBack}
+          onRollback={onRollback}
         />
       ))}
     </div>

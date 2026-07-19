@@ -4,6 +4,7 @@ import io
 import zipfile
 
 import pytest
+from fastapi.testclient import TestClient
 
 
 def _zip_bytes(files: dict[str, str | bytes]) -> bytes:
@@ -102,3 +103,56 @@ def test_replace_existing_categorized_skill_removes_old_location(tmp_path, monke
     assert installed["name"] == "demo-skill"
     assert not categorized.exists()
     assert (tmp_path / "skills" / "demo-skill" / "SKILL.md").is_file()
+
+
+def test_gateway_skill_upload_list_command_and_delete(tmp_path, monkeypatch):
+    import claw.gateway.server as gateway
+    from claw.session.store import SessionStore
+    from claw.skills import management
+    from claw.skills.registry import SkillRegistry
+
+    skills_dir = tmp_path / "skills"
+    monkeypatch.setattr(management, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(management, "SKILLS_DIR", skills_dir)
+    monkeypatch.setattr(gateway, "_skill_registry", SkillRegistry(skills_dir))
+    sessions = SessionStore(tmp_path / "sessions")
+    sessions.create_session(session_id="skill-api")
+    monkeypatch.setattr(gateway, "_session_store", sessions)
+
+    package = _zip_bytes({"demo-skill/SKILL.md": _skill_md()})
+    client = TestClient(gateway.app)
+    uploaded = client.post(
+        "/skills/upload",
+        params={"replace": "false"},
+        files={"file": ("demo.zip", package, "application/zip")},
+    )
+    assert uploaded.status_code == 200, uploaded.text
+    assert uploaded.json()["skill"]["name"] == "demo-skill"
+
+    listed = client.get("/skills").json()
+    assert [skill["name"] for skill in listed["skills"]] == ["demo-skill"]
+
+    command = client.post(
+        "/command",
+        json={"sessionId": "skill-api", "command": "/skill list"},
+    )
+    assert command.status_code == 200
+    assert "demo-skill" in command.json()["result"]
+    assert "未初始化" not in command.json()["result"]
+
+    deleted = client.delete("/skills/demo-skill")
+    assert deleted.status_code == 200, deleted.text
+    assert client.get("/skills").json()["skills"] == []
+
+
+def test_gateway_rejects_invalid_memory_category_as_client_error(tmp_path, monkeypatch):
+    import claw.gateway.server as gateway
+    from claw.memory.store import MemoryStore
+
+    monkeypatch.setattr(gateway, "_memory_store", MemoryStore(tmp_path / "memory"))
+    response = TestClient(gateway.app).post(
+        "/memories",
+        json={"content": "test", "category": "invalid-category"},
+    )
+    assert response.status_code == 400
+    assert "无效的记忆类别" in response.json()["detail"]

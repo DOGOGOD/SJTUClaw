@@ -45,5 +45,6 @@ CLAW_TIMEZONE=Asia/Shanghai
 
 - 不要提交 `.env` 或真实 API Key。
 - 为会话设置 workspace 后再执行文件写入和 Shell 操作。
+- 设置 workspace 会自动启用逐回合回退；快照默认存放在 `data/workspace/rollback/`，不要手动编辑其中的 SQLite 数据库或对象文件。
 - 非本机监听 Gateway 时设置 `GATEWAY_API_TOKEN`。
 - QQ Bot 凭证和允许来源应按需配置。

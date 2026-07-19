@@ -70,12 +70,13 @@ class CompactionWorker:
             self._running = True
 
             # Take a snapshot under the lock
-            snapshot_messages = list(session.messages)
+            snapshot_messages = list(session.get_unconsolidated_messages())
             snapshot_summary = session.summary
+            snapshot_revision = session.revision
 
         self._thread = threading.Thread(
             target=self._run,
-            args=(session, snapshot_messages, snapshot_summary),
+            args=(session, snapshot_messages, snapshot_summary, snapshot_revision),
             daemon=True,
         )
         self._thread.start()
@@ -132,9 +133,10 @@ class CompactionWorker:
         session: Session,
         snapshot_messages: list,
         snapshot_summary: str,
+        snapshot_revision: int,
     ) -> None:
         try:
-            self._do_compact(session, snapshot_messages, snapshot_summary)
+            self._do_compact(session, snapshot_messages, snapshot_summary, snapshot_revision)
         except Exception:
             traceback.print_exc()
         finally:
@@ -147,6 +149,7 @@ class CompactionWorker:
         session: Session,
         snapshot_messages: list,
         snapshot_summary: str,
+        snapshot_revision: int,
     ) -> None:
         from claw.context.compaction import (
             CompactionError,
@@ -178,6 +181,12 @@ class CompactionWorker:
 
         # Apply result to the live session (brief lock)
         with self._lock:
+            # A user turn or rollback changed the session while the LLM was
+            # producing this summary.  Applying it would resurrect context
+            # from the wrong history branch, so discard it.
+            if session.revision != snapshot_revision:
+                print("[compaction] session 已变化，丢弃过期的后台压缩结果")
+                return
             apply_compaction_result(session, result)
 
         # Persist

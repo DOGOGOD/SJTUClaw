@@ -14,6 +14,7 @@ import argparse
 import sys
 
 from claw.config import ENV_EXAMPLE_PATH, ENV_PATH, PROJECT_ROOT
+from claw.utils import force_utf8_stdio
 
 
 _PROJECT_ROOT = PROJECT_ROOT
@@ -280,6 +281,7 @@ def _cmd_chat() -> int:
 
 
 def main() -> int:
+    force_utf8_stdio()
     parser = argparse.ArgumentParser(
         prog="sjtuclaw",
         description="SJTUClaw — AI Agent with QQ Bot support",

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import uuid
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -55,6 +56,12 @@ class Message:
     role: str          # "user" | "assistant" | "tool" | "system"
     content: str
 
+    # Stable identifiers are required by workspace checkpoints.  They are
+    # deliberately independent from list indexes because compaction and tool
+    # messages can change the materialized message layout.
+    message_id: str = field(default_factory=lambda: f"msg_{uuid.uuid4().hex}")
+    rollback_checkpoint_id: str | None = None
+
     # -- Native function-calling fields (optional) --
     tool_calls: list[dict] | None = None     # assistant: tool call requests
     tool_call_id: str | None = None           # tool: result identifier
@@ -71,6 +78,10 @@ class Message:
     def to_dict(self) -> dict:
         """Full serialization dict (used for API responses, not disk storage)."""
         d: dict = {"role": self.role, "content": self.content}
+        if self.rollback_checkpoint_id:
+            d["messageId"] = self.message_id
+            d["rollbackCheckpointId"] = self.rollback_checkpoint_id
+            d["rollbackAvailable"] = True
         if self.tool_calls:
             d["tool_calls"] = self.tool_calls
         if self.tool_call_id:
@@ -89,7 +100,10 @@ class Message:
             "role": self.role,
             "content": self.content,
             "timestamp": self.timestamp,
+            "message_id": self.message_id,
         }
+        if self.rollback_checkpoint_id:
+            d["rollback_checkpoint_id"] = self.rollback_checkpoint_id
         if self.tool_calls:
             d["tool_calls"] = self.tool_calls
         if self.tool_call_id:
@@ -115,11 +129,16 @@ class Message:
         return cls(
             role=role,
             content=content,
+            message_id=str(data.get("message_id") or f"msg_{uuid.uuid4().hex}"),
+            rollback_checkpoint_id=(
+                str(data["rollback_checkpoint_id"])
+                if data.get("rollback_checkpoint_id") else None
+            ),
             tool_calls=data.get("tool_calls"),
             tool_call_id=data.get("tool_call_id"),
             name=data.get("name"),
             timestamp=str(data.get("timestamp", _now_iso())),
-            _command=bool(data.get("_command", False)),
+            _command=bool(data.get("_command", data.get("command", False))),
             media=data.get("media"),
             injected_event=data.get("injected_event"),
             subagent_task_id=data.get("subagent_task_id"),
@@ -139,12 +158,24 @@ class Message:
         return cls(
             role=role,
             content=content,
+            message_id=str(
+                data.get("messageId") or data.get("message_id")
+                or f"msg_{uuid.uuid4().hex}"
+            ),
+            rollback_checkpoint_id=(
+                str(data.get("rollbackCheckpointId") or data.get("rollback_checkpoint_id"))
+                if data.get("rollbackCheckpointId") or data.get("rollback_checkpoint_id")
+                else None
+            ),
             tool_calls=data.get("tool_calls"),
             tool_call_id=data.get("tool_call_id"),
             name=data.get("name"),
             timestamp=str(data.get("timestamp", _now_iso())),
-            _command=bool(data.get("_command", False)),
+            _command=bool(data.get("_command", data.get("command", False))),
             media=data.get("media"),
+            injected_event=data.get("injected_event"),
+            subagent_task_id=data.get("subagent_task_id"),
+            latency_ms=data.get("latency_ms"),
         )
 
 
@@ -171,6 +202,7 @@ class Session:
     created_at: str = field(default_factory=_now_iso)
     updated_at: str = field(default_factory=_now_iso)
     last_consolidated: int = 0
+    revision: int = 0
     metadata: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -183,14 +215,16 @@ class Session:
 
     # -- Mutation ---------------------------------------------------------
 
-    def append_message(self, role: str, content: str, **kwargs) -> None:
+    def append_message(self, role: str, content: str, **kwargs) -> Message:
         """Add a message with optional extra fields."""
         msg = Message(role=role, content=content, **kwargs)
         self.messages.append(msg)
         self.touch()
+        return msg
 
     def touch(self) -> None:
         self.updated_at = _now_iso()
+        self.revision += 1
 
     def clear(self) -> None:
         """Reset session to initial state."""
@@ -413,8 +447,15 @@ class Session:
             "createdAt": self.created_at,
             "updatedAt": self.updated_at,
             "lastConsolidated": self.last_consolidated,
+            "revision": self.revision,
             "metadata": self.metadata,
         }
+
+    def to_snapshot_dict(self) -> dict:
+        """Lossless internal snapshot, independent from the public API shape."""
+        snapshot = self.to_dict()
+        snapshot["messages"] = [message.to_jsonl_dict() for message in self.messages]
+        return snapshot
 
     @classmethod
     def from_dict(cls, data: dict) -> "Session":
@@ -436,6 +477,7 @@ class Session:
         updated_at = str(data.get("updatedAt") or created_at)
         skill_usage_raw = data.get("skillUsage") or []
         last_consolidated = int(data.get("lastConsolidated", 0))
+        revision = int(data.get("revision", 0))
         metadata = dict(data.get("metadata") or {})
 
         messages = [Message.from_dict(item) for item in raw_messages]
@@ -448,6 +490,7 @@ class Session:
             created_at=created_at,
             updated_at=updated_at,
             last_consolidated=last_consolidated,
+            revision=revision,
             metadata=metadata,
         )
 

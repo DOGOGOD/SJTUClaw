@@ -351,17 +351,13 @@ def apply_compaction_result(session: Session, result: CompactionResult) -> None:
 
     Only call this after `compact_session` has returned successfully.
 
-    The old-message slice is identified by count: the first
-    ``result.old_message_count`` unconsolidated messages are removed
-    and their count absorbed into ``last_consolidated``.
+    The raw transcript is immutable for rollback.  Compaction advances the
+    context projection boundary instead of deleting the covered messages.
     """
-    lc = session.last_consolidated
-    # Remove old_message_count messages from the unconsolidated prefix
-    session.messages = (
-        session.messages[:lc]
-        + session.messages[lc + result.old_message_count:]
+    session.last_consolidated = min(
+        len(session.messages),
+        session.last_consolidated + result.old_message_count,
     )
-    session.last_consolidated = lc  # stays same; summary replaces the old prefix
     session.summary = result.summary
     session.touch()
 
@@ -461,16 +457,9 @@ def maybe_consolidate_by_tokens(
             _raw_archive(chunk, session.session_id)
             summary = None
 
-        # Advance: remove the chunk from the working list.
-        # end_idx is relative to the unconsolidated slice, so we must
-        # map it back to the full session.messages list.
-        base = session.last_consolidated
-        session.messages = (
-            session.messages[:base]
-            + session.messages[base + end_idx:]
-        )
-        # last_consolidated stays at `base` — the consolidated prefix
-        # is unchanged; the removed chunk is now covered by the summary.
+        # Advance only the context projection boundary.  Raw messages remain
+        # available to checkpoint restore and audit.
+        session.last_consolidated += end_idx
         if summary and summary != "(nothing)":
             session.summary = _merge_summaries(session.summary, summary)
             last_summary = summary
@@ -538,11 +527,8 @@ def compact_idle_session(
         _raw_archive(messages_to_remove, session_key)
         summary = None
 
-    # Apply the truncation
-    session.messages = (
-        session.messages[:session.last_consolidated]
-        + messages_to_keep
-    )
+    # Preserve the raw transcript and advance the compacted prefix boundary.
+    session.last_consolidated += len(messages_to_remove)
     if summary and summary != "(nothing)":
         session.summary = _merge_summaries(session.summary, summary)
         session.metadata["_last_summary"] = {
@@ -550,7 +536,6 @@ def compact_idle_session(
             "last_active": last_active,
         }
 
-    session.last_consolidated = 0
     session.touch()
 
     try:

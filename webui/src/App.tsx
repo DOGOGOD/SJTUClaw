@@ -8,7 +8,8 @@ import { ThemeProvider, useTheme } from "@/hooks/useTheme";
 import { useSessions } from "@/hooks/useSessions";
 import { cn } from "@/lib/utils";
 import { isSlashCommand } from "@/lib/commands";
-import { fetchMessages, sendMessage, sendCommand, stopChat, uploadAttachment, renameSession, fetchApprovals, approveApproval, rejectApproval } from "@/lib/api";
+import { messagesAfterCommandRefresh, resolveCommandNavigation } from "@/lib/commandState";
+import { fetchMessages, sendMessage, sendCommand, stopChat, uploadAttachment, renameSession, fetchApprovals, approveApproval, rejectApproval, previewRollback, applyRollback } from "@/lib/api";
 import type { ApprovalInfo } from "@/lib/types";
 import type { ChatMessage, SettingsSection, ShellView } from "@/lib/types";
 
@@ -33,6 +34,9 @@ function Shell() {
   const [pendingApproval, setPendingApproval] = useState<ApprovalInfo | null>(null);
   const [autoMode, setAutoMode] = useState(false);
   const [unlimitedMode, setUnlimitedMode] = useState(false);
+  const [rollbackEnabled, setRollbackEnabled] = useState(false);
+  const [rollingBack, setRollingBack] = useState(false);
+  const [workspaceRefreshToken, setWorkspaceRefreshToken] = useState(0);
   const freshlyCreatedSessionRef = useRef<string | null>(null);
 
   useEffect(() => {
@@ -50,6 +54,7 @@ function Shell() {
       // user opens a new-chat draft; the new session starts with both off.
       setAutoMode(false);
       setUnlimitedMode(false);
+      setRollbackEnabled(false);
       return;
     }
     if (freshlyCreatedSessionRef.current === activeSessionId) {
@@ -66,6 +71,7 @@ function Shell() {
           setMessages(d.messages || []);
           if (d.autoMode !== undefined) setAutoMode(!!d.autoMode);
           if (d.unlimitedMode !== undefined) setUnlimitedMode(!!d.unlimitedMode);
+          setRollbackEnabled(!!d.rollback?.enabled);
         } else {
           setMessages([]);
         }
@@ -90,6 +96,7 @@ function Shell() {
         const d = await fetchMessages(activeSessionId);
         if (cancelled) return;
         if (d.ok && d.messages) {
+          setRollbackEnabled(!!d.rollback?.enabled);
           setMessages((prev) => {
             // 仅在消息数量增加时更新，避免覆盖正在编辑或流式中的状态
             if (d.messages.length > prev.length) {
@@ -179,18 +186,40 @@ function Shell() {
     if (isSlashCommand(message)) {
       try {
         const d = await sendCommand({ sessionId, command: message });
+        let commandResult: ChatMessage | null = null;
         if (d.ok && d.result) {
-          setMessages((prev) => [...prev, {
+          commandResult = {
             role: "assistant",
             content: d.result,
             format: d.format ?? "markdown",
             command: true,
-          }]);
+          };
+          setMessages((prev) => [...prev, commandResult!]);
           if (d.autoMode !== undefined) setAutoMode(!!d.autoMode);
           if (d.unlimitedMode !== undefined) setUnlimitedMode(!!d.unlimitedMode);
         }
         if (d.actions?.includes("open_pet_settings")) {
           navigateToSettings("pet");
+        }
+        if (message.trim().toLowerCase().startsWith("/workspace")) {
+          setWorkspaceRefreshToken((value) => value + 1);
+        }
+        const navigation = resolveCommandNavigation(d.actions, d.switchToSessionId);
+        if (navigation?.kind === "switch") {
+          freshlyCreatedSessionRef.current = /^\/session\s+new(?:\s|$)/i.test(message.trim())
+            ? navigation.sessionId
+            : null;
+          setMessages([]);
+          navigateToChat(navigation.sessionId);
+        } else if (navigation?.kind === "clear") {
+          setMessages([]);
+          navigateToChat(null);
+        } else if (d.actions?.some((action) => action === "reload_messages" || action === "reload_rollback_status")) {
+          const refreshed = await fetchMessages(sessionId);
+          if (refreshed.ok) {
+            setMessages(messagesAfterCommandRefresh(refreshed.messages || [], userMsg, commandResult));
+            setRollbackEnabled(!!refreshed.rollback?.enabled);
+          }
         }
         await refreshSessions();
       } catch (e) {
@@ -278,6 +307,38 @@ function Shell() {
       setPendingApproval(null);
     }
   }, [activeSessionId]);
+
+  const handleRollback = useCallback(async (checkpointId: string) => {
+    if (!activeSessionId || sending || rollingBack) return;
+    setRollingBack(true);
+    try {
+      const preview = await previewRollback(activeSessionId, checkpointId);
+      const detail = preview.preview;
+      const warning = detail.unlimitedWarning
+        ? "\n\n注意：UNLIMITED 模式在 workspace 外的改动无法恢复。"
+        : "";
+      const confirmed = window.confirm(
+        `确定回退到“${detail.messagePreview || "所选消息"}”之前吗？\n\n` +
+        `将恢复 ${detail.filesToRestore} 个文件，删除 ${detail.filesToDelete} 个新增路径，` +
+        `并移除 ${detail.messagesToRemove} 条对话记录。${warning}`
+      );
+      if (!confirmed) return;
+      const result = await applyRollback(activeSessionId, checkpointId);
+      if (result.ok) {
+        setMessages(result.messages || []);
+        setRollbackEnabled(!!result.rollback?.enabled);
+        await refreshSessions();
+      }
+    } catch (error) {
+      console.error("Rollback failed", error);
+      setMessages((prev) => [...prev, {
+        role: "system",
+        content: error instanceof Error ? `回退失败：${error.message}` : "回退失败",
+      }]);
+    } finally {
+      setRollingBack(false);
+    }
+  }, [activeSessionId, refreshSessions, rollingBack, sending]);
 
   const handleApprove = useCallback(async () => {
     if (!pendingApproval) return;
@@ -386,6 +447,10 @@ function Shell() {
           sending={sending}
           autoMode={autoMode}
           unlimitedMode={unlimitedMode}
+          rollbackEnabled={rollbackEnabled}
+          rollingBack={rollingBack}
+          workspaceRefreshToken={workspaceRefreshToken}
+          onRollback={handleRollback}
           onSend={handleSend}
           onStop={handleStop}
           onAttach={handleAttach}

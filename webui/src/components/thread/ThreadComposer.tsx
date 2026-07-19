@@ -13,6 +13,7 @@ interface ThreadComposerProps {
   onAttach?: (file: File) => void;
   sessionId?: string | null;
   messageHistory?: string[];
+  workspaceRefreshToken?: number;
   home?: boolean;
 }
 
@@ -24,6 +25,7 @@ export function ThreadComposer({
   onAttach,
   sessionId,
   messageHistory,
+  workspaceRefreshToken = 0,
   home = false,
 }: ThreadComposerProps) {
   const [value, setValue] = useState("");
@@ -53,7 +55,7 @@ export function ThreadComposer({
       setWsPath(d.workspace || "");
       setWsDisplay(d.workspace ? d.workspace.split("/").pop()?.split("\\").pop() || d.workspace : "");
     }).catch(() => {});
-  }, [sessionId]);
+  }, [sessionId, workspaceRefreshToken]);
 
   useEffect(() => {
     if (!disabled) textareaRef.current?.focus();

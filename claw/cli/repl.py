@@ -18,7 +18,9 @@ from claw.session.title import auto_title_if_first_turn
 from claw.tools.base import ToolRegistry
 from claw.tools import register_all_tools
 from claw.utils import default_timezone_name
-from claw.workspace.manager import WorkspaceManager
+from claw.workspace.manager import WorkspaceError, WorkspaceManager
+from claw.workspace.rollback import WorkspaceRollbackManager
+from claw.workspace.rollback import RollbackError
 
 EXIT_COMMANDS = {"/exit"}
 WELCOME_MESSAGE = "claw started. Type /exit to quit."
@@ -43,6 +45,10 @@ def run_repl(
 ) -> None:
     """Run the interactive multi-turn conversation loop."""
     initial_session = session_store.ensure_default_session()
+    rollback_manager = (
+        WorkspaceRollbackManager(workspace_manager, session_store)
+        if workspace_manager is not None else None
+    )
     state = RuntimeState(
         session_store=session_store,
         memory_store=memory_store,
@@ -51,12 +57,14 @@ def run_repl(
         workspace_manager=workspace_manager,
         approval_manager=approval_manager,
         tool_registry=tool_registry,
+        skill_registry=skill_registry,
         reflection_manager=reflection_manager,
         compaction_worker=compaction_worker,
         llm_config=llm_config,
         cron_service=cron_service,
         pet_catalog=pet_catalog,
         pet_process=pet_process,
+        rollback_manager=rollback_manager,
     )
 
     # Register advanced tools with the current session id provider
@@ -237,8 +245,9 @@ def _handle_chat_turn(
                 state.workspace_manager.is_unlimited(state.current_session_id)
                 if state.workspace_manager else False
             ),
+            rollback_manager=state.rollback_manager,
         )
-    except LLMError as exc:
+    except (LLMError, RollbackError, WorkspaceError) as exc:
         _print_error(exc)
         return
 

@@ -243,6 +243,7 @@ class SessionStore:
         created_at: str | None = None
         updated_at: str | None = None
         last_consolidated = 0
+        revision = 0
         stored_key: str | None = None
         skipped = 0
 
@@ -264,6 +265,7 @@ class SessionStore:
                         created_at = data.get("created_at")
                         updated_at = data.get("updated_at")
                         last_consolidated = data.get("last_consolidated", 0)
+                        revision = data.get("revision", 0)
                     else:
                         try:
                             messages.append(Message.from_jsonl_dict(data))
@@ -285,8 +287,16 @@ class SessionStore:
             created_at=str(created_at or _now_iso()),
             updated_at=str(updated_at or _now_iso()),
             last_consolidated=int(last_consolidated),
+            revision=int(revision),
             metadata=dict(metadata),
         )
+
+        # Older JSONL writers persisted the compaction boundary but omitted
+        # the summary itself.  Keeping that boundary would hide the compacted
+        # prefix without providing the model any replacement context.  Fail
+        # safe by exposing the raw transcript again for those files.
+        if session.last_consolidated > 0 and not session.summary.strip():
+            session.last_consolidated = 0
 
         if skipped > 0:
             # Produce a load warning via the caller
@@ -498,13 +508,16 @@ class SessionStore:
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             # Metadata line
+            persisted_metadata = dict(session.metadata)
+            persisted_metadata["summary"] = session.summary
             meta = {
                 "_type": "metadata",
                 "key": session.session_id,
                 "created_at": session.created_at,
                 "updated_at": session.updated_at,
-                "metadata": session.metadata,
+                "metadata": persisted_metadata,
                 "last_consolidated": session.last_consolidated,
+                "revision": session.revision,
             }
             f.write(json.dumps(meta, ensure_ascii=False) + "\n")
             # Message lines
@@ -713,6 +726,7 @@ class SessionStore:
             created_at=_now_iso(),
             updated_at=_now_iso(),
             last_consolidated=last_consolidated,
+            revision=source.revision,
             metadata=metadata,
         )
         self.save(target, fsync=True)

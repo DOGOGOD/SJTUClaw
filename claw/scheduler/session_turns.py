@@ -25,7 +25,9 @@ def is_bound_cron_job(job: CronJob) -> bool:
     )
 
 
-def visible_session_messages(session) -> list[dict[str, Any]]:
+def visible_session_messages(
+    session, *, rollback_checkpoint_ids: set[str] | None = None
+) -> list[dict[str, Any]]:
     """Serialize user-visible messages while hiding Cron execution prompts.
 
     ``injected_event`` is authoritative for new messages.  The prefix fallback
@@ -42,6 +44,14 @@ def visible_session_messages(session) -> list[dict[str, Any]]:
         )
         if not is_cron_trigger:
             serialized = message.to_dict()
+            checkpoint_id = serialized.get("rollbackCheckpointId")
+            if (
+                rollback_checkpoint_ids is not None
+                and checkpoint_id not in rollback_checkpoint_ids
+            ):
+                serialized.pop("rollbackCheckpointId", None)
+                serialized.pop("rollbackAvailable", None)
+                serialized.pop("messageId", None)
             legacy_prefix = "[定时任务回复]\n\n"
             if message.role == "assistant" and message.content.startswith(legacy_prefix):
                 body = message.content[len(legacy_prefix):]

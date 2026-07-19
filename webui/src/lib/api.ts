@@ -102,7 +102,7 @@ export async function renameSession(sessionId: string, title: string): Promise<{
 
 export async function fetchMessages(sessionId: string): Promise<{
   ok: boolean; sessionId: string; messages: import("@/lib/types").ChatMessage[]; summary: string;
-  autoMode?: boolean; unlimitedMode?: boolean;
+  autoMode?: boolean; unlimitedMode?: boolean; rollback?: import("@/lib/types").RollbackStatus;
 }> {
   return request(`/sessions/${encodeURIComponent(sessionId)}/messages`);
 }
@@ -278,6 +278,48 @@ export async function saveLLMSettings(data: {
   return request("/settings/llm", {
     method: "PUT",
     body: JSON.stringify(data),
+  });
+}
+
+export async function fetchRollbackStatus(sessionId: string): Promise<{
+  ok: boolean;
+  sessionId: string;
+  rollback: import("@/lib/types").RollbackStatus;
+  checkpoints: Array<Record<string, unknown>>;
+}> {
+  return request(`/sessions/${encodeURIComponent(sessionId)}/rollback`);
+}
+
+export async function previewRollback(sessionId: string, checkpointId: string): Promise<{
+  ok: boolean;
+  preview: import("@/lib/types").RollbackPreview;
+}> {
+  return request(`/sessions/${encodeURIComponent(sessionId)}/rollback/preview`, {
+    method: "POST",
+    body: JSON.stringify({ checkpointId }),
+  });
+}
+
+export async function applyRollback(sessionId: string, checkpointId: string): Promise<{
+  ok: boolean;
+  messages: import("@/lib/types").ChatMessage[];
+  rollback: import("@/lib/types").RollbackStatus;
+  result: Record<string, unknown>;
+}> {
+  return request(`/sessions/${encodeURIComponent(sessionId)}/rollback`, {
+    method: "POST",
+    body: JSON.stringify({ checkpointId }),
+  });
+}
+
+export async function undoRollback(sessionId: string): Promise<{
+  ok: boolean;
+  messages: import("@/lib/types").ChatMessage[];
+  rollback: import("@/lib/types").RollbackStatus;
+}> {
+  return request(`/sessions/${encodeURIComponent(sessionId)}/rollback/undo`, {
+    method: "POST",
+    body: "{}",
   });
 }
 

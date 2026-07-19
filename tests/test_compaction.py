@@ -123,6 +123,70 @@ class TestContextBudget:
 
 
 class TestCompactionV2:
+    def test_summary_and_boundary_survive_store_roundtrip(self, tmp_path):
+        from claw.session.store import SessionStore
+
+        store = SessionStore(tmp_path / "sessions")
+        session = store.create_session(session_id="compact-roundtrip")
+        for index in range(6):
+            session.append_message("user" if index % 2 == 0 else "assistant", f"message-{index}")
+        session.summary = "durable compact summary"
+        session.last_consolidated = 2
+        store.save(session)
+
+        loaded = SessionStore(tmp_path / "sessions").get("compact-roundtrip")
+        assert loaded.summary == "durable compact summary"
+        assert loaded.last_consolidated == 2
+        assert len(loaded.messages) == 6
+
+    def test_compact_and_persist_keeps_summary_after_restart(self, tmp_path):
+        from claw.context.compaction import compact_and_persist
+        from claw.session.store import SessionStore
+
+        class SummaryLLM:
+            def chat(self, _messages):
+                return "SUMMARY_FROM_LLM"
+
+        store = SessionStore(tmp_path / "sessions")
+        session = store.create_session(session_id="actual-compact")
+        for index in range(10):
+            role = "user" if index % 2 == 0 else "assistant"
+            session.append_message(role, (f"message-{index} unique content " * 300))
+        store.save(session)
+
+        outcome = compact_and_persist(session, store, SummaryLLM())
+        assert outcome.save_error is None
+        assert session.last_consolidated > 0
+
+        loaded = SessionStore(tmp_path / "sessions").get("actual-compact")
+        assert loaded.summary == "SUMMARY_FROM_LLM"
+        assert loaded.last_consolidated == session.last_consolidated
+        assert len(loaded.messages) == 10
+
+    def test_missing_legacy_summary_reexposes_raw_transcript(self, tmp_path):
+        from claw.session.store import SessionStore
+
+        store = SessionStore(tmp_path / "sessions")
+        session = store.create_session(session_id="legacy-compact")
+        for index in range(6):
+            session.append_message("user" if index % 2 == 0 else "assistant", f"message-{index}")
+        session.last_consolidated = 2
+        store.save(session)
+
+        # Simulate the old writer, which stored the boundary without summary.
+        path = store._key_path("legacy-compact")
+        lines = path.read_text("utf-8").splitlines()
+        import json
+        metadata = json.loads(lines[0])
+        metadata["metadata"].pop("summary", None)
+        lines[0] = json.dumps(metadata, ensure_ascii=False)
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        loaded = SessionStore(tmp_path / "sessions").get("legacy-compact")
+        assert loaded.summary == ""
+        assert loaded.last_consolidated == 0
+        assert len(loaded.messages) == 6
+
     def test_needs_compaction_token_threshold(self, ss):
         from claw.context.compaction import needs_compaction
 

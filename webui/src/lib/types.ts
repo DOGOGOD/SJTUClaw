@@ -14,6 +14,29 @@ export interface ChatMessage {
   tool_call_id?: string;
   name?: string;
   timestamp?: string;
+  messageId?: string;
+  rollbackCheckpointId?: string;
+  rollbackAvailable?: boolean;
+}
+
+export interface RollbackStatus {
+  enabled: boolean;
+  workspace: string | null;
+  checkpointCount: number;
+  undoAvailable: boolean;
+  bindingId?: string;
+}
+
+export interface RollbackPreview {
+  checkpointId: string;
+  messagePreview: string;
+  filesToRestore: number;
+  filesToDelete: number;
+  directoriesToRestore: number;
+  messagesToRemove: number;
+  restoreFiles: string[];
+  deletePaths: string[];
+  unlimitedWarning: boolean;
 }
 
 export interface ToolCallData {
@@ -30,6 +53,7 @@ export interface WorkspaceInfo {
   sessionId: string;
   workspace: string | null;
   isSet: boolean;
+  rollback?: RollbackStatus;
 }
 
 export interface MemoryEntry {

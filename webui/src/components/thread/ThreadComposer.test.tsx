@@ -3,10 +3,39 @@
 import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ThreadComposer } from "./ThreadComposer";
+import * as api from "@/lib/api";
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+});
 
 describe("ThreadComposer keyboard interactions", () => {
+  it("refreshes the workspace indicator after a slash workspace command", async () => {
+    const fetchWorkspace = vi.spyOn(api, "fetchWorkspace").mockResolvedValue({
+      ok: true,
+      sessionId: "session-a",
+      workspace: "C:\\project-one",
+      isSet: true,
+    });
+    const view = render(
+      <ThreadComposer onSend={vi.fn().mockResolvedValue(undefined)} sessionId="session-a" workspaceRefreshToken={0} />
+    );
+    await waitFor(() => expect(fetchWorkspace).toHaveBeenCalledTimes(1));
+
+    fetchWorkspace.mockResolvedValue({
+      ok: true,
+      sessionId: "session-a",
+      workspace: "C:\\project-two",
+      isSet: true,
+    });
+    view.rerender(
+      <ThreadComposer onSend={vi.fn().mockResolvedValue(undefined)} sessionId="session-a" workspaceRefreshToken={1} />
+    );
+    await waitFor(() => expect(fetchWorkspace).toHaveBeenCalledTimes(2));
+    expect(view.getByTitle("project-two")).toBeTruthy();
+  });
+
   it("clears immediately after clicking send", () => {
     const onSend = vi.fn(() => new Promise<void>(() => {}));
     const view = render(<ThreadComposer onSend={onSend} sessionId="session-a" />);

@@ -8,6 +8,7 @@ forwarded to the LLM as ordinary chat messages.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from contextlib import nullcontext
 from zoneinfo import ZoneInfo
 
 from claw.approval.manager import ApprovalManager
@@ -22,11 +23,12 @@ from claw.session.store import SessionNotFoundError, SessionStore, SessionStoreE
 from claw.tools.base import ToolRegistry
 from claw.utils import default_timezone_name
 from claw.workspace.manager import WorkspaceManager, WorkspaceError
+from claw.workspace.rollback import RollbackError, WorkspaceRollbackManager
 
 _COMMAND_PREFIXES = (
     "/session", "/memory", "/compact", "/workspace", "/approve", "/reject",
     "/approvals", "/skill", "/reflect", "/cron", "/help", "/auto",
-    "/unlimited", "/pet", "/stop", "/exit",
+    "/unlimited", "/pet", "/rollback", "/stop", "/exit",
 )
 
 _HELP_TEXT = (
@@ -55,6 +57,13 @@ _HELP_TEXT = (
     "    set <路径>               设置工作区路径\n"
     "    show                     查看当前工作区\n"
     "    unset                    取消工作区设置\n"
+    "  Workspace 回退（需先设置 workspace）：\n"
+    "  /rollback                 回退到上一条用户消息发送前\n"
+    "  /rollback <n>             回退到倒数第 n 个用户回合之前\n"
+    "  /rollback <checkpointId>  回退到指定检查点\n"
+    "  /rollback list            列出当前分支的可用回退点\n"
+    "  /rollback status          查看回退状态\n"
+    "  /rollback undo            撤销最近一次回退（开始新回合后失效）\n"
     "  /approvals               查看待审批操作\n"
     "  /approve [approvalId]    批准操作\n"
     "  /reject [approvalId]     拒绝操作\n"
@@ -117,11 +126,25 @@ _HELP_MARKDOWN = """# SJTUClaw 可用指令
 - `/reflect time <HH:MM>`：设置执行时间
 - `/reflect now`：立即执行
 
-## Workspace 与审批
+## Workspace
 
 - `/workspace set <路径>`：设置工作区路径
 - `/workspace show`：查看当前工作区
 - `/workspace unset`：取消工作区设置
+
+## Workspace 回退
+
+> 设置 workspace 后自动启用；未设置 workspace 时不支持回退。
+
+- `/rollback`：回退到上一条用户消息发送前
+- `/rollback <n>`：回退到倒数第 n 个用户回合之前
+- `/rollback <checkpointId>`：回退到指定检查点
+- `/rollback list`：列出当前分支的可用回退点
+- `/rollback status`：查看回退状态
+- `/rollback undo`：撤销最近一次回退；开始新用户回合后 undo 失效
+
+## 审批
+
 - `/approvals`：查看待审批操作
 - `/approve [approvalId]`：批准操作
 - `/reject [approvalId] [原因]`：拒绝操作
@@ -183,6 +206,7 @@ class RuntimeState:
     cron_service: object | None = None
     pet_catalog: object | None = None
     pet_process: object | None = None
+    rollback_manager: WorkspaceRollbackManager | None = None
     # Track the current pending approval for the active agent turn
     pending_approval_id: str | None = None
     # AUTO mode — skip approval for write/shell tools
@@ -215,6 +239,8 @@ def handle_command(user_input: str, state: RuntimeState, *, markdown: bool = Fal
         return finish(_handle_compact_command(state))
     if root == "/workspace":
         return finish(_handle_workspace_command(args, state))
+    if root == "/rollback":
+        return finish(_handle_rollback_command(args, state))
     if root == "/approvals":
         return finish(_handle_approvals_list(state))
     if root == "/approve":
@@ -324,9 +350,19 @@ def _switch_session(session_id: str, state: RuntimeState) -> str:
 
 
 def _delete_session(session_id: str, state: RuntimeState) -> str:
+    guard = (
+        state.rollback_manager.session_guard(session_id)
+        if state.rollback_manager is not None else nullcontext()
+    )
     try:
-        state.session_store.delete(session_id)
-    except (SessionNotFoundError, SessionStoreError) as exc:
+        with guard:
+            if state.rollback_manager is not None:
+                state.rollback_manager.disable(session_id)
+            if state.workspace_manager is not None:
+                state.workspace_manager.unset(session_id)
+                state.workspace_manager.set_unlimited(session_id, False)
+            state.session_store.delete(session_id)
+    except (SessionNotFoundError, SessionStoreError, OSError, RollbackError) as exc:
         return f"[错误] {exc}"
 
     if state.current_session_id != session_id:
@@ -585,10 +621,25 @@ def _handle_workspace_command(args: list[str], state: RuntimeState) -> str:
         if len(args) < 2:
             return "用法: /workspace set <路径>"
         path_str = " ".join(args[1:])
+        previous = state.workspace_manager.get(sid)
+        guard = (
+            state.rollback_manager.session_guard(sid)
+            if state.rollback_manager is not None else nullcontext()
+        )
         try:
-            resolved = state.workspace_manager.set(sid, path_str)
+            with guard:
+                resolved = state.workspace_manager.set(sid, path_str)
+                if state.rollback_manager is not None:
+                    state.rollback_manager.enable(sid, state.session_store.get(sid))
             return f"Workspace 已设置为: {resolved}"
-        except WorkspaceError as exc:
+        except (WorkspaceError, RollbackError, OSError) as exc:
+            try:
+                if previous is None:
+                    state.workspace_manager.unset(sid)
+                else:
+                    state.workspace_manager.set(sid, str(previous))
+            except (WorkspaceError, OSError):
+                pass
             return f"[错误] {exc}"
 
     if sub == "show":
@@ -598,10 +649,63 @@ def _handle_workspace_command(args: list[str], state: RuntimeState) -> str:
         return f"当前 workspace: {ws}"
 
     if sub == "unset":
-        state.workspace_manager.unset(sid)
+        guard = (
+            state.rollback_manager.session_guard(sid)
+            if state.rollback_manager is not None else nullcontext()
+        )
+        with guard:
+            if state.rollback_manager is not None:
+                state.rollback_manager.disable(sid)
+            state.workspace_manager.unset(sid)
         return "Workspace 已取消设置。"
 
     return f"未知 /workspace 子命令: {sub}"
+
+
+def _handle_rollback_command(args: list[str], state: RuntimeState) -> str:
+    manager = state.rollback_manager
+    if manager is None:
+        return "Workspace 回退服务未初始化。"
+    sid = state.current_session_id
+    sub = args[0].lower() if args else "1"
+    try:
+        if sub in ("status", "show"):
+            status = manager.status(sid)
+            if not status["enabled"]:
+                return "当前 session 未启用回退。请先设置 workspace。"
+            return (
+                f"Workspace 回退已启用。\n"
+                f"路径: {status['workspace']}\n"
+                f"回退点: {status['checkpointCount']}\n"
+                f"可撤销回退: {'是' if status['undoAvailable'] else '否'}"
+            )
+        if sub == "list":
+            checkpoints = [item for item in manager.list_checkpoints(sid) if item["kind"] == "turn"]
+            if not checkpoints:
+                return "当前没有可用的消息回退点。"
+            lines = ["可用回退点："]
+            for index, item in enumerate(checkpoints, 1):
+                warning = " [仅 workspace]" if item["partial"] else ""
+                lines.append(
+                    f"  {index}. {item['checkpointId']}  {item['messagePreview']}{warning}"
+                )
+            return "\n".join(lines)
+        if sub == "undo":
+            result = manager.undo(sid)
+            return (
+                f"已撤销上一次回退。恢复 {result['restored']} 个路径，"
+                f"删除 {result['deleted']} 个路径。"
+            )
+        target: str | int | None
+        target = int(sub) if sub.isdigit() else sub
+        result = manager.rollback(sid, target)
+        warning = "\n注意：UNLIMITED 模式下 workspace 外的改动未恢复。" if result["partial"] else ""
+        return (
+            f"回退完成。恢复 {result['restored']} 个路径，"
+            f"删除 {result['deleted']} 个路径。可使用 /rollback undo 撤销。{warning}"
+        )
+    except (RollbackError, WorkspaceError, OSError) as exc:
+        return f"[错误] {exc}"
 
 
 # -- /approvals (list pending) ---------------------------------------------

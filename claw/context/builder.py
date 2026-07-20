@@ -16,7 +16,10 @@ so the user-content prefix stays stable for prompt-cache hits.
 
 from __future__ import annotations
 
+import base64
+import mimetypes
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -45,6 +48,27 @@ _MEMORY_CONTEXT_NOTE = (
     "请将其作为权威的参考数据对待——这是代理的持久记忆，"
     "应以此辅助所有回复。]"
 )
+
+
+def _multimodal_user_content(text: str, media: list[str]) -> str | list[dict[str, Any]]:
+    """Build OpenAI-compatible content blocks for persisted local images."""
+    blocks: list[dict[str, Any]] = []
+    if text:
+        blocks.append({"type": "text", "text": text})
+    for item in media:
+        try:
+            path = Path(item)
+            mime_type = mimetypes.guess_type(path.name)[0] or ""
+            if not path.is_file() or not mime_type.startswith("image/"):
+                continue
+            encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+            blocks.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime_type};base64,{encoded}"},
+            })
+        except OSError:
+            continue
+    return blocks if any(block.get("type") == "image_url" for block in blocks) else text
 
 
 def build_memory_context_block(raw_context: str) -> str:
@@ -110,6 +134,35 @@ def _build_runtime_context(
 
 # Matching prefix for stripping runtime context from persisted messages
 _RUNTIME_CONTEXT_PREFIX = _RUNTIME_CONTEXT_TAG
+
+
+def _merge_leading_system_messages(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return an OpenAI-compatible history with one leading system message.
+
+    Some compatible gateways (including the Qwen route used by SJTU) reject
+    multiple consecutive ``system`` messages even when every one is at the
+    beginning of the history.  ContextBuilder composes several independent
+    system sections, so consolidate that leading run at the provider boundary
+    while leaving all conversation, multimodal, and tool messages untouched.
+    """
+    system_count = 0
+    system_sections: list[str] = []
+    for message in messages:
+        if message.get("role") != "system":
+            break
+        system_count += 1
+        content = message.get("content", "")
+        if isinstance(content, str) and content.strip():
+            system_sections.append(content.strip())
+
+    if system_count <= 1:
+        return messages
+
+    merged = dict(messages[0])
+    merged["content"] = "\n\n---\n\n".join(system_sections)
+    return [merged, *messages[system_count:]]
 
 
 class ContextBuilder:
@@ -194,7 +247,7 @@ class ContextBuilder:
         sender_id: str = "",
         session_summary: str | None = None,
         supplemental_runtime_lines: list[str] | None = None,
-    ) -> list[dict[str, str]] | tuple[list[dict[str, str]], ContextBudget]:
+    ) -> list[dict[str, Any]] | tuple[list[dict[str, Any]], ContextBudget]:
         """Build the full ``messages`` array to send to the LLM for *session*.
 
         Args:
@@ -254,6 +307,7 @@ class ContextBuilder:
         unconsolidated = session.get_unconsolidated_messages()
         for i, msg in enumerate(unconsolidated):
             msg_dict = msg.to_dict()
+            msg_dict.pop("media", None)
             # Legacy sessions may contain orphan tool messages without the
             # matching assistant tool_calls entry. Strict providers reject
             # those messages, so preserve them as ordinary assistant context.
@@ -262,13 +316,23 @@ class ContextBuilder:
                     "role": "assistant",
                     "content": f"[历史工具结果]\n{msg.content}",
                 }
+            message_content = str(msg_dict.get("content", msg.content))
             if (
                 msg.role == "user"
                 and i == len(unconsolidated) - 1
                 and runtime_ctx
             ):
-                msg_dict["content"] = f"{msg.content}\n\n{runtime_ctx}"
+                message_content = f"{message_content}\n\n{runtime_ctx}"
+            if msg.role == "user" and msg.media:
+                msg_dict["content"] = _multimodal_user_content(message_content, msg.media)
+            else:
+                msg_dict["content"] = message_content
             messages.append(msg_dict)
+
+        # Keep the provider-facing history portable.  In particular, the
+        # SJTU Qwen/LiteLLM route requires exactly one system message at index
+        # zero instead of several consecutive system sections.
+        messages = _merge_leading_system_messages(messages)
 
         if return_budget:
             budget = ContextBudget.measure(

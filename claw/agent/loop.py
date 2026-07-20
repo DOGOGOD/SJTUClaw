@@ -353,6 +353,9 @@ def _run_agent_turn_unlocked(
     approval_handler: Callable | None = None,
 
 
+    media: list[str] | None = None,
+
+
     skill_registry=None,
 
 
@@ -748,6 +751,7 @@ def _run_agent_turn_unlocked(
         session.append_message(
             "user",
             injected,
+            media=media,
             injected_event=input_event,
             message_id=_rollback_message_id or f"msg_{uuid.uuid4().hex}",
             rollback_checkpoint_id=_rollback_checkpoint_id,
@@ -769,6 +773,7 @@ def _run_agent_turn_unlocked(
         session.append_message(
             "user",
             user_message,
+            media=media,
             injected_event=input_event,
             message_id=_rollback_message_id or f"msg_{uuid.uuid4().hex}",
             rollback_checkpoint_id=_rollback_checkpoint_id,

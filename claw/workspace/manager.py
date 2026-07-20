@@ -130,7 +130,15 @@ class WorkspaceManager:
             p = Path(ws_path)
             self._workspaces[sid] = p
             loaded += 1
-            if not p.exists() or not p.is_dir():
+            try:
+                available_directory = p.exists() and p.is_dir()
+            except OSError:
+                # A persisted path can become inaccessible between runs
+                # (revoked ACL, disconnected drive, protected test temp dir,
+                # etc.).  Keep the binding for possible later recovery, but
+                # never let one unusable workspace prevent gateway startup.
+                available_directory = False
+            if not available_directory:
                 missing += 1
 
         if loaded:

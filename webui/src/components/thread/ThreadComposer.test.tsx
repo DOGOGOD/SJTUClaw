@@ -11,6 +11,19 @@ afterEach(() => {
 });
 
 describe("ThreadComposer keyboard interactions", () => {
+  it("uses the Claw chat placeholder in both composer modes", () => {
+    const home = render(
+      <ThreadComposer onSend={vi.fn().mockResolvedValue(undefined)} sessionId="session-a" home />
+    );
+    expect(home.getByPlaceholderText("Chat or Work With Claw")).toBeTruthy();
+    home.unmount();
+
+    const thread = render(
+      <ThreadComposer onSend={vi.fn().mockResolvedValue(undefined)} sessionId="session-a" />
+    );
+    expect(thread.getByPlaceholderText("Chat or Work With Claw")).toBeTruthy();
+  });
+
   it("refreshes the workspace indicator after a slash workspace command", async () => {
     const fetchWorkspace = vi.spyOn(api, "fetchWorkspace").mockResolvedValue({
       ok: true,
@@ -129,5 +142,108 @@ describe("ThreadComposer keyboard interactions", () => {
 
     expect(onSend).not.toHaveBeenCalled();
     expect(composer.value).toBe("中文");
+  });
+
+  it("keeps a pasted image pending until text is entered and the message is sent", async () => {
+    const onSend = vi.fn().mockResolvedValue(undefined);
+    const view = render(
+      <ThreadComposer
+        onSend={onSend}
+        sessionId="session-a"
+      />
+    );
+    const composer = view.getByRole("textbox") as HTMLTextAreaElement;
+    const image = new File(["png"], "clipboard.png", { type: "image/png" });
+
+    fireEvent.paste(composer, {
+      clipboardData: {
+        items: [{ kind: "file", type: "image/png", getAsFile: () => image }],
+        files: [image],
+      },
+    });
+
+    expect(onSend).not.toHaveBeenCalled();
+    expect(view.getByLabelText("待发送图片")).toBeTruthy();
+    expect(composer.value).toBe("");
+
+    fireEvent.change(composer, { target: { value: "请描述这张图" } });
+    fireEvent.keyDown(composer, { key: "Enter" });
+
+    await waitFor(() => expect(onSend).toHaveBeenCalledWith("请描述这张图", [image]));
+    expect(view.queryByLabelText("待发送图片")).toBeNull();
+  });
+
+  it("keeps normal text paste behavior when the clipboard has no image", () => {
+    const view = render(
+      <ThreadComposer
+        onSend={vi.fn().mockResolvedValue(undefined)}
+        sessionId="session-a"
+      />
+    );
+    const composer = view.getByRole("textbox") as HTMLTextAreaElement;
+
+    const event = new Event("paste", { bubbles: true, cancelable: true });
+    Object.defineProperty(event, "clipboardData", {
+      value: { items: [], files: [] },
+    });
+    composer.dispatchEvent(event);
+
+    expect(event.defaultPrevented).toBe(false);
+  });
+
+  it("can send a pasted image without additional text by clicking send", async () => {
+    const onSend = vi.fn().mockResolvedValue(undefined);
+    const view = render(<ThreadComposer onSend={onSend} sessionId="session-a" />);
+    const composer = view.getByRole("textbox") as HTMLTextAreaElement;
+    const image = new File(["png"], "clipboard.png", { type: "image/png" });
+
+    fireEvent.paste(composer, {
+      clipboardData: {
+        items: [{ kind: "file", type: "image/png", getAsFile: () => image }],
+        files: [image],
+      },
+    });
+    fireEvent.click(view.getByTitle("发送"));
+
+    await waitFor(() => expect(onSend).toHaveBeenCalledWith("", [image]));
+  });
+
+  it("restores both text and the pending image when combined sending fails", async () => {
+    const onSend = vi.fn().mockRejectedValue(new Error("图片发送失败"));
+    const view = render(<ThreadComposer onSend={onSend} sessionId="session-a" />);
+    const composer = view.getByRole("textbox") as HTMLTextAreaElement;
+    const image = new File(["png"], "clipboard.png", { type: "image/png" });
+
+    fireEvent.paste(composer, {
+      clipboardData: {
+        items: [{ kind: "file", type: "image/png", getAsFile: () => image }],
+        files: [image],
+      },
+    });
+    fireEvent.change(composer, { target: { value: "和图片一起发送" } });
+    fireEvent.keyDown(composer, { key: "Enter" });
+
+    await waitFor(() => expect(view.getByRole("alert").textContent).toBe("图片发送失败"));
+    expect(composer.value).toBe("和图片一起发送");
+    expect(view.getByLabelText("待发送图片")).toBeTruthy();
+  });
+
+  it("removes a pending image without sending it", () => {
+    const onSend = vi.fn().mockResolvedValue(undefined);
+    const view = render(<ThreadComposer onSend={onSend} sessionId="session-a" />);
+    const composer = view.getByRole("textbox") as HTMLTextAreaElement;
+    const image = new File(["png"], "clipboard.png", { type: "image/png" });
+
+    fireEvent.paste(composer, {
+      clipboardData: {
+        items: [{ kind: "file", type: "image/png", getAsFile: () => image }],
+        files: [image],
+      },
+    });
+    fireEvent.click(view.getByLabelText("移除图片 1"));
+    fireEvent.keyDown(composer, { key: "Enter" });
+
+    expect(view.queryByLabelText("待发送图片")).toBeNull();
+    expect(onSend).not.toHaveBeenCalled();
   });
 });

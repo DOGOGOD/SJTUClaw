@@ -45,8 +45,14 @@ def reg():
 
 
 @pytest.fixture
-def wm():
+def wm(tmp, monkeypatch):
+    import claw.workspace.manager as workspace_module
     from claw.workspace.manager import WorkspaceManager
+    monkeypatch.setattr(
+        workspace_module,
+        "_BINDINGS_PATH",
+        tmp / "workspace-state" / "bindings.json",
+    )
     return WorkspaceManager()
 
 
@@ -192,8 +198,50 @@ class TestContextBuilder:
         s.append_message("user", "q"); s.append_message("assistant", "a")
         msgs = cb.build_messages(s)
         roles = [m["role"] for m in msgs]
-        assert roles[0] == "system"; assert roles[1] == "system"
+        assert roles == ["system", "user", "assistant"]
+        assert "sp" in msgs[0]["content"]
+        assert "soul" in msgs[0]["content"]
+        assert "pref: zh" in msgs[0]["content"]
         assert roles[-2] == "user"; assert roles[-1] == "assistant"
+
+    def test_return_budget_also_has_one_leading_system_message(self, cb, ss):
+        cb._memory_store.add("remember this")
+        s = ss.create_session()
+        s.summary = "previous session summary"
+        s.append_message("user", "continue")
+
+        messages, budget = cb.build_messages(s, return_budget=True)
+
+        assert [message["role"] for message in messages] == ["system", "user"]
+        assert "remember this" in messages[0]["content"]
+        assert "previous session summary" in messages[0]["content"]
+        assert budget.total_tokens >= 0
+
+    def test_system_merge_preserves_following_messages_verbatim(self):
+        from claw.context.builder import _merge_leading_system_messages
+
+        user_content = [
+            {"type": "text", "text": "看图"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AA=="}},
+        ]
+        tool_message = {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": "tool result",
+        }
+        messages = [
+            {"role": "system", "content": "first"},
+            {"role": "system", "content": "second"},
+            {"role": "user", "content": user_content},
+            tool_message,
+        ]
+
+        merged = _merge_leading_system_messages(messages)
+
+        assert merged[0] == {"role": "system", "content": "first\n\n---\n\nsecond"}
+        assert merged[1] is messages[2]
+        assert merged[1]["content"] is user_content
+        assert merged[2] is tool_message
 
     def test_empty_memory_excluded(self, cb, ss):
         s = ss.create_session()
@@ -329,6 +377,33 @@ class TestToolRegistry:
 # ═════════════════════════════════════════════════════════════════════
 
 class TestWorkspace:
+    def test_load_tolerates_inaccessible_persisted_directory(
+        self, monkeypatch, tmp
+    ):
+        import claw.workspace.manager as workspace_module
+        from claw.workspace.manager import WorkspaceManager
+
+        bindings_path = tmp / "workspace-state" / "bindings.json"
+        bindings_path.parent.mkdir(parents=True)
+        inaccessible = tmp / "inaccessible"
+        bindings_path.write_text(
+            json.dumps({"blocked-session": str(inaccessible)}),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(workspace_module, "_BINDINGS_PATH", bindings_path)
+        original_exists = Path.exists
+
+        def permission_denied_for_workspace(path):
+            if path == inaccessible:
+                raise PermissionError(5, "Access is denied", str(path))
+            return original_exists(path)
+
+        monkeypatch.setattr(Path, "exists", permission_denied_for_workspace)
+
+        manager = WorkspaceManager()
+
+        assert manager.get("blocked-session") == inaccessible
+
     def test_resolve_ok(self, wm, tmp):
         wm.set("s", str(tmp))
         assert str(wm.resolve("s", "x/y.txt")).startswith(str(tmp))

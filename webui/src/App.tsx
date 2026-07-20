@@ -6,7 +6,7 @@ import { ThreadShell } from "@/components/thread/ThreadShell";
 import { SettingsView } from "@/components/settings/SettingsView";
 import { ThemeProvider, useTheme } from "@/hooks/useTheme";
 import { useSessions } from "@/hooks/useSessions";
-import { cn } from "@/lib/utils";
+import { cn, escapeMarkdownImageAlt } from "@/lib/utils";
 import { isSlashCommand } from "@/lib/commands";
 import { messagesAfterCommandRefresh, resolveCommandNavigation } from "@/lib/commandState";
 import { fetchMessages, sendMessage, sendCommand, stopChat, uploadAttachment, renameSession, fetchApprovals, approveApproval, rejectApproval, previewRollback, applyRollback } from "@/lib/api";
@@ -161,7 +161,7 @@ function Shell() {
     try { await renameSession(sessionId, title.trim()); await refreshSessions(); } catch {}
   }, [refreshSessions]);
 
-  const handleSend = useCallback(async (message: string) => {
+  const handleSend = useCallback(async (message: string, attachments: File[] = []) => {
     setSending(true);
     let sessionId = activeSessionId;
     if (!sessionId) {
@@ -169,7 +169,7 @@ function Shell() {
         const created = await createChat();
         if (!created.sessionId) {
           setSending(false);
-          return;
+          throw new Error("无法创建会话");
         }
         sessionId = created.sessionId;
         freshlyCreatedSessionRef.current = sessionId;
@@ -177,13 +177,28 @@ function Shell() {
       } catch (e) {
         console.error("Failed to create chat", e);
         setSending(false);
-        return;
+        throw e;
       }
     }
-    const userMsg: ChatMessage = { role: "user", content: message };
+    let uploaded: Array<{ id: string; originalName: string }> = [];
+    try {
+      for (const file of attachments) {
+        const result = await uploadAttachment(sessionId, file, false);
+        if (!result.ok || !result.attachment) throw new Error(`图片上传失败: ${file.name}`);
+        uploaded.push({ id: result.attachment.id, originalName: result.attachment.originalName });
+      }
+    } catch (error) {
+      setSending(false);
+      throw error;
+    }
+    const imageMarkdown = uploaded.map((item) =>
+      `![${escapeMarkdownImageAlt(item.originalName)}](/sessions/${sessionId}/attachments/${item.id})`
+    ).join("\n");
+    const optimisticContent = [message, imageMarkdown].filter(Boolean).join("\n\n");
+    const userMsg: ChatMessage = { role: "user", content: optimisticContent };
     setMessages((prev) => [...prev, userMsg]);
 
-    if (isSlashCommand(message)) {
+    if (attachments.length === 0 && isSlashCommand(message)) {
       try {
         const d = await sendCommand({ sessionId, command: message });
         let commandResult: ChatMessage | null = null;
@@ -225,6 +240,7 @@ function Shell() {
       } catch (e) {
         console.error("Command failed", e);
         setMessages((prev) => prev.slice(0, -1));
+        throw e;
       } finally {
         setSending(false);
       }
@@ -260,7 +276,11 @@ function Shell() {
     }, 2000);
 
     try {
-      const d = await sendMessage({ sessionId, message });
+      const d = await sendMessage({
+        sessionId,
+        message,
+        attachmentIds: uploaded.map((item) => item.id),
+      });
       if (d.ok) {
         // Use full messages array from response (includes all tool calls)
         if (d.messages && d.messages.length > 0) {
@@ -282,6 +302,7 @@ function Shell() {
         const d = await fetchMessages(sessionId);
         if (d.ok) setMessages(d.messages || []);
       } catch {}
+      throw e;
     } finally {
       clearInterval(approvalTimer);
       clearInterval(msgTimer);
@@ -350,30 +371,6 @@ function Shell() {
     const reason = prompt("请输入拒绝原因（可选）") || undefined;
     try { await rejectApproval(pendingApproval.approvalId, reason); setPendingApproval(null); } catch (e) { console.error("Reject failed", e); }
   }, [pendingApproval]);
-
-  const handleAttach = useCallback(async (file: File) => {
-    let sid = activeSessionId;
-    if (!sid) {
-      try {
-        const d = await createChat();
-        if (d.sessionId) { sid = d.sessionId; navigateToChat(d.sessionId); } else return;
-      } catch { return; }
-    }
-    try {
-      const result = await uploadAttachment(sid, file);
-      if (result.ok) {
-        const message = result.message || {
-          role: "user" as const,
-          content: `已上传附件: ${file.name}`,
-          command: true,
-        };
-        setMessages((prev) => [...prev, message]);
-      }
-    } catch (e) {
-      console.error("Upload failed", e);
-      setMessages((prev) => [...prev, { role: "system", content: `上传失败: ${file.name}` }]);
-    }
-  }, [activeSessionId, navigateToChat]);
 
   const handleToggleSidebar = useCallback(() => {
     if (isMobile) setMobileSidebarOpen((v) => !v);
@@ -453,7 +450,6 @@ function Shell() {
           onRollback={handleRollback}
           onSend={handleSend}
           onStop={handleStop}
-          onAttach={handleAttach}
           onToggleSidebar={handleToggleSidebar}
           onNewChat={handleNewChat}
           theme={theme}

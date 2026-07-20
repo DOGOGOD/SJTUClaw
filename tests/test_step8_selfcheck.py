@@ -126,7 +126,7 @@ def run():
     s2.append_message("user","hi"); s2.append_message("assistant","ok")
     chk("session msgs correct", len(s2.messages) == 2)
     cb2 = ContextBuilder("sp","s",ms2); msgs = cb2.build_messages(s2)
-    chk("context builder OK", len(msgs) >= 4)
+    chk("context builder OK", [m["role"] for m in msgs] == ["system", "user", "assistant"])
     from claw.context.compaction import needs_compaction
     chk("compaction check OK", not needs_compaction(s2))
 

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { formatTime } from "./utils";
+import { escapeMarkdownImageAlt, formatTime } from "./utils";
 
 afterEach(() => {
   vi.useRealTimers();
@@ -25,5 +25,12 @@ describe("formatTime", () => {
     vi.setSystemTime(new Date(2026, 6, 16, 12, 0));
 
     expect(formatTime(new Date(2026, 6, 14, 18, 0).toISOString())).toBe("2天前");
+  });
+});
+
+describe("escapeMarkdownImageAlt", () => {
+  it("escapes brackets and backslashes in pasted image filenames", () => {
+    expect(escapeMarkdownImageAlt("IMG_30[1].PNG")).toBe("IMG_30&#91;1&#93;.PNG");
+    expect(escapeMarkdownImageAlt("截图\\备份[2].png")).toBe("截图\\备份&#91;2&#93;.png");
   });
 });

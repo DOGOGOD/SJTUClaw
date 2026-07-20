@@ -148,6 +148,7 @@ export interface SoulPayload {
 export interface SendMessageRequest {
   sessionId: string;
   message: string;
+  attachmentIds?: string[];
 }
 
 export interface SendMessageResponse {

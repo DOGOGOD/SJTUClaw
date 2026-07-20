@@ -18,9 +18,8 @@ interface ThreadShellProps {
   rollingBack?: boolean;
   workspaceRefreshToken?: number;
   onRollback?: (checkpointId: string) => Promise<void>;
-  onSend: (message: string) => Promise<void>;
+  onSend: (message: string, attachments?: File[]) => Promise<void>;
   onStop?: () => Promise<void>;
-  onAttach?: (file: File) => void;
   onToggleSidebar?: () => void;
   onNewChat: () => void;
   theme: "light" | "dark";
@@ -38,7 +37,6 @@ export function ThreadShell({
   onStop,
   onToggleSidebar,
   onToggleTheme,
-  onAttach,
   autoMode = false,
   unlimitedMode = false,
   rollbackEnabled = false,
@@ -138,7 +136,7 @@ export function ThreadShell({
           <div className="mx-auto flex min-h-full w-full max-w-[760px] flex-col justify-center pb-[8vh]">
             <ThreadViewport messages={messages} loading={loading} sessionId={sessionId} rollbackEnabled={rollbackEnabled} rollingBack={rollingBack} onRollback={onRollback} />
             <div className="mt-8">
-              <ThreadComposer onSend={onSend} onAttach={onAttach} sessionId={sessionId} messageHistory={messageHistory} sending={sending} workspaceRefreshToken={workspaceRefreshToken} home />
+              <ThreadComposer onSend={onSend} sessionId={sessionId} messageHistory={messageHistory} sending={sending} workspaceRefreshToken={workspaceRefreshToken} home />
             </div>
             <p className="mt-3 text-center text-[10px] text-muted-foreground/55 select-none">
               Claw 可能会犯错，请核对重要信息
@@ -157,7 +155,7 @@ export function ThreadShell({
           </div>
           <div className="host-no-drag shrink-0 bg-gradient-to-t from-background via-background to-background/80 px-3 pb-3 pt-2 md:px-6 md:pb-5">
             <div className="mx-auto max-w-[880px]">
-              <ThreadComposer onSend={onSend} onStop={onStop} onAttach={onAttach} sessionId={sessionId} messageHistory={messageHistory} sending={sending || rollingBack} workspaceRefreshToken={workspaceRefreshToken} />
+              <ThreadComposer onSend={onSend} onStop={onStop} sessionId={sessionId} messageHistory={messageHistory} sending={sending || rollingBack} workspaceRefreshToken={workspaceRefreshToken} />
             </div>
             <p className="mt-2 text-center text-[10px] text-muted-foreground/50 select-none">
               Enter 发送　Shift+Enter 换行　输入 / 查看命令

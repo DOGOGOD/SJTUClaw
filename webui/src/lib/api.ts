@@ -569,7 +569,7 @@ export async function fetchSkillDetail(name: string): Promise<{
 
 // ---------------------------------------------------------------------------
 
-export async function uploadAttachment(sessionId: string, file: File): Promise<{
+export async function uploadAttachment(sessionId: string, file: File, persistMessage = true): Promise<{
   ok: boolean;
   attachment?: { id: string; originalName: string; storedName: string; size: number; mimeType: string; uploadedAt: string };
   message?: { role: "user"; content: string; command?: boolean };
@@ -579,7 +579,7 @@ export async function uploadAttachment(sessionId: string, file: File): Promise<{
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 120_000);
   try {
-    const res = await fetch(`${API_BASE}/sessions/${encodeURIComponent(sessionId)}/attachments`, {
+    const res = await fetch(`${API_BASE}/sessions/${encodeURIComponent(sessionId)}/attachments?persistMessage=${persistMessage ? "true" : "false"}`, {
       method: "POST",
       body: fd,
       signal: controller.signal,

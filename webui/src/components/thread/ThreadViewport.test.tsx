@@ -58,6 +58,23 @@ describe("ThreadViewport user messages", () => {
       .toBe("/sessions/session-a/local-image?path=C%3A%5Cworkspace%5Cresult.png");
   });
 
+  it("renders attachment filenames containing brackets as images", () => {
+    const view = render(
+      <ThreadViewport
+        messages={[{
+          role: "user",
+          content: "描述一下\n\n![IMG_30\\[1\\].PNG](/sessions/session-a/attachments/att_demo)",
+        }]}
+        loading={false}
+        sessionId="session-a"
+      />
+    );
+
+    const image = view.container.querySelector("img");
+    expect(image?.getAttribute("alt")).toBe("IMG_30[1].PNG");
+    expect(image?.getAttribute("src")).toBe("/sessions/session-a/attachments/att_demo");
+  });
+
   it("turns image download links into inline message images", () => {
     const view = render(
       <ThreadViewport

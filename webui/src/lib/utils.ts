@@ -5,6 +5,16 @@ export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs));
 }
 
+/** Escape a filename before embedding it in Markdown image alt text. */
+export function escapeMarkdownImageAlt(filename: string): string {
+  return filename
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/\[/g, "&#91;")
+    .replace(/\]/g, "&#93;");
+}
+
 export function formatTime(iso: string): string {
   if (!iso) return "";
   const d = new Date(iso);

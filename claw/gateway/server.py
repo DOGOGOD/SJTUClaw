@@ -862,7 +862,12 @@ class ChatRequest(BaseModel):
         alias="sessionId",
         description="Target session id. If omitted, a new session is created.",
     )
-    message: str = Field(..., min_length=1, description="User message text.")
+    message: str = Field(default="", description="User message text.")
+    attachment_ids: list[str] = Field(
+        default_factory=list,
+        alias="attachmentIds",
+        description="Session-scoped image attachments sent with this turn.",
+    )
 
     model_config = {"populate_by_name": True}
 
@@ -958,6 +963,57 @@ def _add_attachment_record(
     return record
 
 
+def _markdown_image_alt(filename: str) -> str:
+    """Encode a filename safely for Markdown image alt text.
+
+    HTML entities keep bracketed filenames valid Markdown without introducing
+    ``\\[``/``\\]`` sequences that the WebUI's LaTeX normalizer could mistake
+    for display-math delimiters.
+    """
+    return (
+        filename.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace("[", "&#91;")
+        .replace("]", "&#93;")
+    )
+
+
+def _resolve_chat_attachments(
+    session_id: str, attachment_ids: list[str]
+) -> tuple[list[str], list[str]]:
+    """Resolve uploaded image IDs to safe local paths and display Markdown."""
+    if len(attachment_ids) > 4:
+        raise HTTPException(status_code=400, detail="每条消息最多发送 4 张图片")
+    records = {str(item.get("id")): item for item in _read_attachments_meta(session_id)}
+    root = _attachments_dir(session_id).resolve()
+    media_paths: list[str] = []
+    markdown: list[str] = []
+    for attachment_id in attachment_ids:
+        record = records.get(attachment_id)
+        if record is None:
+            raise HTTPException(status_code=404, detail=f"附件不存在: {attachment_id}")
+        mime_type = str(record.get("mimeType") or "")
+        if not mime_type.startswith("image/"):
+            raise HTTPException(status_code=400, detail="当前消息仅支持粘贴图片")
+        path = (root / str(record.get("storedName") or "")).resolve()
+        try:
+            path.relative_to(root)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail="无效的附件路径") from exc
+        if not path.is_file():
+            raise HTTPException(status_code=404, detail=f"附件文件不存在: {attachment_id}")
+        if path.stat().st_size > 20 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="单张图片不能超过 20 MB")
+        original_name = str(record.get("originalName") or "image")
+        safe_name = _markdown_image_alt(original_name)
+        media_paths.append(str(path))
+        markdown.append(
+            f"![{safe_name}](/sessions/{session_id}/attachments/{attachment_id})"
+        )
+    return media_paths, markdown
+
+
 # ---------------------------------------------------------------------------
 # Error handling
 # ---------------------------------------------------------------------------
@@ -1015,11 +1071,21 @@ async def handle_chat(req: ChatRequest):
         session = _session_store.create_session()
         sid = session.session_id
 
+    media_paths, attachment_markdown = _resolve_chat_attachments(
+        sid, req.attachment_ids
+    )
+    text = req.message.strip()
+    if not text and not attachment_markdown:
+        raise HTTPException(status_code=400, detail="消息或图片不能为空")
+    turn_message = "\n\n".join(
+        part for part in (text, "\n".join(attachment_markdown)) if part
+    )
+
     # Defense in depth: WebUI normally sends slash commands to /command, but
     # stale frontend bundles or alternate clients may post them to /chat.
     # Never forward a recognized command to the LLM.
-    command = req.message.strip()
-    if _is_slash_command(command):
+    command = text
+    if not attachment_markdown and _is_slash_command(command):
         result_text = _execute_slash_command(command, sid)
         session = _session_store.get(sid)
         messages = _visible_messages(session)
@@ -1042,14 +1108,14 @@ async def handle_chat(req: ChatRequest):
         reply = _llm_missing_reply()
         try:
             session = _session_store.get(sid)
-            session.append_message("user", req.message)
+            session.append_message("user", turn_message, media=media_paths or None)
             session.append_message("assistant", reply)
             _session_store.save(session)
             messages = _visible_messages(session)
             title = session.title
         except Exception:
             messages = [
-                {"role": "user", "content": req.message},
+                {"role": "user", "content": turn_message},
                 {"role": "assistant", "content": reply},
             ]
             title = None
@@ -1079,11 +1145,11 @@ async def handle_chat(req: ChatRequest):
         def _run() -> str:
             _set_turn_session_id(sid)
             _update_cron_context(sid, req.session_id or "default")
-            _pet_state.start_turn(sid, req.message)
+            _pet_state.start_turn(sid, turn_message)
             try:
                 return run_agent_turn(
                     sid,
-                    req.message,
+                    turn_message,
                     session_store=_session_store,
                     context_builder=_context_builder,
                     tool_registry=_tool_registry,
@@ -1095,6 +1161,7 @@ async def handle_chat(req: ChatRequest):
                     event_callback=lambda event: _pet_state.handle_event(sid, event),
                     cancel_event=cancel_event,
                     rollback_manager=_rollback_manager,
+                    media=media_paths or None,
                 )
             except Exception:
                 _pet_state.finish_turn(sid, failed=True)
@@ -1394,7 +1461,11 @@ def get_messages(session_id: str):
 
 
 @app.post("/sessions/{session_id}/attachments")
-async def upload_attachment(session_id: str, file: UploadFile = File(...)):
+async def upload_attachment(
+    session_id: str,
+    file: UploadFile = File(...),
+    persist_message: bool = Query(True, alias="persistMessage"),
+):
     if not _session_store.exists(session_id):
         raise HTTPException(status_code=404, detail=f"Session 不存在: {session_id}")
 
@@ -1424,15 +1495,16 @@ async def upload_attachment(session_id: str, file: UploadFile = File(...)):
     )
 
     content_url = f"/sessions/{session_id}/attachments/{attachment_id}"
-    markdown_name = original_name.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+    markdown_name = _markdown_image_alt(original_name)
     message_content = (
         f"![{markdown_name}]({content_url})"
         if mime_type.startswith("image/")
         else f"[{markdown_name}]({content_url})"
     )
-    session = _session_store.get(session_id)
-    session.append_message("user", message_content, _command=True)
-    _session_store.save(session)
+    if persist_message:
+        session = _session_store.get(session_id)
+        session.append_message("user", message_content, _command=True)
+        _session_store.save(session)
 
     return {
         "ok": True,

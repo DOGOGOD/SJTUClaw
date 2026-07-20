@@ -115,18 +115,32 @@ function normalizeMathSegment(segment: string): string {
 }
 
 /** Make same-line/adjacent $$ blocks parseable without touching code samples. */
+function protectEscapedImageAlt(markdown: string): string {
+  // Older messages escaped image filenames as \[ and \]. Keep those escapes
+  // out of LaTeX normalization, where they would look like display-math
+  // delimiters (for example IMG_30\[1\].PNG).
+  return markdown.replace(
+    /!\[((?:\\.|[^\]\\\n])*)\]\(([^)\n]+)\)/g,
+    (_full, alt: string, destination: string) =>
+      `![${alt.replace(/\\\[/g, "&#91;").replace(/\\\]/g, "&#93;")}](${destination})`
+  );
+}
+
 function normalizeMathMarkdown(markdown: string): string {
-  if (!markdown.includes("$$") && !/\\[()[\]]/.test(markdown)) return markdown;
+  const protectedMarkdown = protectEscapedImageAlt(markdown);
+  if (!protectedMarkdown.includes("$$") && !/\\[()[\]]/.test(protectedMarkdown)) {
+    return protectedMarkdown;
+  }
   const code = /(```[\s\S]*?```|~~~[\s\S]*?~~~|`[^`\n]*`)/g;
   let result = "";
   let cursor = 0;
-  for (const match of markdown.matchAll(code)) {
+  for (const match of protectedMarkdown.matchAll(code)) {
     const index = match.index ?? 0;
-    result += normalizeMathSegment(markdown.slice(cursor, index));
+    result += normalizeMathSegment(protectedMarkdown.slice(cursor, index));
     result += match[0];
     cursor = index + match[0].length;
   }
-  return result + normalizeMathSegment(markdown.slice(cursor));
+  return result + normalizeMathSegment(protectedMarkdown.slice(cursor));
 }
 
 function MessageImage({ src, alt, sessionId }: { src?: string; alt?: string; sessionId: string | null }) {

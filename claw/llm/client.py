@@ -31,7 +31,7 @@ from claw.llm.protocol import AgentResponse, ProtocolParseError, parse_agent_res
 if TYPE_CHECKING:
     from claw.context.budget import ContextBudget
 
-Message = Mapping[str, str]
+Message = Mapping[str, Any]
 
 logger = logging.getLogger(__name__)
 
@@ -143,7 +143,7 @@ class LLMClient:
 
     def chat_with_tools(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         tool_definitions: list[dict[str, Any]] | None = None,
         budget: "ContextBudget | None" = None,
     ) -> AgentResponse:
@@ -220,7 +220,7 @@ class LLMClient:
 
     def _call_api(
         self,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         tool_definitions: list[dict[str, Any]] | None = None,
         budget: "ContextBudget | None" = None,
     ) -> Any:

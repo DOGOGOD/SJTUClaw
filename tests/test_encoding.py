@@ -41,8 +41,14 @@ def test_force_utf8_stdio_reconfigures_available_streams(monkeypatch) -> None:
 def test_shell_failure_keeps_chinese_output(monkeypatch, tmp_path: Path) -> None:
     """A failed tool call must not replace localized stderr with mojibake."""
     import claw.tools.shell as shell_module
+    import claw.workspace.manager as workspace_module
 
     session_id = "encoding-regression"
+    monkeypatch.setattr(
+        workspace_module,
+        "_BINDINGS_PATH",
+        tmp_path / "workspace-state" / "bindings.json",
+    )
     workspace = WorkspaceManager()
     workspace.set(session_id, str(tmp_path))
     registry = ToolRegistry()

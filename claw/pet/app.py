@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import math
 import os
@@ -18,7 +19,7 @@ from typing import Any
 
 import tkinter as tk
 import tkinter.font as tkfont
-from PIL import Image, ImageTk
+from PIL import Image, ImageGrab, ImageTk
 
 from claw.pet.catalog import PetCatalog
 
@@ -216,7 +217,12 @@ class GatewayClient:
             return data.get("sessions") or data.get("items") or []
         return []
 
-    def send_message(self, session_id: str, message: str) -> dict[str, Any]:
+    def send_message(
+        self,
+        session_id: str,
+        message: str,
+        attachment_ids: list[str] | None = None,
+    ) -> dict[str, Any]:
         """发送消息到指定 session（同步阻塞，应在后台线程调用）。
 
         /chat 端点会等待 Agent 完整执行后才返回，需要较长超时。
@@ -225,9 +231,40 @@ class GatewayClient:
         """
         return self._request(
             "POST", "/chat",
-            {"sessionId": session_id, "message": message},
+            {
+                "sessionId": session_id,
+                "message": message,
+                "attachmentIds": attachment_ids or [],
+            },
             timeout=180.0,
         )
+
+    def upload_image(
+        self, session_id: str, image: Image.Image, filename: str
+    ) -> dict[str, Any]:
+        """Upload a clipboard image through the gateway attachment endpoint."""
+        output = io.BytesIO()
+        image.convert("RGBA").save(output, format="PNG")
+        boundary = f"----SJTUClawPet{time.time_ns():x}"
+        disposition_name = filename.replace('"', "")
+        prefix = (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="file"; filename="{disposition_name}"\r\n'
+            "Content-Type: image/png\r\n\r\n"
+        ).encode("utf-8")
+        body = prefix + output.getvalue() + f"\r\n--{boundary}--\r\n".encode("ascii")
+        request = urllib.request.Request(
+            self.base_url + f"/sessions/{session_id}/attachments?persistMessage=false",
+            data=body,
+            headers={
+                "Accept": "application/json",
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+                "X-SJTUClaw-Internal": "desktop-pet",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=60.0) as response:
+            return json.loads(response.read().decode("utf-8"))
 
     def _request(
         self, method: str, path: str, body: dict | None = None, timeout: float = 5.0
@@ -646,6 +683,11 @@ class DesktopPet:
         entry_window = popup_canvas.create_window(
             self._px(16), popup_height // 2, anchor="w", window=entry,
         )
+        image_badge = popup_canvas.create_text(
+            self._px(16), popup_height // 2,
+            anchor="w", text="", fill="#D66A00", font=entry_font,
+        )
+        pending_image: dict[str, Image.Image | None] = {"value": None}
 
         # 圆形发送按钮（橙色背景 + 白色箭头）
         btn_cx = popup_width - self._px(24)
@@ -665,7 +707,7 @@ class DesktopPet:
         )
 
         def _on_send_click(_event=None):
-            self._send_input_message(entry, popup)
+            self._send_input_message(entry, popup, pending_image["value"])
 
         # 用 Canvas 级别绑定 + 位置检查，避免重叠 item 重复触发
         btn_pos = {"x": btn_cx, "y": btn_cy, "r": btn_radius}
@@ -705,8 +747,12 @@ class DesktopPet:
                     self._px(12),
                 ),
             )
-            popup_canvas.coords(entry_window, self._px(16), height // 2)
-            popup_canvas.itemconfigure(entry_window, width=content_width - self._px(16))
+            badge_width = self._px(42) if pending_image["value"] is not None else 0
+            popup_canvas.coords(image_badge, self._px(16), height // 2)
+            popup_canvas.coords(entry_window, self._px(16) + badge_width, height // 2)
+            popup_canvas.itemconfigure(
+                entry_window, width=content_width - self._px(16) - badge_width
+            )
             # 重新定位圆形按钮
             new_cx = total_width - self._px(24)
             new_cy = height // 2
@@ -730,8 +776,34 @@ class DesktopPet:
             else:
                 popup.after_idle(_resize_popup)
 
+        def _on_paste(_event: tk.Event):
+            """Use the native text paste unless the clipboard contains an image."""
+            try:
+                clipboard = ImageGrab.grabclipboard()
+            except (OSError, NotImplementedError, tk.TclError):
+                return None
+            image: Image.Image | None = None
+            if isinstance(clipboard, Image.Image):
+                image = clipboard.copy()
+            elif isinstance(clipboard, list):
+                for candidate in clipboard:
+                    try:
+                        with Image.open(candidate) as opened:
+                            image = opened.copy()
+                        break
+                    except (OSError, TypeError):
+                        continue
+            if image is None:
+                return None
+            pending_image["value"] = image
+            popup_canvas.itemconfigure(image_badge, text="图片 ✓")
+            _resize_popup()
+            entry.focus_set()
+            return "break"
+
         entry.bind("<KeyRelease>", _on_key)
         entry.bind("<KeyPress>", lambda e: popup.after_idle(_resize_popup))
+        entry.bind("<<Paste>>", _on_paste)
         popup.bind("<FocusOut>", lambda e: self._close_input_popup(popup))
         popup.bind("<Escape>", lambda e: self._close_input_popup(popup))
 
@@ -748,7 +820,12 @@ class DesktopPet:
         if self._input_popup is popup:
             self._input_popup = None
 
-    def _send_input_message(self, entry: tk.Entry, popup: tk.Toplevel) -> None:
+    def _send_input_message(
+        self,
+        entry: tk.Entry,
+        popup: tk.Toplevel,
+        image: Image.Image | None = None,
+    ) -> None:
         """发送输入框中的消息给 SJTUClaw。"""
         # 防重入：popup 已关闭则跳过（Enter + 点击可能同时触发）
         try:
@@ -757,47 +834,48 @@ class DesktopPet:
         except tk.TclError:
             return
         text = entry.get().strip()
-        if not text:
+        if not text and image is None:
             return
         self._close_input_popup(popup)
         self._set_local_message("消息已发送，执行中…")
         threading.Thread(
-            target=self._send_message_worker, args=(text,), daemon=True
+            target=self._send_message_worker, args=(text, image), daemon=True
         ).start()
 
-    def _send_message_worker(self, text: str) -> None:
+    def _recent_or_new_session_id(self) -> str | None:
+        """Resolve the most recent session, creating one only when none exist."""
+        sessions = self.client.fetch_sessions()
+        if sessions:
+            recent = sessions[0]
+            return recent.get("sessionId") or recent.get("session_id") or recent.get("id")
+        created = self.client.create_session()
+        return created.get("sessionId") or created.get("session_id")
+
+    def _send_message_worker(
+        self, text: str, image: Image.Image | None = None
+    ) -> None:
         """在后台线程中发送消息（/chat 是同步阻塞的）。
 
         始终使用最近活跃的 session；fetch_sessions 失败时不新建 session。
         只有 fetch 成功且返回空列表（系统中无任何 session）时才创建新的。
         """
-        # 1. 获取 session 列表；失败则直接返回，不新建 session
         try:
-            sessions = self.client.fetch_sessions()
+            sid = self._recent_or_new_session_id()
+            if not sid:
+                raise RuntimeError("无法创建会话")
+            attachment_ids: list[str] = []
+            if image is not None:
+                filename = time.strftime("clipboard-%Y%m%d-%H%M%S.png")
+                upload = self.client.upload_image(sid, image, filename)
+                attachment = upload.get("attachment") or {}
+                attachment_id = attachment.get("id")
+                if not upload.get("ok") or not attachment_id:
+                    raise RuntimeError("图片上传失败")
+                attachment_ids.append(str(attachment_id))
+            result = self.client.send_message(sid, text, attachment_ids)
+            self._show_reply(result)
         except Exception:
-            return
-
-        # 2. 有 session → 使用最近的
-        if sessions:
-            recent = sessions[0]
-            sid = recent.get("sessionId") or recent.get("session_id") or recent.get("id")
-            if sid:
-                try:
-                    result = self.client.send_message(sid, text)
-                    self._show_reply(result)
-                except Exception:
-                    pass
-                return
-
-        # 3. fetch 成功但无 session → 创建新的
-        try:
-            created = self.client.create_session()
-            new_sid = created.get("sessionId") or created.get("session_id")
-            if new_sid:
-                result = self.client.send_message(new_sid, text)
-                self._show_reply(result)
-        except Exception:
-            pass
+            self.root.after(0, lambda: self._set_local_message("消息发送失败，请重试"))
 
     def _show_reply(self, result: dict | None) -> None:
         """从 /chat 响应中提取 reply，在气泡中显示。

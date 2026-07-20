@@ -5,6 +5,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from PIL import Image
 
@@ -14,6 +15,8 @@ from claw.pet.app import (
     IDLE_DURATION_MULTIPLIER,
     NON_IDLE_REPEAT_COUNT,
     PET_BASE_SCALE,
+    DesktopPet,
+    GatewayClient,
     _make_color_key_safe,
     _rounded_rectangle_points,
     _single_instance_lock,
@@ -140,6 +143,76 @@ class PetStateBrokerTests(unittest.TestCase):
         cleaned = _make_color_key_safe(image)
         alpha = cleaned.getchannel("A")
         self.assertEqual([alpha.getpixel((x, 0)) for x in range(3)], [0, 0, 255])
+
+
+class GatewayClientImageUploadTests(unittest.TestCase):
+    def test_clipboard_image_is_uploaded_as_png_multipart(self):
+        captured = {}
+
+        class _Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return b'{"ok": true}'
+
+        def _urlopen(request, timeout):
+            captured["request"] = request
+            captured["timeout"] = timeout
+            return _Response()
+
+        client = GatewayClient("http://127.0.0.1:8000")
+        image = Image.new("RGB", (2, 2), (255, 0, 0))
+        with patch("claw.pet.app.urllib.request.urlopen", side_effect=_urlopen):
+            result = client.upload_image("session-a", image, "clipboard.png")
+
+        request = captured["request"]
+        self.assertTrue(result["ok"])
+        self.assertEqual(
+            request.full_url,
+            "http://127.0.0.1:8000/sessions/session-a/attachments?persistMessage=false",
+        )
+        self.assertIn("multipart/form-data; boundary=", request.headers["Content-type"])
+        self.assertIn(b'filename="clipboard.png"', request.data)
+        self.assertIn(b"\x89PNG\r\n\x1a\n", request.data)
+        self.assertEqual(captured["timeout"], 60.0)
+
+    def test_desktop_pet_uploads_pending_image_then_sends_text_and_attachment_id(self):
+        calls = []
+
+        class _Client:
+            def fetch_sessions(self):
+                calls.append(("fetch_sessions",))
+                return [{"sessionId": "session-a"}]
+
+            def upload_image(self, session_id, image, filename):
+                calls.append(("upload_image", session_id, image, filename))
+                return {"ok": True, "attachment": {"id": "att_clipboard"}}
+
+            def send_message(self, session_id, message, attachment_ids):
+                calls.append(("send_message", session_id, message, attachment_ids))
+                return {"ok": True, "reply": "图片分析完成"}
+
+        pet = DesktopPet.__new__(DesktopPet)
+        pet.client = _Client()
+        replies = []
+        pet._show_reply = replies.append
+        pet.root = type("_Root", (), {"after": lambda _self, _delay, callback: callback()})()
+        image = Image.new("RGB", (2, 2), (0, 128, 255))
+
+        pet._send_message_worker("请分析图片", image)
+
+        self.assertEqual(calls[0], ("fetch_sessions",))
+        self.assertEqual(calls[1][0:2], ("upload_image", "session-a"))
+        self.assertTrue(calls[1][3].startswith("clipboard-"))
+        self.assertEqual(
+            calls[2],
+            ("send_message", "session-a", "请分析图片", ["att_clipboard"]),
+        )
+        self.assertEqual(replies, [{"ok": True, "reply": "图片分析完成"}])
 
 
 if __name__ == "__main__":

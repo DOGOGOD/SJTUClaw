@@ -119,6 +119,105 @@ def test_web_attachment_image_is_persisted_as_message(monkeypatch, tmp_path):
     assert response.media_type == "image/png"
 
 
+def test_web_attachment_markdown_escapes_bracketed_filename(monkeypatch, tmp_path):
+    from claw.gateway import server
+    from claw.session.store import SessionStore
+
+    store = SessionStore(tmp_path / "session-data")
+    session = store.create_session(session_id="bracket-image-session")
+    monkeypatch.setattr(server, "_session_store", store)
+    monkeypatch.setattr(server, "SESSIONS_DIR", tmp_path / "session-data")
+
+    upload = UploadFile(
+        BytesIO(b"image-bytes"),
+        filename="IMG_30[1].PNG",
+        headers={"content-type": "image/png"},
+    )
+    result = asyncio.run(server.upload_attachment(session.session_id, upload))
+
+    assert "![IMG_30&#91;1&#93;.PNG](" in result["message"]["content"]
+
+
+def test_pending_web_image_is_not_persisted_until_chat_send(monkeypatch, tmp_path):
+    from claw.gateway import server
+    from claw.session.store import SessionStore
+
+    store = SessionStore(tmp_path / "session-data")
+    session = store.create_session(session_id="pending-image-session")
+    monkeypatch.setattr(server, "_session_store", store)
+    monkeypatch.setattr(server, "SESSIONS_DIR", tmp_path / "session-data")
+
+    upload = UploadFile(
+        BytesIO(b"image-bytes"),
+        filename="pasted.png",
+        headers={"content-type": "image/png"},
+    )
+    result = asyncio.run(
+        server.upload_attachment(session.session_id, upload, persist_message=False)
+    )
+
+    assert result["ok"] is True
+    assert store.get(session.session_id).messages == []
+
+
+def test_context_builder_sends_local_image_as_multimodal_content(tmp_path):
+    from claw.context.builder import _multimodal_user_content
+
+    image = tmp_path / "pasted.png"
+    image.write_bytes(b"png-image-data")
+    content = _multimodal_user_content("请描述图片", [str(image)])
+
+    assert isinstance(content, list)
+    assert content[0] == {"type": "text", "text": "请描述图片"}
+    assert content[1]["type"] == "image_url"
+    assert content[1]["image_url"]["url"].startswith("data:image/png;base64,")
+
+
+def test_chat_sends_uploaded_image_and_text_in_one_agent_turn(monkeypatch, tmp_path):
+    from claw.gateway import server
+    from claw.gateway.server import ChatRequest
+    from claw.session.store import SessionStore
+
+    store = SessionStore(tmp_path / "session-data")
+    session = store.create_session(session_id="combined-image-session")
+    monkeypatch.setattr(server, "_session_store", store)
+    monkeypatch.setattr(server, "SESSIONS_DIR", tmp_path / "session-data")
+    monkeypatch.setattr(server, "_llm_ready", lambda: True)
+    monkeypatch.setattr(server, "auto_title_if_first_turn", lambda *args, **kwargs: None)
+
+    upload = UploadFile(
+        BytesIO(b"image-bytes"),
+        filename="pasted.png",
+        headers={"content-type": "image/png"},
+    )
+    uploaded = asyncio.run(
+        server.upload_attachment(session.session_id, upload, persist_message=False)
+    )
+    captured = {}
+
+    def _run_agent_turn(session_id, message, **kwargs):
+        captured["message"] = message
+        captured["media"] = kwargs.get("media")
+        current = store.get(session_id)
+        current.append_message("user", message, media=kwargs.get("media"))
+        current.append_message("assistant", "我看到了图片")
+        store.save(current)
+        return "我看到了图片"
+
+    monkeypatch.setattr(server, "run_agent_turn", _run_agent_turn)
+    result = asyncio.run(server.handle_chat(ChatRequest(
+        sessionId=session.session_id,
+        message="这张图里有什么？",
+        attachmentIds=[uploaded["attachment"]["id"]],
+    )))
+
+    assert result["reply"] == "我看到了图片"
+    assert "这张图里有什么？" in captured["message"]
+    assert "![pasted.png]" in captured["message"]
+    assert len(captured["media"]) == 1
+    assert store.get(session.session_id).messages[0].media == captured["media"]
+
+
 def test_local_image_endpoint_rejects_outside_workspace(monkeypatch, tmp_path):
     from fastapi import HTTPException
     from claw.gateway import server

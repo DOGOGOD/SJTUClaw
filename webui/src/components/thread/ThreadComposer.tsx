@@ -1,16 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ArrowUp, Plus, FolderOpen, FolderSearch, Square } from "lucide-react";
+import { ArrowUp, Plus, FolderOpen, FolderSearch, ImageIcon, Square, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
 import { fetchWorkspace, pickWorkspace, setWorkspace, unsetWorkspace } from "@/lib/api";
 
 interface ThreadComposerProps {
-  onSend: (message: string) => Promise<void>;
+  onSend: (message: string, attachments?: File[]) => Promise<void>;
   onStop?: () => Promise<void>;
   disabled?: boolean;
   sending?: boolean;
-  onAttach?: (file: File) => void;
   sessionId?: string | null;
   messageHistory?: string[];
   workspaceRefreshToken?: number;
@@ -22,7 +21,6 @@ export function ThreadComposer({
   onStop,
   disabled = false,
   sending = false,
-  onAttach,
   sessionId,
   messageHistory,
   workspaceRefreshToken = 0,
@@ -34,6 +32,7 @@ export function ThreadComposer({
   const [wsDisplay, setWsDisplay] = useState("");
   const [wsError, setWsError] = useState("");
   const [sendError, setSendError] = useState("");
+  const [pendingImages, setPendingImages] = useState<Array<{ file: File; url: string }>>([]);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const wsRef = useRef<HTMLDivElement>(null);
@@ -41,6 +40,7 @@ export function ThreadComposer({
   const historyRef = useRef(new Map<string, string[]>());
   const historyIndexRef = useRef<number | null>(null);
   const historyDraftRef = useRef("");
+  const pendingImagesRef = useRef<Array<{ file: File; url: string }>>([]);
 
   const historyKey = sessionId || "__home__";
 
@@ -65,7 +65,19 @@ export function ThreadComposer({
     historyIndexRef.current = null;
     historyDraftRef.current = "";
     setSendError("");
+    setPendingImages((current) => {
+      current.forEach((item) => item.url && URL.revokeObjectURL(item.url));
+      return [];
+    });
   }, [sessionId]);
+
+  useEffect(() => {
+    pendingImagesRef.current = pendingImages;
+  }, [pendingImages]);
+
+  useEffect(() => () => {
+    pendingImagesRef.current.forEach((item) => item.url && URL.revokeObjectURL(item.url));
+  }, []);
 
   useEffect(() => {
     if (!messageHistory) return;
@@ -101,13 +113,28 @@ export function ThreadComposer({
     setValue(nextValue);
   }, []);
 
+  const addPendingImages = useCallback((files: File[]) => {
+    const supported = files.filter((file) => file.type.startsWith("image/") && file.size <= 20 * 1024 * 1024);
+    setSendError(supported.length !== files.length ? "仅支持不超过 20 MB 的图片。" : "");
+    setPendingImages((current) => {
+      const available = Math.max(0, 4 - current.length);
+      return [
+        ...current,
+        ...supported.slice(0, available).map((file) => ({
+          file,
+          url: typeof URL.createObjectURL === "function" ? URL.createObjectURL(file) : "",
+        })),
+      ];
+    });
+  }, []);
+
   const handleSend = useCallback(async () => {
     const trimmed = value.trim();
-    if (!trimmed || disabled || sending) return;
+    if ((!trimmed && pendingImages.length === 0) || disabled || sending) return;
 
     const history = historyRef.current.get(historyKey) || [];
-    const historyEntryIndex = history.length;
-    history.push(trimmed);
+    const historyEntryIndex = trimmed ? history.length : -1;
+    if (trimmed) history.push(trimmed);
     historyRef.current.set(historyKey, history);
     historyIndexRef.current = null;
     historyDraftRef.current = "";
@@ -115,17 +142,27 @@ export function ThreadComposer({
 
     // Clear immediately so slow network requests never leave stale text in the composer.
     updateValue("");
+    const sentImages = pendingImages;
+    setPendingImages([]);
     if (textareaRef.current) textareaRef.current.style.height = "auto";
 
     try {
-      await onSend(trimmed);
+      const files = sentImages.map((item) => item.file);
+      if (files.length > 0) await onSend(trimmed, files);
+      else await onSend(trimmed);
+      sentImages.forEach((item) => item.url && URL.revokeObjectURL(item.url));
     } catch (error) {
       // A rejected send is not part of the sent-message history.
-      if (history[historyEntryIndex] === trimmed) history.splice(historyEntryIndex, 1);
+      if (historyEntryIndex >= 0 && history[historyEntryIndex] === trimmed) history.splice(historyEntryIndex, 1);
       if (valueRef.current === "") updateValue(trimmed);
+      setPendingImages((current) => {
+        const combined = [...sentImages, ...current];
+        combined.slice(4).forEach((item) => item.url && URL.revokeObjectURL(item.url));
+        return combined.slice(0, 4);
+      });
       setSendError(error instanceof Error ? error.message : "消息发送失败，请重试。");
     }
-  }, [value, disabled, sending, historyKey, onSend, updateValue]);
+  }, [value, pendingImages, disabled, sending, historyKey, onSend, updateValue]);
 
   const handleStop = useCallback(async () => {
     if (!onStop) return;
@@ -192,12 +229,39 @@ export function ThreadComposer({
   const handleAttach = useCallback(() => fileInputRef.current?.click(), []);
   const handleFileChange = useCallback(
     (e: React.ChangeEvent<HTMLInputElement>) => {
-      const file = e.target.files?.[0];
-      if (file && onAttach) onAttach(file);
+      const files = Array.from(e.target.files || []).filter((file) => file.type.startsWith("image/"));
+      if (files.length > 0) addPendingImages(files);
       e.target.value = "";
     },
-    [onAttach]
+    [addPendingImages]
   );
+
+  const handlePaste = useCallback(
+    (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+      const itemImages = Array.from(e.clipboardData.items || [])
+        .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
+        .map((item) => item.getAsFile())
+        .filter((file): file is File => file !== null);
+      const images = itemImages.length > 0
+        ? itemImages
+        : Array.from(e.clipboardData.files || []).filter((file) => file.type.startsWith("image/"));
+
+      if (images.length === 0) return;
+      // An image paste is an attachment action. Prevent the browser from also
+      // inserting a filename or other clipboard representation into the draft.
+      e.preventDefault();
+      addPendingImages(images);
+    },
+    [addPendingImages]
+  );
+
+  const removePendingImage = useCallback((index: number) => {
+    setPendingImages((current) => {
+      const removed = current[index];
+      if (removed?.url) URL.revokeObjectURL(removed.url);
+      return current.filter((_, itemIndex) => itemIndex !== index);
+    });
+  }, []);
 
   const handlePickFolder = useCallback(async () => {
     setWsError("");
@@ -237,7 +301,7 @@ export function ThreadComposer({
     try { await unsetWorkspace(sid); setWsPath(""); setWsDisplay(""); setWsError(""); setShowWsPicker(false); } catch {}
   };
 
-  const hasContent = value.trim().length > 0;
+  const hasContent = value.trim().length > 0 || pendingImages.length > 0;
 
   return (
     <div className={cn(
@@ -252,7 +316,8 @@ export function ThreadComposer({
         value={value}
         onChange={handleValueChange}
         onKeyDown={handleKeyDown}
-        placeholder={home ? "Claw 能帮你做些什么？" : "继续对话..."}
+        onPaste={handlePaste}
+        placeholder="Chat or Work With Claw"
         disabled={disabled}
         rows={1}
         className={cn(
@@ -260,6 +325,28 @@ export function ThreadComposer({
           home && "min-h-[58px]"
         )}
       />
+
+      {pendingImages.length > 0 && (
+        <div className="flex gap-2 overflow-x-auto px-1 pt-2" aria-label="待发送图片">
+          {pendingImages.map((item, index) => (
+            <div key={`${item.file.name}-${item.file.lastModified}-${index}`} className="relative h-16 w-16 shrink-0 overflow-hidden rounded-xl border border-border/80 bg-muted/50">
+              {item.url ? (
+                <img src={item.url} alt={item.file.name || `图片 ${index + 1}`} className="h-full w-full object-cover" />
+              ) : (
+                <ImageIcon className="absolute inset-0 m-auto h-5 w-5 text-muted-foreground" />
+              )}
+              <button
+                type="button"
+                aria-label={`移除图片 ${index + 1}`}
+                onClick={() => removePendingImage(index)}
+                className="absolute right-1 top-1 grid h-5 w-5 place-items-center rounded-full bg-black/65 text-white hover:bg-black/80"
+              >
+                <X className="h-3 w-3" />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
 
       {sendError && <p role="alert" className="px-1 pt-1 text-[11px] leading-relaxed text-destructive">{sendError}</p>}
 
@@ -294,7 +381,7 @@ export function ThreadComposer({
       </div>
 
       {/* Attach */}
-      <input ref={fileInputRef} type="file" className="hidden" onChange={handleFileChange} />
+      <input ref={fileInputRef} type="file" accept="image/*" multiple className="hidden" onChange={handleFileChange} />
       <Button variant="ghost" size="icon-sm" onClick={handleAttach} className="h-8 w-8 shrink-0 rounded-xl" title="添加附件">
         <Plus className="h-3.5 w-3.5" />
       </Button>

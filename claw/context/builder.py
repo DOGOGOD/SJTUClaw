@@ -405,6 +405,52 @@ class ContextBuilder:
         workspace = self._workspace_manager.get(session_id)
         return str(workspace) if workspace is not None else None
 
+    def build_pi_append_prompt(self, session_id: str) -> str:
+        """Build SJTUClaw context that can safely extend Pi's native prompt.
+
+        Pi remains responsible for describing its active tools and their
+        calling guidelines.  In particular, the legacy SJTUClaw tool contract
+        is deliberately not copied here because its file-tool names differ
+        from Pi's native ``read``/``bash``/``edit``/``write`` tools.
+        """
+        import platform
+
+        workspace = self._resolve_workspace(session_id)
+        runtime = (
+            f"{'macOS' if platform.system() == 'Darwin' else platform.system()} "
+            f"{platform.machine()}, Python {platform.python_version()}"
+        )
+        identity_lines = [
+            "## SJTUClaw 运行环境",
+            runtime,
+            "",
+            "## 工作区",
+            f"当前工作区：`{workspace or '.'}`",
+            "",
+            "默认使用中文回复，除非用户明确要求其他语言。",
+        ]
+        if self._timezone:
+            identity_lines.append(f"当前时区：`{self._timezone}`")
+        sections = [
+            "\n".join(identity_lines),
+            self._system_prompt,
+            self._soul,
+        ]
+        bootstrap = self._build_bootstrap_block(workspace_path=workspace)
+        if bootstrap:
+            sections.append(bootstrap)
+        memory = self._build_memory_block()
+        if memory:
+            sections.append(memory)
+        sections.append(
+            "## Pi 与 SJTUClaw 集成规则\n\n"
+            "Pi 原生 system prompt 中列出的 Available tools、工具参数 schema "
+            "和工具专属 guidelines 是工具调用的权威说明。SJTUClaw 通过宿主工具桥接"
+            "补充长期记忆、Web、Cron 等能力；工具结果均来自实际执行，不得伪造。"
+            "会改变状态的操作仍受 SJTUClaw 审批与 workspace 边界约束。"
+        )
+        return "\n\n---\n\n".join(section for section in sections if section.strip())
+
     def _invalidate_cache(self) -> None:
         self._system_prefix_cache = None
         self._prefix_version += 1

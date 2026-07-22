@@ -29,7 +29,7 @@ from claw.scheduler.callbacks import (
 )
 from claw.scheduler import CronService
 from claw.llm.client import LLMClient
-from claw.pi import create_agent_client, is_pi_backend
+from claw.pi import RuntimeAgentClient, is_pi_backend
 from claw.memory.reflection import ReflectionManager
 from claw.memory.store import MemoryStore
 from claw.prompts import PromptLoadError, load_soul, load_system_prompt
@@ -73,7 +73,7 @@ def main() -> int:
         )
         logging.info("Pi Agent 已启用；辅助 LLM 未配置。")
 
-    client = create_agent_client(config)
+    client = RuntimeAgentClient(config)
     session_store = SessionStore(SESSIONS_DIR)
     memory_store = MemoryStore(MEMORY_DIR)
     workspace_manager = WorkspaceManager()

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from contextlib import nullcontext
+from typing import Callable
 from zoneinfo import ZoneInfo
 
 from claw.approval.manager import ApprovalManager
@@ -28,7 +29,7 @@ from claw.workspace.rollback import RollbackError, WorkspaceRollbackManager
 _COMMAND_PREFIXES = (
     "/session", "/memory", "/compact", "/workspace", "/approve", "/reject",
     "/approvals", "/skill", "/reflect", "/cron", "/help", "/auto",
-    "/unlimited", "/pet", "/rollback", "/stop", "/exit",
+    "/unlimited", "/pi", "/pet", "/rollback", "/stop", "/exit",
 )
 
 _HELP_TEXT = (
@@ -92,6 +93,9 @@ _HELP_TEXT = (
     "    status                   查看当前状态\n"
     "    on / off                 开启 / 关闭 UNLIMITED 模式\n"
     "    toggle                   切换 UNLIMITED 模式\n"
+    "  /pi                      检查并切换到 Pi Agent 后端\n"
+    "    status                   查看当前 Agent 后端\n"
+    "    off                      切回 SJTUClaw 原生后端\n"
     "  /stop                    终止当前正在运行的 Agent 任务\n"
     "  /exit                    退出当前会话\n"
 )
@@ -159,6 +163,9 @@ _HELP_MARKDOWN = """# SJTUClaw 可用指令
   - `/unlimited status`：查看当前状态
   - `/unlimited on` / `/unlimited off`：开启或关闭 UNLIMITED 模式
   - `/unlimited toggle`：切换 UNLIMITED 模式
+- `/pi` / `/pi on`：检查 Pi 运行环境并立即切换到 Pi Agent 后端
+- `/pi status`：查看当前 Agent 后端
+- `/pi off`：切回 SJTUClaw 原生后端
 
 > **安全提示：** AUTO 模式只会自动批准 workspace 内的操作。UNLIMITED 模式下涉及 workspace 外部的写入、覆盖、删除和 Shell 操作仍需用户明确审批。
 
@@ -214,6 +221,7 @@ class RuntimeState:
     # Optional callbacks for gateway integration
     stop_handler: Callable[[], str] | None = None  # () -> result text
     exit_handler: Callable[[], str] | None = None  # () -> result text
+    backend_switcher: Callable[[str], str] | None = None
 
 
 def is_command(user_input: str) -> bool:
@@ -259,6 +267,8 @@ def handle_command(user_input: str, state: RuntimeState, *, markdown: bool = Fal
         return finish(_handle_auto_command(args, state, markdown=markdown))
     if root == "/unlimited":
         return finish(_handle_unlimited_command(args, state, markdown=markdown))
+    if root == "/pi":
+        return finish(_handle_pi_command(args, state))
     if root == "/help":
         return _HELP_MARKDOWN if markdown else _HELP_TEXT
     if root == "/stop":
@@ -266,6 +276,20 @@ def handle_command(user_input: str, state: RuntimeState, *, markdown: bool = Fal
     if root == "/exit":
         return finish(_handle_exit_command(state))
     return finish(f"未知命令: {root}（输入 /help 查看可用指令）")
+
+
+def _handle_pi_command(args: list[str], state: RuntimeState) -> str:
+    """Switch the process-wide main agent backend through its entrypoint."""
+    action = args[0].lower() if args else "on"
+    target = {
+        "on": "pi", "enable": "pi",
+        "off": "sjtuclaw", "disable": "sjtuclaw",
+    }.get(action, action)
+    if target not in {"pi", "sjtuclaw", "status"}:
+        return "用法: /pi [on|off|status]"
+    if state.backend_switcher is None:
+        return "[错误] 当前入口不支持运行时切换 Agent 后端。"
+    return state.backend_switcher(target)
 
 
 def _format_command_markdown(result: str) -> str:
@@ -598,6 +622,16 @@ def _delete_memory(memory_id: str, state: RuntimeState) -> str:
 
 
 def _handle_compact_command(state: RuntimeState) -> str:
+    pi_compact = getattr(state.llm_client, "compact_session", None)
+    if callable(pi_compact):
+        try:
+            return pi_compact(
+                state.current_session_id,
+                session_store=state.session_store,
+            )
+        except Exception as exc:
+            return f"[错误] Pi session 压缩失败：{exc}"
+
     session = state.session_store.get(state.current_session_id)
 
     if len(session.messages) <= KEEP_RECENT_MESSAGES_MIN:

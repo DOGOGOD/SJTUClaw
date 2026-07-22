@@ -13,8 +13,9 @@ from fastapi import HTTPException
 from claw.agent.events import FinalEvent, ToolCallEndEvent, ToolCallStartEvent
 from claw.approval.manager import ApprovalStatus
 from claw.config import LLMConfig
-from claw.pi.client import PiAgentClient, PiRuntimeConfig
+from claw.pi.client import PiAgentClient, PiRuntimeConfig, RuntimeAgentClient
 from claw.session.store import SessionStore
+from claw.tools.base import Tool, ToolRegistry, ToolResult
 
 
 _FAKE_PI = r'''
@@ -62,6 +63,16 @@ send({"type":"response","id":command["id"],"command":"prompt","success":True})
 send({"type":"message_end","message":{"role":"assistant","content":[],"stopReason":"error","errorMessage":"Connection error."}})
 send({"type":"auto_retry_end","success":False,"attempt":3,"finalError":"Connection error."})
 send({"type":"agent_settled"})
+'''
+
+_COMPACT_PI = r'''
+import json, sys
+command = json.loads(sys.stdin.readline())
+sys.stdout.write(json.dumps({
+    "type":"response", "id":command["id"], "command":"compact", "success":True,
+    "data":{"summary":"native pi summary", "tokensBefore":1234}
+}) + "\n")
+sys.stdout.flush()
 '''
 
 
@@ -145,6 +156,17 @@ def test_pi_model_error_is_not_reported_as_empty_success(tmp_path, monkeypatch):
     result = client.run_agent_turn("pi-test", "失败", session_store=store)
 
     assert result == "Pi Agent 执行失败：Connection error."
+
+
+def test_pi_manual_compact_uses_native_rpc_command(tmp_path, monkeypatch):
+    monkeypatch.setattr("claw.pi.client.load_pi_config", lambda: _runtime(tmp_path, _COMPACT_PI))
+    client, store = _client_and_store(tmp_path)
+
+    result = client.compact_session("pi-test", session_store=store)
+
+    assert "Pi session 已完成原生压缩" in result
+    assert "1234 tokens" in result
+    assert "native pi summary" in result
 
 
 def test_pi_uses_session_bound_workspace_as_process_cwd(tmp_path, monkeypatch):
@@ -286,3 +308,201 @@ def test_settings_reject_invalid_pi_thinking_before_applying_runtime():
         server.update_llm_settings(request)
 
     assert exc_info.value.status_code == 400
+
+
+def test_pi_command_uses_native_prompt_and_only_appends_sjtu_context(tmp_path):
+    prompt = tmp_path / "sjtu-prompt.md"
+    prompt.write_text("SJTU context", encoding="utf-8")
+    config = _runtime(tmp_path, _ERROR_PI)
+    config = PiRuntimeConfig(**{**config.__dict__, "append_prompt_file": prompt})
+
+    command = PiAgentClient._build_command(config, "session-id")
+
+    assert "--system-prompt" not in command
+    assert command.count("--append-system-prompt") == 1
+    assert str(prompt) in command
+    assert any(value.endswith("sjtuclaw_tools.ts") for value in command)
+
+
+def test_pi_append_prompt_keeps_identity_memory_but_not_legacy_tool_contract(tmp_path):
+    from claw.context.builder import ContextBuilder
+    from claw.memory.store import MemoryStore
+
+    memory = MemoryStore(tmp_path / "memory")
+    memory.add(
+        content="用户偏好深色主题",
+        category="user_preference",
+        tags=[],
+        importance=4,
+    )
+    builder = ContextBuilder("SJTU system", "SJTU soul", memory, workspace_path=str(tmp_path))
+
+    prompt = builder.build_pi_append_prompt("session-a")
+
+    assert "SJTU system" in prompt and "SJTU soul" in prompt
+    assert "用户偏好深色主题" in prompt
+    assert "Pi 原生 system prompt" in prompt
+    assert "find_files" not in prompt
+    assert "edit_file" not in prompt
+
+
+def test_pi_runtime_manifest_bridges_sjtu_tools_but_not_native_equivalents(tmp_path):
+    registry = ToolRegistry()
+    registry.register(Tool("recall", "Recall memory", {"type": "object", "properties": {}}, lambda _args: ToolResult(True, "ok")))
+    registry.register(Tool("read_file", "Legacy reader", {"type": "object", "properties": {}}, lambda _args: ToolResult(True, "ok")))
+    config = _runtime(tmp_path, _ERROR_PI)
+
+    files = PiAgentClient._write_runtime_files(
+        config, "pi-session", session_id="s", context_builder=None, tool_registry=registry,
+    )
+    manifest = json.loads(files["tools"].read_text(encoding="utf-8"))
+
+    assert [tool["name"] for tool in manifest["tools"]] == ["recall"]
+    assert manifest["tools"][0]["description"] == "Recall memory"
+
+
+def test_pi_host_tool_bridge_executes_registry_tool():
+    registry = ToolRegistry()
+    registry.register(Tool(
+        "echo_host", "Echo", {
+            "type": "object",
+            "properties": {"value": {"type": "string"}},
+            "required": ["value"],
+        }, lambda args: ToolResult(True, args["value"]),
+    ))
+    replies = []
+    payload = json.dumps({"toolName": "echo_host", "input": {"value": "桥接成功"}})
+
+    PiAgentClient._handle_ui_request(
+        {"type": "extension_ui_request", "id": "bridge", "method": "input",
+         "title": "SJTUClaw 工具桥接", "placeholder": payload},
+        replies.append, session_id="s", approval_handler=None, tool_registry=registry,
+    )
+
+    response = json.loads(replies[0]["value"])
+    assert response == {"ok": True, "result": "桥接成功"}
+
+
+def test_pi_host_tool_bridge_fails_closed_for_unapproved_write():
+    executed = []
+    registry = ToolRegistry()
+    registry.register(Tool(
+        "host_write", "Write", {"type": "object", "properties": {}},
+        lambda _args: executed.append(True) or ToolResult(True, "written"),
+        safety_level="write",
+    ))
+
+    response = json.loads(PiAgentClient._execute_host_tool(
+        json.dumps({"toolName": "host_write", "input": {}}),
+        session_id="s", tool_registry=registry, approval_handler=None,
+        trust_tools=False, auto_mode=False, unlimited_mode=False,
+    ))
+
+    assert response["ok"] is False
+    assert executed == []
+
+
+def test_pi_host_tool_bridge_rejects_spoofed_token():
+    registry = ToolRegistry()
+    registry.register(Tool(
+        "host_read", "Read", {"type": "object", "properties": {}},
+        lambda _args: ToolResult(True, "secret"),
+    ))
+
+    response = json.loads(PiAgentClient._execute_host_tool(
+        json.dumps({"token": "wrong", "toolName": "host_read", "input": {}}),
+        session_id="s", tool_registry=registry, approval_handler=None,
+        trust_tools=False, auto_mode=False, unlimited_mode=False,
+        bridge_token="expected",
+    ))
+
+    assert response == {"ok": False, "result": "SJTUClaw 工具桥接认证失败。"}
+
+
+def test_pi_slash_command_switches_backend_through_runtime_callback(tmp_path):
+    from claw.cli.commands import RuntimeState, handle_command, is_command
+    from claw.memory.store import MemoryStore
+
+    calls = []
+    state = RuntimeState(
+        session_store=SessionStore(tmp_path / "sessions"),
+        memory_store=MemoryStore(tmp_path / "memory"),
+        llm_client=object(),
+        current_session_id="s",
+        backend_switcher=lambda target: calls.append(target) or f"switched:{target}",
+    )
+
+    assert is_command("/pi") is True
+    assert handle_command("/pi", state) == "switched:pi"
+    assert handle_command("/pi status", state) == "switched:status"
+    assert handle_command("/pi off", state) == "switched:sjtuclaw"
+    assert calls == ["pi", "status", "sjtuclaw"]
+
+
+def test_gateway_pi_command_updates_runtime_backend(monkeypatch):
+    from claw.gateway import server
+    import claw.pi as pi_module
+
+    settings = {"AGENT_BACKEND": "sjtuclaw"}
+    applied = []
+    monkeypatch.setattr(
+        server,
+        "setting_value",
+        lambda name, default="": settings.get(name, default),
+    )
+    monkeypatch.setattr(server, "load_runtime_settings_raw", lambda: dict(settings))
+    monkeypatch.setattr(server, "replace_runtime_settings_raw", lambda values: settings.update(values))
+    monkeypatch.setattr(server, "update_runtime_settings", lambda values: settings.update(values))
+    monkeypatch.setattr(server, "_apply_llm_runtime_config", lambda: applied.append(settings["AGENT_BACKEND"]))
+    monkeypatch.setattr(server, "_session_turn_active", lambda _sid: False)
+    monkeypatch.setattr(pi_module, "load_pi_config", lambda: object())
+
+    result = server._execute_slash_command("/pi", "pi-command-test")
+
+    assert "已接入 Pi" in result
+    assert settings["AGENT_BACKEND"] == "pi"
+    assert applied == ["pi"]
+
+
+def test_runtime_agent_router_switches_background_and_foreground_capability(monkeypatch):
+    class Legacy:
+        config = LLMConfig("key", "https://example.test/v1", "legacy")
+
+        def chat(self, *_args, **_kwargs):
+            return "legacy-chat"
+
+        def chat_with_tools(self, *_args, **_kwargs):
+            return "legacy-tools"
+
+    legacy = Legacy()
+    monkeypatch.setattr("claw.pi.client.create_agent_client", lambda _config: legacy)
+    router = RuntimeAgentClient(legacy.config)
+    assert router.chat([]) == "legacy-chat"
+    assert getattr(router, "run_agent_turn", None) is None
+
+    pi = PiAgentClient(LLMConfig("", "https://example.test/v1", ""))
+    router.set_client(pi)
+    assert callable(getattr(router, "run_agent_turn"))
+    assert callable(getattr(router, "compact_session"))
+
+
+def test_compact_command_routes_to_pi_native_compaction(tmp_path):
+    from claw.cli.commands import RuntimeState, handle_command
+    from claw.memory.store import MemoryStore
+
+    class PiLike:
+        def compact_session(self, session_id, *, session_store):
+            assert session_id == "s"
+            assert session_store is store
+            return "native compact ok"
+
+    store = SessionStore(tmp_path / "sessions")
+    store.save(store.create_session(session_id="s"))
+    state = RuntimeState(
+        session_store=store,
+        memory_store=MemoryStore(tmp_path / "memory"),
+        llm_client=PiLike(),
+        current_session_id="s",
+    )
+
+    assert handle_command("/compact", state) == "native compact ok"

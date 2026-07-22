@@ -291,6 +291,7 @@ dist\installer\SJTUClaw-Setup-0.1.0.exe
 /skill list|show|usage|<name>
 /auto on|off|toggle|status
 /unlimited on|off|toggle|status
+/pi [on|off|status]
 /cron list|status|disable|enable|delete
 /approvals|approve|reject
 /pet status|list|open|close|select|autostart

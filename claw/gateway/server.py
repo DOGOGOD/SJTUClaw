@@ -150,7 +150,7 @@ class RuntimeLLMClient:
         ``run_agent_turn`` must remain absent for the legacy client so the
         shared loop does not bypass its normal Think/Act/Observe path.
         """
-        if name == "run_agent_turn":
+        if name in {"run_agent_turn", "compact_session"}:
             client = self.__dict__.get("_client")
             runner = getattr(client, name, None) if client is not None else None
             if callable(runner):
@@ -1311,8 +1311,8 @@ def _execute_slash_command(
 
     sid = session_id or "default"
     root = command.strip().split(maxsplit=1)[0].lower() if command.strip() else ""
-    if root == "/workspace" and _session_turn_active(sid):
-        return "[错误] 当前任务正在运行，请先停止任务后再修改 workspace。"
+    if root in {"/workspace", "/pi"} and _session_turn_active(sid):
+        return "[错误] 当前任务正在运行，请先停止任务后再修改运行配置。"
 
     def _stop_impl() -> str:
         found = _cancel_active_turn(sid)
@@ -1327,6 +1327,35 @@ def _execute_slash_command(
         _auto_mode.pop(sid, None)
         _workspace_manager.set_unlimited(sid, False)
         return "bye."
+
+    def _switch_backend(target: str) -> str:
+        current = setting_value("AGENT_BACKEND", "sjtuclaw").strip().lower()
+        if target == "status":
+            return f"当前 Agent 后端：{'Pi' if current == 'pi' else 'SJTUClaw'}。"
+        if target == current:
+            if target == "pi":
+                try:
+                    from claw.pi import load_pi_config
+                    load_pi_config()
+                except Exception as exc:
+                    return f"[错误] Pi Agent 运行环境不可用：{exc}"
+                return "Pi Agent 后端已连接，运行环境检查通过。"
+            return f"Agent 后端已经是 {'Pi' if target == 'pi' else 'SJTUClaw'}。"
+        previous = load_runtime_settings_raw()
+        try:
+            if target == "pi":
+                from claw.pi import load_pi_config
+                load_pi_config()
+            update_runtime_settings({"AGENT_BACKEND": target})
+            _apply_llm_runtime_config()
+        except Exception as exc:
+            replace_runtime_settings_raw(previous)
+            try:
+                _apply_llm_runtime_config()
+            except Exception:
+                logger.exception("恢复先前 Agent 后端失败")
+            return f"[错误] Agent 后端切换失败：{exc}"
+        return "已接入 Pi Agent 后端。" if target == "pi" else "已切回 SJTUClaw 原生后端。"
 
     state = RuntimeState(
         session_store=_session_store,
@@ -1345,6 +1374,7 @@ def _execute_slash_command(
         auto_mode=_auto_mode.get(sid, False),
         stop_handler=_stop_impl,
         exit_handler=_exit_impl,
+        backend_switcher=_switch_backend,
     )
     result = handle_command(command, state, markdown=True)
     if state_out is not None:
@@ -1518,6 +1548,8 @@ async def handle_command(req: CommandRequest):
         actions = []
     elif root == "/unlimited":
         actions = ["reload_unlimited_mode"]
+    elif root == "/pi":
+        actions = ["reload_sessions"]
 
     resp: dict = {
         "ok": True,

@@ -21,6 +21,15 @@ cp .env.example .env
 设置 `AGENT_BACKEND=pi` 后，主对话由 Pi coding agent 的官方 RPC 模式执行；
 标题生成、反思等辅助服务仍复用现有 LLM 配置。Pi 的模型提供商、工具循环、
 Skills、Extensions、自动压缩、重试和持久会话均保留，WebUI、QQ 与桌宠接口不变。
+也可以在 CLI、WebUI 或 QQ 对话中输入 `/pi`，系统会先检查 Pi 运行环境并立即
+切换后端；`/pi status` 查看当前后端，`/pi off` 切回 SJTUClaw 原生后端。
+
+SJTUClaw 不替换 Pi 的默认 system prompt。Pi 会根据实际启用的工具自动生成
+`Available tools`、每个工具的 `promptSnippet` 与 `promptGuidelines`；SJTUClaw
+只追加身份、人格、长期记忆和运行环境。长期记忆、Web、Cron、下载等宿主工具
+通过 Extension 桥接进入同一份 Pi 工具清单与 schema，并继续使用 SJTUClaw
+ToolRegistry、审批流程和 workspace 边界。
+Pi 后端下的 `/compact` 会直接调用 Pi RPC 的原生压缩命令，不依赖辅助 LLM。
 
 启动前先构建相邻的 `pi` 仓库，或把 `pi` 安装到系统命令路径。SJTUClaw 按
 `PI_COMMAND`、`PI_CLI_PATH`、相邻 Pi 构建产物、系统 `pi` 的顺序查找。

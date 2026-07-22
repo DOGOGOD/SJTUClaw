@@ -15,6 +15,7 @@ const SLASH_COMMANDS = new Set([
   "/help",
   "/auto",
   "/unlimited",
+  "/pi",
   "/stop",
 ]);
 

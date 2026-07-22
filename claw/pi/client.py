@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import base64
+import hmac
 import hashlib
 import json
 import logging
 import mimetypes
 import os
 import queue
+import secrets
 import shlex
 import shutil
 import subprocess
@@ -42,6 +44,9 @@ class PiRuntimeConfig:
     model: str = ""
     thinking: str = ""
     agent_dir: Path | None = None
+    append_prompt_file: Path | None = None
+    tool_manifest_file: Path | None = None
+    bridge_token: str = ""
     trust_tools: bool = False
     turn_timeout_s: float = 1800.0
 
@@ -136,10 +141,71 @@ class PiAgentClient(LLMClient):
             raise LLMError("Pi 主后端已启用，但辅助 LLM 未配置。")
         return self._aux_client.chat_with_tools(*args, **kwargs)
 
-    def run_agent_turn(self, session_id: str, user_message: str, *, session_store, context_builder=None,
-                       approval_handler=None, media=None, event_callback=None,
-                       cancel_event=None, input_event=None, rollback_message_id=None,
-                       rollback_checkpoint_id=None, skill_source="", skill_name="", **_ignored) -> str:
+    def compact_session(self, session_id: str, *, session_store) -> str:
+        """Run Pi's native manual compaction for the mapped persistent session."""
+        config = self._effective_config()
+        session = session_store.get(session_id)
+        generation = str(session.metadata.get("pi_session_generation") or "1")
+        pi_session_id = _session_token(session_id, generation)
+        config.session_dir.mkdir(parents=True, exist_ok=True)
+        command = self._build_command(config, pi_session_id)
+        proc = subprocess.Popen(
+            command,
+            cwd=str(config.cwd),
+            env=self._child_env(config),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        )
+        stderr: list[str] = []
+        threading.Thread(target=self._collect_stderr, args=(proc, stderr), daemon=True).start()
+        events: queue.Queue[str | None] = queue.Queue()
+        threading.Thread(target=self._collect_stdout, args=(proc, events), daemon=True).start()
+        try:
+            if proc.stdin is None:
+                raise PiError("Pi RPC 标准输入不可用。")
+            proc.stdin.write(json.dumps({"id": "sjtu-compact", "type": "compact"}) + "\n")
+            proc.stdin.flush()
+            deadline = time.monotonic() + config.turn_timeout_s
+            while time.monotonic() < deadline:
+                try:
+                    line = events.get(timeout=0.1)
+                except queue.Empty:
+                    if proc.poll() is not None and events.empty():
+                        break
+                    continue
+                if line is None:
+                    if proc.poll() is not None:
+                        break
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if event.get("type") == "response" and event.get("id") == "sjtu-compact":
+                    if not event.get("success"):
+                        raise PiError(str(event.get("error") or "Pi 压缩失败"))
+                    data = event.get("data") or {}
+                    summary = str(data.get("summary") or "").strip()
+                    tokens_before = data.get("tokensBefore")
+                    detail = f"，压缩前约 {tokens_before} tokens" if tokens_before is not None else ""
+                    return f"Pi session 已完成原生压缩{detail}。" + (f"\n\n摘要：\n{summary}" if summary else "")
+            if time.monotonic() >= deadline:
+                raise PiError(f"Pi 压缩超过 {config.turn_timeout_s:g} 秒仍未完成。")
+            raise PiError(f"Pi 进程提前退出（code={proc.poll()}）。{''.join(stderr)[-2000:].strip()}")
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+
+    def _effective_config(self) -> PiRuntimeConfig:
         config = load_pi_config()
         if (
             not config.provider
@@ -148,11 +214,15 @@ class PiAgentClient(LLMClient):
             and self._config.base_url
             and self._config.model
         ):
-            config = replace(
-                config,
-                provider="sjtuclaw",
-                model=self._config.model,
-            )
+            return replace(config, provider="sjtuclaw", model=self._config.model)
+        return config
+
+    def run_agent_turn(self, session_id: str, user_message: str, *, session_store, context_builder=None,
+                       tool_registry=None, approval_handler=None, media=None, event_callback=None,
+                       cancel_event=None, input_event=None, rollback_message_id=None,
+                       rollback_checkpoint_id=None, skill_source="", skill_name="",
+                       auto_mode=False, unlimited_mode=False, **_ignored) -> str:
+        config = self._effective_config()
         workspace_resolver = getattr(context_builder, "bound_workspace", None)
         if callable(workspace_resolver):
             bound_workspace = workspace_resolver(session_id)
@@ -161,6 +231,8 @@ class PiAgentClient(LLMClient):
         config.session_dir.mkdir(parents=True, exist_ok=True)
         session = session_store.get(session_id)
         generation = str(session.metadata.get("pi_session_generation") or "1")
+        pi_session_id = _session_token(session_id, generation)
+        config = replace(config, bridge_token=secrets.token_urlsafe(32))
         session.metadata["pi_session_generation"] = generation
         needs_handoff = (
             session.metadata.get("pi_session_owner") != session_id
@@ -185,15 +257,37 @@ class PiAgentClient(LLMClient):
             session_store.save(current, fsync=True)
 
         started = time.monotonic()
+        runtime_files: dict[str, Path] = {}
         try:
-            result = self._run_rpc(self._build_command(config, _session_token(session_id, generation)), config, prompt,
+            runtime_files = self._write_runtime_files(
+                config,
+                pi_session_id,
+                session_id=session_id,
+                context_builder=context_builder,
+                tool_registry=tool_registry,
+            )
+            if runtime_files:
+                config = replace(
+                    config,
+                    append_prompt_file=runtime_files.get("prompt"),
+                    tool_manifest_file=runtime_files.get("tools"),
+                )
+            result = self._run_rpc(self._build_command(config, pi_session_id), config, prompt,
                                    media=media, session_id=session_id, approval_handler=approval_handler,
+                                   tool_registry=tool_registry,
+                                   auto_mode=bool(auto_mode), unlimited_mode=bool(unlimited_mode),
                                    event_callback=event_callback, cancel_event=cancel_event,
                                    on_prompt_accepted=mark_pi_session_initialized)
         except Exception as exc:
             logger.exception("Pi Agent 本轮执行失败")
             _emit(event_callback, ErrorEvent(error=str(exc)))
             result = f"Pi Agent 执行失败：{exc}"
+        finally:
+            for path in runtime_files.values():
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning("无法清理 Pi 临时运行文件: %s", path)
         session = session_store.get(session_id)
         assistant = session.append_message("assistant", result)
         assistant.latency_ms = int((time.monotonic() - started) * 1000)
@@ -206,8 +300,14 @@ class PiAgentClient(LLMClient):
         args = [*config.command, "--mode", "rpc", "--session-dir", str(config.session_dir), "--session-id", pi_session_id,
                 "--extension", str(PROJECT_ROOT / "claw" / "pi" / "permission_gate.ts"),
                 "--extension", str(PROJECT_ROOT / "claw" / "pi" / "sjtuclaw_provider.ts"),
+                "--extension", str(PROJECT_ROOT / "claw" / "pi" / "sjtuclaw_tools.ts")]
+        if config.append_prompt_file:
+            args += ["--append-system-prompt", str(config.append_prompt_file)]
+        else:
+            args += [
                 "--append-system-prompt", str(prompts_dir() / "system_prompt.md"),
-                "--append-system-prompt", str(prompts_dir() / "soul.md")]
+                "--append-system-prompt", str(prompts_dir() / "soul.md"),
+            ]
         if config.provider:
             args += ["--provider", config.provider]
         if config.model:
@@ -222,21 +322,10 @@ class PiAgentClient(LLMClient):
         return args
 
     def _run_rpc(self, command: Sequence[str], config: PiRuntimeConfig, prompt: str, *, media, session_id,
-                 approval_handler, event_callback, cancel_event, on_prompt_accepted=None) -> str:
-        env = os.environ.copy()
-        if config.agent_dir:
-            env["PI_CODING_AGENT_DIR"] = str(config.agent_dir)
-        if config.provider == "sjtuclaw" and self._config.api_key:
-            env.update({
-                "SJTUCLAW_PI_API_KEY": self._config.api_key,
-                "SJTUCLAW_PI_BASE_URL": self._config.base_url,
-                "SJTUCLAW_PI_MODEL": self._config.model,
-                "SJTUCLAW_PI_CONTEXT_WINDOW": str(self._config.context_window),
-                "SJTUCLAW_PI_MAX_TOKENS": str(self._config.max_output_tokens),
-                "SJTUCLAW_PI_REASONING": (
-                    "true" if _truthy(setting_value("PI_REASONING", "false")) else "false"
-                ),
-            })
+                 approval_handler, tool_registry, auto_mode, unlimited_mode,
+                 event_callback, cancel_event, on_prompt_accepted=None) -> str:
+        env = self._child_env(config)
+
         proc = subprocess.Popen(list(command), cwd=str(config.cwd), env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", bufsize=1)
         stderr: list[str] = []
@@ -303,7 +392,9 @@ class PiAgentClient(LLMClient):
                         on_prompt_accepted = None
                 elif kind == "extension_ui_request":
                     self._handle_ui_request(event, send, session_id=session_id, approval_handler=approval_handler,
-                                            trust_tools=config.trust_tools)
+                                            tool_registry=tool_registry, trust_tools=config.trust_tools,
+                                            auto_mode=auto_mode, unlimited_mode=unlimited_mode,
+                                            bridge_token=config.bridge_token)
                 elif kind == "agent_start":
                     _emit(event_callback, ThinkingEvent(iteration=1))
                 elif kind == "tool_execution_start":
@@ -359,6 +450,26 @@ class PiAgentClient(LLMClient):
                 except subprocess.TimeoutExpired:
                     proc.kill()
 
+    def _child_env(self, config: PiRuntimeConfig) -> dict[str, str]:
+        env = os.environ.copy()
+        if config.agent_dir:
+            env["PI_CODING_AGENT_DIR"] = str(config.agent_dir)
+        if config.tool_manifest_file:
+            env["SJTUCLAW_PI_TOOL_MANIFEST"] = str(config.tool_manifest_file)
+            env["SJTUCLAW_PI_BRIDGE_TOKEN"] = config.bridge_token
+        if config.provider == "sjtuclaw" and self._config.api_key:
+            env.update({
+                "SJTUCLAW_PI_API_KEY": self._config.api_key,
+                "SJTUCLAW_PI_BASE_URL": self._config.base_url,
+                "SJTUCLAW_PI_MODEL": self._config.model,
+                "SJTUCLAW_PI_CONTEXT_WINDOW": str(self._config.context_window),
+                "SJTUCLAW_PI_MAX_TOKENS": str(self._config.max_output_tokens),
+                "SJTUCLAW_PI_REASONING": (
+                    "true" if _truthy(setting_value("PI_REASONING", "false")) else "false"
+                ),
+            })
+        return env
+
     @staticmethod
     def _collect_stderr(proc, output):
         if proc.stderr:
@@ -412,9 +523,59 @@ class PiAgentClient(LLMClient):
         )
 
     @staticmethod
-    def _handle_ui_request(event, send, *, session_id, approval_handler, trust_tools):
+    def _write_runtime_files(config, pi_session_id, *, session_id, context_builder, tool_registry):
+        runtime_dir = config.session_dir.parent / "runtime"
+        runtime_dir.mkdir(parents=True, exist_ok=True)
+        files: dict[str, Path] = {}
+        run_suffix = hashlib.sha256(config.bridge_token.encode()).hexdigest()[:12]
+        runtime_name = f"{pi_session_id}-{run_suffix}"
+        try:
+            prompt_builder = getattr(context_builder, "build_pi_append_prompt", None)
+            if callable(prompt_builder):
+                prompt_path = runtime_dir / f"{runtime_name}.prompt.md"
+                prompt_path.write_text(prompt_builder(session_id), encoding="utf-8")
+                files["prompt"] = prompt_path
+
+            if tool_registry is not None:
+                excluded = {
+                    "list_dir", "read_file", "create_file", "overwrite_file", "edit_file",
+                    "new_shell", "run_command", "skills_list", "skill_view", "skill_manage",
+                }
+                tools = [
+                    definition for definition in tool_registry.list_compact_definitions()
+                    if definition.get("name") not in excluded
+                ]
+                if tools:
+                    manifest_path = runtime_dir / f"{runtime_name}.tools.json"
+                    manifest_path.write_text(
+                        json.dumps({"version": 1, "tools": tools}, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+                    files["tools"] = manifest_path
+        except Exception:
+            for path in files.values():
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            raise
+        return files
+
+    @staticmethod
+    def _handle_ui_request(event, send, *, session_id, approval_handler, tool_registry=None,
+                           trust_tools=False, auto_mode=False, unlimited_mode=False,
+                           bridge_token=""):
         method, request_id = event.get("method"), str(event.get("id") or "")
         if method not in {"select", "confirm", "input", "editor"} or not request_id:
+            return
+        if method == "input" and event.get("title") == "SJTUClaw 工具桥接":
+            response = PiAgentClient._execute_host_tool(
+                event.get("placeholder"), session_id=session_id,
+                tool_registry=tool_registry, approval_handler=approval_handler,
+                trust_tools=trust_tools, auto_mode=auto_mode,
+                unlimited_mode=unlimited_mode, bridge_token=bridge_token,
+            )
+            send({"type": "extension_ui_response", "id": request_id, "value": response})
             return
         if method != "confirm" or event.get("title") != "SJTUClaw 工具审批":
             send({"type": "extension_ui_response", "id": request_id, "cancelled": True})
@@ -432,6 +593,72 @@ class PiAgentClient(LLMClient):
             except Exception:
                 logger.exception("Pi 工具审批失败，已安全拒绝")
         send({"type": "extension_ui_response", "id": request_id, "confirmed": approved})
+
+    @staticmethod
+    def _execute_host_tool(raw_payload, *, session_id, tool_registry, approval_handler,
+                           trust_tools, auto_mode, unlimited_mode, bridge_token=""):
+        try:
+            payload = json.loads(str(raw_payload or "{}"))
+        except json.JSONDecodeError:
+            payload = {}
+        supplied_token = str(payload.get("token") or "")
+        if bridge_token and not hmac.compare_digest(supplied_token, bridge_token):
+            return json.dumps({"ok": False, "result": "SJTUClaw 工具桥接认证失败。"}, ensure_ascii=False)
+        name = str(payload.get("toolName") or "")
+        args = payload.get("input") if isinstance(payload.get("input"), dict) else {}
+        tool = tool_registry.get_tool(name) if tool_registry is not None else None
+        if tool is None:
+            return json.dumps({"ok": False, "result": f"未知的 SJTUClaw tool: {name}"}, ensure_ascii=False)
+
+        mutating = tool.safety_level in {"write", "shell", "download"}
+        approved = trust_tools or (auto_mode and not unlimited_mode)
+        if mutating and not approved:
+            if approval_handler is None:
+                return json.dumps({"ok": False, "result": "当前通道不支持审批，操作已拒绝。"}, ensure_ascii=False)
+            request = ApprovalRequest(session_id=session_id, tool_name=name, tool_args=args)
+            try:
+                approved = approval_handler(request).status == ApprovalStatus.APPROVED.value
+            except Exception:
+                logger.exception("Pi 宿主工具审批失败，已安全拒绝")
+        if mutating and not approved:
+            return json.dumps({"ok": False, "result": "用户未批准该操作。"}, ensure_ascii=False)
+
+        result = tool_registry.execute_by_name(name, args, max_result_chars=50_000)
+        text = result.content if result.ok else f"错误: {result.error}"
+        return json.dumps({"ok": result.ok, "result": text or "(空结果)"}, ensure_ascii=False)
+
+
+class RuntimeAgentClient:
+    """Mutable client router shared by all CLI foreground/background jobs."""
+
+    def __init__(self, config: LLMConfig):
+        self._client = create_agent_client(config)
+
+    @property
+    def config(self) -> LLMConfig:
+        return self._client.config
+
+    @property
+    def configured(self) -> bool:
+        return callable(getattr(self._client, "run_agent_turn", None)) or bool(
+            self.config.api_key and self.config.base_url and self.config.model
+        )
+
+    def set_client(self, client) -> None:
+        self._client = client
+
+    def chat(self, *args, **kwargs):
+        return self._client.chat(*args, **kwargs)
+
+    def chat_with_tools(self, *args, **kwargs):
+        return self._client.chat_with_tools(*args, **kwargs)
+
+    def __getattr__(self, name: str):
+        if name in {"run_agent_turn", "compact_session"}:
+            runner = getattr(self._client, name, None)
+            if callable(runner):
+                return runner
+        raise AttributeError(name)
 
 
 def create_agent_client(config: LLMConfig) -> LLMClient:

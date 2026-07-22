@@ -54,6 +54,29 @@ class WebToolConfig:
 
     @classmethod
     def from_env(cls) -> "WebToolConfig":
+        # Web tools can be registered before the rest of the application
+        # configuration is loaded (for example in tests and lightweight
+        # integrations).  Make their .env behaviour self-contained instead
+        # of relying on an unrelated config loader having run first.
+        try:
+            from dotenv import load_dotenv
+
+            from claw.config import ENV_PATH, _ensure_dotenv_loaded
+
+            _ensure_dotenv_loaded()
+            # The WebUI/gateway is long-running and users commonly add the
+            # optional Tavily key after it has started.  Re-reading with
+            # override=False fills newly added variables while preserving
+            # values explicitly supplied by the parent process.
+            try:
+                load_dotenv(dotenv_path=ENV_PATH, override=False, encoding="utf-8")
+            except (UnicodeDecodeError, LookupError):
+                load_dotenv(dotenv_path=ENV_PATH, override=False, encoding="gbk")
+        except Exception:
+            # Environment variables remain a valid configuration source when
+            # the optional .env file is absent or unreadable.
+            pass
+
         def _bool(name: str, default: bool) -> bool:
             raw = os.getenv(name, "").strip().lower()
             if not raw:
@@ -604,8 +627,8 @@ def _search_tavily(query: str, max_results: int, config: WebToolConfig) -> list[
         "POST",
         "https://api.tavily.com/search",
         config,
+        headers={"Authorization": f"Bearer {config.tavily_api_key}"},
         json_data={
-            "api_key": config.tavily_api_key,
             "query": query,
             "search_depth": "basic",
             "max_results": max_results,
@@ -676,9 +699,12 @@ def _search_bing(query: str, max_results: int, config: WebToolConfig) -> list[di
 
 
 def create_web_fetch_tool(config: WebToolConfig | None = None) -> Tool:
-    cfg = config or WebToolConfig.from_env()
-
     def handler(args: dict[str, Any]) -> ToolResult:
+        # An explicit config is intentionally stable (useful for tests and
+        # embedding).  The normal application path refreshes environment
+        # configuration per call so a newly configured Web key takes effect
+        # without rebuilding the entire tool registry.
+        cfg = config or WebToolConfig.from_env()
         try:
             max_chars = _clamp_int(args.get("max_chars"), 30000, 1000, 100000)
             result = _fetch(args["url"], cfg, max_chars=max_chars)
@@ -710,9 +736,8 @@ def create_web_fetch_tool(config: WebToolConfig | None = None) -> Tool:
 
 
 def create_web_search_tool(config: WebToolConfig | None = None) -> Tool:
-    cfg = config or WebToolConfig.from_env()
-
     def handler(args: dict[str, Any]) -> ToolResult:
+        cfg = config or WebToolConfig.from_env()
         query = args["query"].strip()
         max_results = _clamp_int(args.get("max_results"), 5, 1, 10)
         if not query:
@@ -778,5 +803,8 @@ def register_web_tools(registry, config: WebToolConfig | None = None) -> None:
     cfg = config or WebToolConfig.from_env()
     if not cfg.enabled:
         return
-    registry.register(create_web_search_tool(cfg))
-    registry.register(create_web_fetch_tool(cfg))
+    # Keep caller-supplied configurations deterministic.  In the normal
+    # environment-driven path, leave config resolution to each invocation so
+    # adding TAVILY_API_KEY after startup is observed immediately.
+    registry.register(create_web_search_tool(config))
+    registry.register(create_web_fetch_tool(config))

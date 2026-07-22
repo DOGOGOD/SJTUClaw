@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import socket
 
 import httpx
@@ -245,6 +246,55 @@ def test_search_uses_duckduckgo_without_key(monkeypatch):
     payload = json.loads(result.content)
     assert payload["provider"] == "duckduckgo"
     assert payload["results"][0]["title"] == "Example result"
+
+
+def test_search_refreshes_tavily_key_after_tool_registration(monkeypatch, tmp_path):
+    from claw import config as app_config
+    from claw.tools import web
+
+    monkeypatch.delenv("TAVILY_API_KEY", raising=False)
+    env_path = tmp_path / ".env"
+    env_path.write_text("", encoding="utf-8")
+    monkeypatch.setattr(app_config, "ENV_PATH", env_path)
+    monkeypatch.setattr(app_config, "_dotenv_loaded", True)
+    tool = create_web_search_tool()
+    seen_keys = []
+
+    def tavily(query, max_results, config):
+        seen_keys.append(config.tavily_api_key)
+        return [{"title": "Tavily", "url": "https://example.com/tavily", "snippet": "ok"}]
+
+    monkeypatch.setattr(web, "_search_tavily", tavily)
+    env_path.write_text("TAVILY_API_KEY=tvly-configured-after-startup\n", encoding="utf-8")
+
+    try:
+        result = tool.handler({"query": "hot reload", "max_results": 1})
+        assert result.ok
+        assert seen_keys == ["tvly-configured-after-startup"]
+        assert json.loads(result.content)["provider"] == "tavily"
+    finally:
+        os.environ.pop("TAVILY_API_KEY", None)
+
+
+def test_tavily_uses_bearer_authentication(monkeypatch):
+    from claw.tools import web
+
+    captured = {}
+
+    def request_text(method, url, config, **kwargs):
+        captured.update({"method": method, "url": url, **kwargs})
+        return json.dumps(
+            {"results": [{"title": "Result", "url": "https://example.com", "content": "Text"}]}
+        )
+
+    monkeypatch.setattr(web, "_request_text", request_text)
+    results = web._search_tavily(
+        "query", 1, WebToolConfig(tavily_api_key="tvly-secret", max_retries=0)
+    )
+
+    assert results[0]["title"] == "Result"
+    assert captured["headers"] == {"Authorization": "Bearer tvly-secret"}
+    assert "api_key" not in captured["json_data"]
 
 
 def test_search_filters_unsafe_and_duplicate_results(monkeypatch):

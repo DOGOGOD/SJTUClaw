@@ -155,6 +155,36 @@ class TestRunAgentTurnCancellation:
 
         assert "终止" in result
 
+    def test_cancel_while_waiting_ignores_late_final_reply(
+        self, store, context_builder, tool_registry
+    ):
+        """A final response arriving after /stop must not be accepted."""
+        session = store.create_session(session_id="cancel-late-final")
+        store.save(session)
+        cancel_event = threading.Event()
+        client = _FakeLLMClient(
+            [_FakeLLMResponse(final="不应展示的迟到回复")],
+            delay=0.2,
+        )
+
+        def _set_cancel():
+            time.sleep(0.1)
+            cancel_event.set()
+
+        threading.Thread(target=_set_cancel, daemon=True).start()
+        result = run_agent_turn(
+            "cancel-late-final",
+            "test message",
+            session_store=store,
+            context_builder=context_builder,
+            tool_registry=tool_registry,
+            llm_client=client,
+            cancel_event=cancel_event,
+        )
+
+        assert "终止" in result
+        assert "不应展示的迟到回复" not in result
+
     def test_no_cancel_event_works_normally(self, store, context_builder, tool_registry):
         """Without cancel_event, the turn should complete normally."""
         session = store.create_session(session_id="normal")

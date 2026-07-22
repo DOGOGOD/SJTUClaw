@@ -1,0 +1,4 @@
+variant,latency_ms,success_rate,notes
+A,120,0.995,baseline
+B,82,0.991,fastest
+C,95,0.998,highest reliability

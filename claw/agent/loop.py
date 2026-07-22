@@ -894,6 +894,23 @@ def _run_agent_turn_unlocked(
                 truncated=getattr(response, "finish_reason", None) == "length",
             )
 
+            # A synchronous provider call cannot be interrupted in-place, but
+            # /stop may be requested while it is in flight.  Re-check before
+            # accepting a late final answer or executing any requested tool.
+            if cancel_event is not None and cancel_event.is_set():
+                logger.info(
+                    "Agent turn cancelled while waiting for LLM at iteration %d",
+                    turn_count,
+                )
+                return _finish_reply(
+                    None,
+                    empty_reason=(
+                        "用户已终止本轮任务；模型稍后返回的内容已忽略，"
+                        "已完成的操作和结果仍然保留。"
+                    ),
+                    status="cancelled",
+                )
+
 
         except Exception:
 

@@ -300,6 +300,27 @@ def _format_command_markdown(result: str) -> str:
     return "\n".join(formatted)
 
 
+_SKILL_INVOKE_PREFIX = "__SKILL_INVOKE__|"
+
+
+def parse_skill_invoke_result(result: str) -> tuple[str, str] | None:
+    """Decode the internal explicit-skill command result for entrypoints.
+
+    ``handle_command`` stays text-based for backwards compatibility, but CLI
+    and Gateway callers must consume this marker instead of displaying it.
+    The task portion may itself contain ``|``, so split at most twice.
+    """
+    if not result.startswith(_SKILL_INVOKE_PREFIX):
+        return None
+    parts = result.split("|", 2)
+    if len(parts) != 3:
+        return None
+    skill_name, task = parts[1].strip(), parts[2].strip()
+    if not skill_name or not task:
+        return None
+    return skill_name, task
+
+
 # -- /session ---------------------------------------------------------------
 
 

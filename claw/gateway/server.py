@@ -1347,21 +1347,123 @@ class CommandRequest(BaseModel):
     command: str = Field(..., min_length=1)
 
 
+async def _run_explicit_skill_command(
+    session_id: str,
+    skill_name: str,
+    task: str,
+) -> dict[str, Any]:
+    """Run ``/skill <name> <task>`` through the shared agent loop.
+
+    ``handle_command`` returns a small internal marker so terminal and HTTP
+    entrypoints can distinguish management commands from agent work.  The
+    marker must never escape to clients; this function consumes it and mirrors
+    the normal Gateway chat lifecycle, including cancellation and approvals.
+    """
+    if not _llm_ready():
+        return {
+            "ok": True,
+            "type": "config_required",
+            "format": "markdown",
+            "result": _llm_missing_reply(),
+            "actions": [],
+            "autoMode": _auto_mode.get(session_id, False),
+            "unlimitedMode": _workspace_manager.is_unlimited(session_id),
+        }
+
+    cancel_event = _register_active_turn(session_id)
+    if cancel_event is None:
+        raise HTTPException(
+            status_code=409,
+            detail="该 Session 已有任务正在运行，请等待完成或先停止任务。",
+        )
+
+    failed = False
+    try:
+        def _run() -> str:
+            _set_turn_session_id(session_id)
+            _update_cron_context(session_id, session_id)
+            _pet_state.start_turn(session_id, task)
+            try:
+                return run_agent_turn(
+                    session_id,
+                    task,
+                    session_store=_session_store,
+                    context_builder=_context_builder,
+                    tool_registry=_tool_registry,
+                    llm_client=_llm_client,
+                    approval_handler=_gateway_approval_handler,
+                    skill_registry=_skill_registry,
+                    skill_source="explicit",
+                    skill_name=skill_name,
+                    compaction_worker=_compaction_worker,
+                    auto_mode=_auto_mode.get(session_id, False),
+                    unlimited_mode=_workspace_manager.is_unlimited(session_id),
+                    event_callback=lambda event: _pet_state.handle_event(
+                        session_id, event
+                    ),
+                    cancel_event=cancel_event,
+                    rollback_manager=_rollback_manager,
+                )
+            except Exception:
+                _pet_state.finish_turn(session_id, failed=True)
+                raise
+            finally:
+                _set_turn_session_id(None)
+
+        reply = await asyncio.to_thread(_run)
+    except Exception as exc:
+        failed = True
+        logger.exception(
+            "Gateway 显式 skill 调用失败: session=%s skill=%s",
+            session_id,
+            skill_name,
+        )
+        reply = _persist_agent_fallback(
+            session_id,
+            "抱歉，显式 Skill 任务执行失败。已保留现有进度，请重试。",
+        )
+    finally:
+        _unregister_active_turn(session_id, cancel_event)
+
+    if not failed:
+        _pet_state.finish_turn(session_id)
+
+    return {
+        "ok": True,
+        "type": "command",
+        "format": "markdown",
+        "result": reply,
+        "actions": [
+            "reload_messages",
+            "reload_sessions",
+            "reload_rollback_status",
+        ],
+        "autoMode": _auto_mode.get(session_id, False),
+        "unlimitedMode": _workspace_manager.is_unlimited(session_id),
+    }
+
+
 @app.post("/command")
-def handle_command(req: CommandRequest):
+async def handle_command(req: CommandRequest):
     """Execute a CLI-style command and return the result."""
+    from claw.cli.commands import parse_skill_invoke_result
+
     root, *args = req.command.split()
     command_state: dict[str, str] = {}
+    sid = req.session_id or "default"
     result_text = _execute_slash_command(
         req.command,
-        req.session_id or "default",
+        sid,
         state_out=command_state,
     )
+    skill_invocation = parse_skill_invoke_result(result_text)
+    if skill_invocation is not None:
+        skill_name, task = skill_invocation
+        return await _run_explicit_skill_command(sid, skill_name, task)
 
     # Determine actions for WebUI
     actions: list[str] = []
     switch_to: str | None = None
-    sid = req.session_id or "default"
 
     if root == "/session" and args and args[0] == "new":
         actions = ["reload_sessions", "switch_session"]

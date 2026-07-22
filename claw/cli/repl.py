@@ -9,7 +9,12 @@ import json
 
 from claw.agent.loop import run_agent_turn
 from claw.approval.manager import ApprovalManager, ApprovalRequest
-from claw.cli.commands import RuntimeState, handle_command, is_command
+from claw.cli.commands import (
+    RuntimeState,
+    handle_command,
+    is_command,
+    parse_skill_invoke_result,
+)
 from claw.context.builder import ContextBuilder
 from claw.llm.client import LLMClient, LLMError
 from claw.memory.store import MemoryStore
@@ -199,8 +204,26 @@ def run_repl(
             break
 
         if is_command(user_input):
-            print(handle_command(user_input, state))
-            print()
+            command_result = handle_command(user_input, state)
+            skill_invocation = parse_skill_invoke_result(command_result)
+            if skill_invocation is None:
+                print(command_result)
+                print()
+                continue
+
+            skill_name, skill_task = skill_invocation
+            _handle_chat_turn(
+                skill_task,
+                state,
+                client,
+                context_builder,
+                tool_registry,
+                approval_handler=(
+                    _cli_approval_handler if approval_manager else None
+                ),
+                skill_source="explicit",
+                skill_name=skill_name,
+            )
             continue
 
         _handle_chat_turn(
@@ -228,6 +251,8 @@ def _handle_chat_turn(
     tool_registry: ToolRegistry,
     *,
     approval_handler=None,
+    skill_source: str = "",
+    skill_name: str = "",
 ) -> None:
     """Process one user message through the unified agent loop."""
     try:
@@ -239,6 +264,9 @@ def _handle_chat_turn(
             tool_registry=tool_registry,
             llm_client=client,
             approval_handler=approval_handler,
+            skill_registry=state.skill_registry,
+            skill_source=skill_source,
+            skill_name=skill_name,
             compaction_worker=state.compaction_worker,
             auto_mode=state.auto_mode,
             unlimited_mode=(

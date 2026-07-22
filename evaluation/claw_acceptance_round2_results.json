@@ -1,0 +1,230 @@
+{
+  "generatedAt": "2026-07-22T19:35:58+0800",
+  "dataDir": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\.claw-eval-round2-advanced2",
+  "workspace": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\claw_evaluation_workspace_round2",
+  "passed": 12,
+  "failed": 0,
+  "results": [
+    {
+      "taskId": "N01",
+      "name": "AUTO 免审批写入且保持 Workspace 边界",
+      "passed": true,
+      "evidence": {
+        "approvals": [],
+        "reply": "AUTO workspace 写入完成。"
+      }
+    },
+    {
+      "taskId": "N02",
+      "name": "AUTO 无法绕过 Workspace 路径边界",
+      "passed": true,
+      "evidence": {
+        "approvals": [],
+        "reply": "越界写入已被 workspace 拒绝。"
+      }
+    },
+    {
+      "taskId": "N03",
+      "name": "UNLIMITED + AUTO 仍强制审批外部写入",
+      "passed": true,
+      "evidence": {
+        "approvalTools": [
+          "overwrite_file"
+        ],
+        "reply": "UNLIMITED 写入经审批完成。"
+      }
+    },
+    {
+      "taskId": "N04",
+      "name": "Workspace 文件与对话原子回退及单步撤销",
+      "passed": true,
+      "evidence": {
+        "preview": {
+          "checkpointId": "cp_6514fa2baf214fd1af150c0c0c259deb",
+          "messagePreview": "执行 ROLLBACK-V2",
+          "filesToRestore": 1,
+          "filesToDelete": 1,
+          "directoriesToRestore": 0,
+          "messagesToRemove": 5,
+          "restoreFiles": [
+            "state.txt"
+          ],
+          "deletePaths": [
+            "branch-only.txt"
+          ],
+          "unlimitedWarning": false
+        },
+        "messagesBefore": 9,
+        "messagesAfter": 4,
+        "undo": {
+          "checkpointId": "cp_d0353c85b7c047818e291be7754e62fb",
+          "restored": 2,
+          "deleted": 0,
+          "messages": [
+            {
+              "role": "user",
+              "content": "执行 ROLLBACK-V1",
+              "messageId": "msg_7ad3d38b7b8f45dfaed7abcbb0471407",
+              "rollbackCheckpointId": "cp_998f62ce06814813847bce036467aa40",
+              "rollbackAvailable": true
+            },
+            {
+              "role": "assistant",
+              "content": "",
+              "tool_calls": [
+                {
+                  "id": "round2-ROLLBACK-V1-1",
+                  "type": "function",
+                  "function": {
+                    "name": "overwrite_file",
+                    "arguments": "{\"path\": \"state.txt\", \"content\": \"VERSION-1\"}"
+                  }
+                }
+              ]
+            },
+            {
+              "role": "tool",
+              "content": "{\"tool\": \"overwrite_file\", \"path\": \"state.txt\", \"result\": \"文件已覆盖写入，共 9 字符\"}",
+              "tool_call_id": "round2-ROLLBACK-V1-1",
+              "name": "overwrite_file"
+            },
+            {
+              "role": "assistant",
+              "content": "已写入 VERSION-1。"
+            },
+            {
+              "role": "user",
+              "content": "执行 ROLLBACK-V2",
+              "messageId": "msg_ad8ab49603044845ad06519c3cb9eefb",
+              "rollbackCheckpointId": "cp_6514fa2baf214fd1af150c0c0c259deb",
+              "rollbackAvailable": true
+            },
+            {
+              "role": "assistant",
+              "content": "",
+              "tool_calls": [
+                {
+                  "id": "round2-state-v2",
+                  "type": "function",
+                  "function": {
+                    "name": "overwrite_file",
+                    "arguments": "{\"path\": \"state.txt\", \"content\": \"VERSION-2\"}"
+                  }
+                },
+                {
+                  "id": "round2-branch",
+                  "type": "function",
+                  "function": {
+                    "name": "overwrite_file",
+                    "arguments": "{\"path\": \"branch-only.txt\", \"content\": \"BRANCH\"}"
+                  }
+                }
+              ]
+            },
+            {
+              "role": "tool",
+              "content": "{\"tool\": \"overwrite_file\", \"path\": \"state.txt\", \"result\": \"文件已覆盖写入，共 9 字符\"}",
+              "tool_call_id": "round2-state-v2",
+              "name": "overwrite_file"
+            },
+            {
+              "role": "tool",
+              "content": "{\"tool\": \"overwrite_file\", \"path\": \"branch-only.txt\", \"result\": \"文件已覆盖写入，共 6 字符\"}",
+              "tool_call_id": "round2-branch",
+              "name": "overwrite_file"
+            },
+            {
+              "role": "assistant",
+              "content": "已写入 VERSION-2 与分支文件。"
+            }
+          ],
+          "undoAvailable": true,
+          "partial": false
+        }
+      }
+    },
+    {
+      "taskId": "N05",
+      "name": "Reflection 抽取结构化长期记忆并记录运行历史",
+      "passed": true,
+      "evidence": {
+        "reflection": {
+          "ok": true,
+          "sessionsReviewed": 3,
+          "factsExtracted": 1,
+          "status": "success",
+          "error": ""
+        },
+        "recallCount": 1
+      }
+    },
+    {
+      "taskId": "N06",
+      "name": "Heartbeat 活跃任务检测与 Agent 回写",
+      "passed": true,
+      "evidence": {
+        "reply": "告警：ROUND2 发布清单仍有未完成项。"
+      }
+    },
+    {
+      "taskId": "N07",
+      "name": "周期 Scheduler 多次执行、禁用与删除",
+      "passed": true,
+      "evidence": {
+        "runs": 2,
+        "stableAfterDisable": true
+      }
+    },
+    {
+      "taskId": "N08",
+      "name": "运行时敏感配置加密、脱敏与输入校验",
+      "passed": true,
+      "evidence": {
+        "masked": "ROUN****8475",
+        "invalidAvatarStatus": 400
+      }
+    },
+    {
+      "taskId": "N09",
+      "name": "桌宠目录、选择持久化与恶意 ZIP 防护",
+      "passed": true,
+      "evidence": {
+        "petCount": 3,
+        "selected": "shin-chan",
+        "hostileStatus": 400
+      }
+    },
+    {
+      "taskId": "N10",
+      "name": "Web Tool SSRF 私网阻断与 observation 回写",
+      "passed": true,
+      "evidence": {
+        "reply": "本地/私网目标已被 SSRF 防护阻止。"
+      }
+    },
+    {
+      "taskId": "N11",
+      "name": "同 Session 并发互斥与用户停止",
+      "passed": true,
+      "evidence": {
+        "concurrentStatus": 409,
+        "stop": {
+          "ok": true,
+          "cancelled": 1,
+          "message": "已终止 1 个正在运行的任务"
+        },
+        "reply": "任务处理简报\n- 状态：已终止\n- 说明：用户已终止本轮任务；模型稍后返回的内容已忽略，已完成的操作和结果仍然保留。"
+      }
+    },
+    {
+      "taskId": "N12",
+      "name": "Skill 安装、热加载、详情与安全删除生命周期",
+      "passed": true,
+      "evidence": {
+        "installStatus": 200,
+        "detailStatus": 200,
+        "deleteStatus": 200
+      }
+    }
+  ]
+}

@@ -1,8 +1,9 @@
 """Prompt template engine — variable interpolation.
 
-Supports ``{{ variable }}`` substitution and ``{% if condition %}``
-conditional blocks, matching a lightweight Jinja2 subset
-in its agent templates (identity, platform_policy, tool_contract, etc.).
+Supports ``{{ variable }}`` substitution and lightweight Jinja-style
+``{% if variable %}`` / ``{% if variable == 'value' %}`` conditional blocks,
+with optional ``{% else %}`` branches, in its agent templates (identity,
+platform_policy, tool_contract, etc.).
 
 No external dependencies — this is a minimal self-contained renderer.
 """
@@ -20,7 +21,7 @@ from typing import Any, Mapping
 
 def render(template: str, variables: Mapping[str, Any] | None = None) -> str:
     """Render a template string with ``{{ var }}`` substitution and
-    ``{% if var %}...{% endif %}`` conditional blocks.
+    lightweight ``{% if ... %}...{% else %}...{% endif %}`` blocks.
 
     Args:
         template: the template string.
@@ -59,7 +60,8 @@ def render_file(path: Path, variables: Mapping[str, Any] | None = None) -> str:
 # ---------------------------------------------------------------------------
 
 _IF_BLOCK_RE = re.compile(
-    r"\{%\s*if\s+(\w[\w.-]*)\s*%\}(.*?)\{%\s*endif\s*%\}",
+    r"\{%\s*if\s+(\w[\w.-]*)(?:\s*==\s*(['\"])(.*?)\2)?\s*%\}"
+    r"(.*?)(?:\{%\s*else\s*%\}(.*?))?\{%\s*endif\s*%\}",
     re.DOTALL,
 )
 _VAR_RE = re.compile(r"\{\{\s*(\w[\w.-]*)\s*\}\}")
@@ -78,13 +80,17 @@ def _truthy(value: Any) -> bool:
 
 
 def _expand_conditionals(text: str, variables: dict[str, Any]) -> str:
-    """Expand ``{% if var %}content{% endif %}`` blocks."""
+    """Expand supported conditional blocks, including optional else branches."""
     def _replace(m: re.Match) -> str:
         var_name = m.group(1)
-        body = m.group(2)
-        if _truthy(variables.get(var_name)):
-            return body
-        return ""
+        expected = m.group(3)
+        truthy_body = m.group(4)
+        fallback_body = m.group(5) or ""
+        value = variables.get(var_name)
+        condition_matches = (
+            str(value) == expected if expected is not None else _truthy(value)
+        )
+        return truthy_body if condition_matches else fallback_body
     return _IF_BLOCK_RE.sub(_replace, text)
 
 

@@ -277,6 +277,7 @@ export async function fetchLLMSettings(): Promise<{ ok: boolean; settings: impor
 }
 
 export async function saveLLMSettings(data: {
+  backend: "sjtuclaw" | "pi";
   baseUrl: string;
   apiKey?: string;
   model: string;
@@ -284,6 +285,10 @@ export async function saveLLMSettings(data: {
   contextUsageRatio: number;
   maxOutputTokens: number;
   consolidationRatio: number;
+  piProvider: string;
+  piModel: string;
+  piThinking: string;
+  piTrustTools: boolean;
 }): Promise<{ ok: boolean; settings: import("@/lib/types").LLMSettings }> {
   return request("/settings/llm", {
     method: "PUT",

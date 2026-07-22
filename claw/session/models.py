@@ -232,11 +232,7 @@ class Session:
         self.last_consolidated = 0
         self.summary = ""
         self.metadata.pop("_last_summary", None)
-        try:
-            generation = int(self.metadata.get("pi_session_generation", 1)) + 1
-        except (TypeError, ValueError):
-            generation = 2
-        self.metadata["pi_session_generation"] = str(generation)
+        self.metadata["pi_session_generation"] = uuid.uuid4().hex
         self.touch()
 
     # -- History replay

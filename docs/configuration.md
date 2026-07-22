@@ -24,6 +24,9 @@ Skills、Extensions、自动压缩、重试和持久会话均保留，WebUI、QQ
 
 启动前先构建相邻的 `pi` 仓库，或把 `pi` 安装到系统命令路径。SJTUClaw 按
 `PI_COMMAND`、`PI_CLI_PATH`、相邻 Pi 构建产物、系统 `pi` 的顺序查找。
+源码仓库布局为 `SJTUClaw/SJTUClaw` 与 `SJTUClaw/pi` 时可自动发现。Windows
+安装版不会内置完整 Pi/Node 运行时，需要另外安装系统 `pi`，或显式设置
+`PI_COMMAND` / `PI_CLI_PATH`（以及必要时的 `PI_NODE_PATH`）。
 
 | 变量 | 说明 |
 | --- | --- |
@@ -33,6 +36,7 @@ Skills、Extensions、自动压缩、重试和持久会话均保留，WebUI、QQ
 | `PI_REPO_DIR` | Pi 源码路径；默认是 SJTUClaw 相邻的 `pi` |
 | `PI_PROVIDER` / `PI_MODEL` | 可选 provider 与 model；留空使用 Pi 设置 |
 | `PI_THINKING` | `off` 到 `max` 的 Pi reasoning level |
+| `PI_REASONING` | 将现有 `LLM_*` 映射给 Pi 时是否声明模型支持 reasoning，默认 `false` |
 | `PI_CWD` | Pi 工具工作目录 |
 | `PI_AGENT_DIR` / `PI_SESSION_DIR` | Pi 配置与持久会话目录 |
 | `PI_TURN_TIMEOUT_S` | 单轮最长秒数，默认 1800 |
@@ -40,6 +44,11 @@ Skills、Extensions、自动压缩、重试和持久会话均保留，WebUI、QQ
 
 Pi 本身不提供宿主权限沙箱。SJTUClaw 默认加载一个薄 Extension，把 `bash`、
 `edit`、`write` 转交给现有审批通道；没有审批通道时安全拒绝。
+
+如果没有设置 `PI_PROVIDER` 和 `PI_MODEL`，但已有完整 `LLM_API_KEY`、
+`LLM_BASE_URL`、`LLM_MODEL`，SJTUClaw 会通过进程环境把它们注册成 Pi 的
+`sjtuclaw` OpenAI-compatible provider。密钥不会写入 Pi 配置文件或命令行。
+显式设置 `PI_PROVIDER`/`PI_MODEL` 时则完全使用 Pi 自身的 auth 与 models 配置。
 
 也可以运行 `sjtuclaw setup` 使用交互式配置向导。
 

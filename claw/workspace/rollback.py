@@ -828,6 +828,10 @@ class WorkspaceRollbackManager:
         live.updated_at = now_iso()
         live.last_consolidated = restored.last_consolidated
         live.metadata = restored.metadata
+        # Pi sessions are append-only.  After restoring an older SJTUClaw
+        # conversation, start a fresh Pi branch so removed turns cannot leak
+        # back into subsequent prompts.  Undo rotates again for the same reason.
+        live.metadata["pi_session_generation"] = uuid.uuid4().hex
         live.metadata.pop("runtime_checkpoint", None)
         live.metadata.pop("pending_user_turn", None)
         live.revision = next_revision

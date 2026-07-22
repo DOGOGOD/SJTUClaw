@@ -272,6 +272,7 @@ export interface PetInfo {
 }
 
 export interface LLMSettings {
+  backend: "sjtuclaw" | "pi";
   baseUrl: string;
   apiKeyMasked: string;
   apiKeyConfigured: boolean;
@@ -280,6 +281,10 @@ export interface LLMSettings {
   contextUsageRatio: number;
   maxOutputTokens: number;
   consolidationRatio: number;
+  piProvider: string;
+  piModel: string;
+  piThinking: string;
+  piTrustTools: boolean;
 }
 
 export interface QQChannelSettings {

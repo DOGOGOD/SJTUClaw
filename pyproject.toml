@@ -38,3 +38,4 @@ include = ["claw*"]
 
 [tool.setuptools.package-data]
 "claw.pet" = ["assets/*/pet.json", "assets/*/spritesheet.webp", "assets/*/spritesheet.png"]
+"claw.pi" = ["*.ts"]

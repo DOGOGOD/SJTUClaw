@@ -45,7 +45,7 @@ export default defineConfig(({ mode }) => {
         // Proxy all backend API paths used by the WebUI.  Without this the
         // Vite dev server serves index.html for unknown routes, causing JSON
         // parse errors and the "界面出错了" crash.
-        "^/(sessions|chat|stop|command|workspace|admin|memories|cron|approvals|skills|downloads|qq|reflect|pet)(/.*)?$": {
+        "^/(sessions|chat|stop|command|workspace|admin|memories|cron|approvals|skills|downloads|qq|reflect|pet|settings)(/.*)?$": {
           target,
           changeOrigin: true,
         },

@@ -393,6 +393,18 @@ class ContextBuilder:
                 return str(ws)
         return self._workspace_path or ""
 
+    def bound_workspace(self, session_id: str) -> str | None:
+        """Return the explicitly bound workspace for an agent session.
+
+        Full-turn backends such as Pi use this as their process cwd.  The
+        generic context fallback is intentionally excluded because it is not
+        an explicit file-operation boundary.
+        """
+        if self._workspace_manager is None:
+            return None
+        workspace = self._workspace_manager.get(session_id)
+        return str(workspace) if workspace is not None else None
+
     def _invalidate_cache(self) -> None:
         self._system_prefix_cache = None
         self._prefix_version += 1

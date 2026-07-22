@@ -57,7 +57,7 @@ from claw.config import (
 from claw.context.builder import ContextBuilder
 from claw.context.compaction_worker import CompactionWorker
 from claw.llm.client import LLMClient, LLMError
-from claw.pi import create_agent_client
+from claw.pi import create_agent_client, is_pi_backend
 from claw.memory.store import MemoryStore, MemoryStoreError
 from claw.prompts import load_soul, load_system_prompt
 from claw.session.store import SessionStore, SessionStoreError
@@ -119,7 +119,10 @@ class RuntimeLLMClient:
     @property
     def configured(self) -> bool:
         cfg = self.config
-        return self._client is not None and bool(cfg.api_key and cfg.base_url and cfg.model)
+        return self._client is not None and (
+            callable(getattr(self._client, "run_agent_turn", None))
+            or bool(cfg.api_key and cfg.base_url and cfg.model)
+        )
 
     def set_config(self, config: LLMConfig) -> None:
         self._client = create_agent_client(config)
@@ -141,6 +144,19 @@ class RuntimeLLMClient:
     def chat_with_tools(self, *args, **kwargs):
         return self._require_client().chat_with_tools(*args, **kwargs)
 
+    def __getattr__(self, name: str):
+        """Expose optional full-turn capabilities of the active backend.
+
+        ``run_agent_turn`` must remain absent for the legacy client so the
+        shared loop does not bypass its normal Think/Act/Observe path.
+        """
+        if name == "run_agent_turn":
+            client = self.__dict__.get("_client")
+            runner = getattr(client, name, None) if client is not None else None
+            if callable(runner):
+                return runner
+        raise AttributeError(name)
+
 
 def _load_initial_llm() -> tuple[LLMConfig, RuntimeLLMClient]:
     client = RuntimeLLMClient()
@@ -149,6 +165,11 @@ def _load_initial_llm() -> tuple[LLMConfig, RuntimeLLMClient]:
         client.set_config(config)
         return config, client
     except ConfigError as exc:
+        if is_pi_backend():
+            config = client.config
+            client.set_config(config)
+            logger.info("Pi Agent 已启用；辅助 LLM 未配置: %s", exc)
+            return config, client
         client.clear(_LLM_NOT_CONFIGURED_MESSAGE)
         logger.warning("LLM 未配置，WebUI 将以设置模式启动: %s", exc)
         return client.config, client
@@ -451,7 +472,8 @@ async def _lifespan(_app: FastAPI):
     loop = asyncio.get_running_loop()
     _cron_service.start(loop=loop)
     _reflection_mgr.start()
-    _compaction_worker.start_idle_compaction()
+    if not is_pi_backend():
+        _compaction_worker.start_idle_compaction()
 
     pet_settings = _pet_catalog.load_settings()
     can_show_desktop = os.name == "nt" or bool(os.getenv("DISPLAY"))
@@ -2662,7 +2684,11 @@ def _float_setting(name: str, default: float) -> float:
 
 def _llm_settings_payload() -> dict[str, Any]:
     api_key = setting_value("LLM_API_KEY", "").strip()
+    backend = setting_value("AGENT_BACKEND", "sjtuclaw").strip().lower()
+    if backend not in {"sjtuclaw", "pi"}:
+        backend = "sjtuclaw"
     return {
+        "backend": backend,
         "baseUrl": setting_value("LLM_BASE_URL", "https://api.openai.com/v1").strip(),
         "apiKeyMasked": _masked(api_key),
         "apiKeyConfigured": bool(api_key),
@@ -2671,6 +2697,10 @@ def _llm_settings_payload() -> dict[str, Any]:
         "contextUsageRatio": _float_setting("LLM_CONTEXT_USAGE_RATIO", 0.8),
         "maxOutputTokens": _int_setting("LLM_MAX_OUTPUT_TOKENS", 4096),
         "consolidationRatio": _float_setting("LLM_CONSOLIDATION_RATIO", 0.5),
+        "piProvider": setting_value("PI_PROVIDER", "").strip(),
+        "piModel": setting_value("PI_MODEL", "").strip(),
+        "piThinking": setting_value("PI_THINKING", "").strip(),
+        "piTrustTools": setting_value("PI_TRUST_TOOLS", "false").strip().lower() in {"1", "true", "yes", "on"},
     }
 
 
@@ -2749,11 +2779,13 @@ def _apply_llm_runtime_config() -> None:
     global _config
     settings = _llm_settings_payload()
     api_key = setting_value("LLM_API_KEY", "").strip()
-    if not api_key:
+    backend = settings["backend"]
+    if backend != "pi" and not api_key:
         raise HTTPException(status_code=400, detail="请填写 LLM API Key")
-    if not settings["model"]:
+    if backend != "pi" and not settings["model"]:
         raise HTTPException(status_code=400, detail="请填写 LLM 模型名称")
-    _validate_url(settings["baseUrl"], "Base_url")
+    if settings["baseUrl"]:
+        _validate_url(settings["baseUrl"], "Base_url")
 
     _config = LLMConfig(
         api_key=api_key,
@@ -2765,6 +2797,10 @@ def _apply_llm_runtime_config() -> None:
         consolidation_ratio=settings["consolidationRatio"],
     )
     _llm_client.set_config(_config)
+    if backend == "pi":
+        _compaction_worker.stop_idle_compaction()
+    else:
+        _compaction_worker.start_idle_compaction()
 
 
 async def _apply_qq_runtime_config() -> None:
@@ -2808,6 +2844,7 @@ async def _ensure_qq_runtime_started() -> None:
 
 
 class LLMSettingsRequest(BaseModel):
+    backend: str = "sjtuclaw"
     base_url: str = Field(alias="baseUrl")
     api_key: str | None = Field(default=None, alias="apiKey")
     model: str
@@ -2815,6 +2852,10 @@ class LLMSettingsRequest(BaseModel):
     context_usage_ratio: float = Field(alias="contextUsageRatio")
     max_output_tokens: int = Field(alias="maxOutputTokens")
     consolidation_ratio: float = Field(alias="consolidationRatio")
+    pi_provider: str = Field(default="", alias="piProvider")
+    pi_model: str = Field(default="", alias="piModel")
+    pi_thinking: str = Field(default="", alias="piThinking")
+    pi_trust_tools: bool = Field(default=False, alias="piTrustTools")
 
 
 class QQSettingsRequest(BaseModel):
@@ -2838,8 +2879,15 @@ def get_llm_settings():
 
 @app.put("/settings/llm")
 def update_llm_settings(req: LLMSettingsRequest):
-    _validate_url(req.base_url.strip(), "Base_url")
-    if not req.model.strip():
+    backend = req.backend.strip().lower()
+    pi_thinking = req.pi_thinking.strip().lower()
+    if backend not in {"sjtuclaw", "pi"}:
+        raise HTTPException(status_code=400, detail="Agent backend 必须是 sjtuclaw 或 pi")
+    if pi_thinking not in {"", "off", "minimal", "low", "medium", "high", "xhigh", "max"}:
+        raise HTTPException(status_code=400, detail="Pi thinking level 无效")
+    if req.base_url.strip():
+        _validate_url(req.base_url.strip(), "Base_url")
+    if backend != "pi" and not req.model.strip():
         raise HTTPException(status_code=400, detail="请填写 LLM 模型名称")
     if req.context_window < 1024:
         raise HTTPException(status_code=400, detail="Context window 不能小于 1024")
@@ -2852,12 +2900,17 @@ def update_llm_settings(req: LLMSettingsRequest):
 
     previous_settings = load_runtime_settings_raw()
     updates: dict[str, Any] = {
+        "AGENT_BACKEND": backend,
         "LLM_BASE_URL": req.base_url,
         "LLM_MODEL": req.model,
         "LLM_CONTEXT_WINDOW": req.context_window,
         "LLM_CONTEXT_USAGE_RATIO": req.context_usage_ratio,
         "LLM_MAX_OUTPUT_TOKENS": req.max_output_tokens,
         "LLM_CONSOLIDATION_RATIO": req.consolidation_ratio,
+        "PI_PROVIDER": req.pi_provider.strip(),
+        "PI_MODEL": req.pi_model.strip(),
+        "PI_THINKING": pi_thinking,
+        "PI_TRUST_TOOLS": "true" if req.pi_trust_tools else "false",
     }
     if req.api_key:
         updates["LLM_API_KEY"] = req.api_key

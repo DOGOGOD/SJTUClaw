@@ -15,6 +15,7 @@ SJTUClaw 将多轮对话、工具调用、长期记忆、Skill、定时任务和
 ## 核心功能
 
 - **统一 Agent Loop**：CLI、Web UI、QQ Bot、Heartbeat 和 Cron 共享 `run_agent_turn()`。
+- **可选 Pi Agent 后端**：通过官方 JSONL RPC 接入 Pi，保留其模型提供商、工具循环、Skills、Extensions、自动压缩、重试和持久会话，同时沿用 SJTUClaw 的界面、渠道与审批体验。
 - **工具调用与安全审批**：支持文件读写、Shell、联网、下载、记忆、Skill 和 Cron 工具，并按安全级别控制执行。
 - **可控执行模式**：提供按 Session 隔离的 AUTO 与 UNLIMITED 模式，可在自动执行效率和文件系统安全边界之间明确切换。
 - **上下文与长期记忆**：支持 Session 持久化、上下文压缩、Markdown 记忆和每日 Reflection。
@@ -137,6 +138,8 @@ sjtuclaw setup
 ```
 
 也可以复制 `.env.example` 为 `.env` 手动配置模型服务。
+
+需要使用 Pi 时，先构建同级目录中的 `pi` 仓库，或在系统中安装可执行的 `pi`；随后在 Web UI 的“设置 → LLM”把 Agent backend 切换为 Pi。Pi 可以直接复用已有的 OpenAI-compatible 模型配置，也可以通过 `PI_PROVIDER`、`PI_MODEL` 使用 Pi 自身的模型与认证配置。
 
 完整配置项、时区覆盖方式和安全建议见 [配置说明](docs/configuration.md)。
 

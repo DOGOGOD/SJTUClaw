@@ -19,6 +19,10 @@ datas += add_tree("web")
 datas += add_tree("prompts")
 datas += add_tree("skills")
 datas += add_tree("claw/pet/assets")
+for pi_extension in ("permission_gate.ts", "sjtuclaw_provider.ts"):
+    source = ROOT / "claw" / "pi" / pi_extension
+    if source.exists():
+        datas.append((str(source), "claw/pi"))
 if (ROOT / ".env.example").exists():
     datas.append((str(ROOT / ".env.example"), "."))
 

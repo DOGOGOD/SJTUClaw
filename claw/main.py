@@ -16,6 +16,7 @@ from claw.config import (
     MEMORY_DIR,
     SESSIONS_DIR,
     ConfigError,
+    LLMConfig,
     load_compaction_config,
     load_config,
     load_heartbeat_config,
@@ -28,7 +29,7 @@ from claw.scheduler.callbacks import (
 )
 from claw.scheduler import CronService
 from claw.llm.client import LLMClient
-from claw.pi import create_agent_client
+from claw.pi import create_agent_client, is_pi_backend
 from claw.memory.reflection import ReflectionManager
 from claw.memory.store import MemoryStore
 from claw.prompts import PromptLoadError, load_soul, load_system_prompt
@@ -53,12 +54,24 @@ def main() -> int:
     )
 
     try:
-        config = load_config()
         system_prompt = load_system_prompt()
         soul = load_soul()
-    except (ConfigError, PromptLoadError) as exc:
+    except PromptLoadError as exc:
         print(f"[配置错误] {exc}", file=sys.stderr)
         return 1
+
+    try:
+        config = load_config()
+    except ConfigError as exc:
+        if not is_pi_backend():
+            print(f"[配置错误] {exc}", file=sys.stderr)
+            return 1
+        config = LLMConfig(
+            api_key="",
+            base_url="https://api.openai.com/v1",
+            model="",
+        )
+        logging.info("Pi Agent 已启用；辅助 LLM 未配置。")
 
     client = create_agent_client(config)
     session_store = SessionStore(SESSIONS_DIR)
@@ -96,7 +109,8 @@ def main() -> int:
         config=compact_cfg,
         idle_ttl_minutes=compact_cfg.idle_ttl_minutes,
     )
-    compaction_worker.start_idle_compaction()
+    if not is_pi_backend():
+        compaction_worker.start_idle_compaction()
 
     approval_manager = ApprovalManager()
 

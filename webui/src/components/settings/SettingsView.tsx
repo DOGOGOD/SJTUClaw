@@ -421,13 +421,15 @@ function LLMSection() {
 
   const validate = () => {
     if (!settings) return "配置未加载";
-    try {
-      const url = new URL(settings.baseUrl);
-      if (!["http:", "https:"].includes(url.protocol)) return "Base_url 必须使用 http 或 https";
-    } catch {
-      return "Base_url 必须是完整 URL";
+    if (settings.baseUrl.trim()) {
+      try {
+        const url = new URL(settings.baseUrl);
+        if (!["http:", "https:"].includes(url.protocol)) return "Base_url 必须使用 http 或 https";
+      } catch {
+        return "Base_url 必须是完整 URL";
+      }
     }
-    if (!settings.model.trim()) return "请填写模型名称";
+    if (settings.backend !== "pi" && !settings.model.trim()) return "请填写模型名称";
     if (!Number.isFinite(settings.contextWindow) || settings.contextWindow < 1024) return "Context window 不能小于 1024";
     if (settings.contextUsageRatio <= 0 || settings.contextUsageRatio > 1) return "Context usage ratio 必须在 0 到 1 之间";
     if (settings.maxOutputTokens < 1) return "Max output tokens 必须大于 0";
@@ -469,9 +471,47 @@ function LLMSection() {
   );
 
   return (
-    <Section title="LLM 设置" desc="配置 OpenAI 兼容接口参数，保存后后续请求立即使用新连接。">
+    <Section title="Agent 与 LLM 设置" desc="选择 SJTUClaw 或 Pi Agent；保存后后续请求立即使用新后端。">
       <div className="rounded-xl border border-border/60 bg-card/40 p-4">
         <div className="grid gap-3">
+          <div>
+            <FieldLabel>Agent backend</FieldLabel>
+            <select
+              className="mt-1 h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
+              value={settings.backend}
+              onChange={(e) => setSettings({ ...settings, backend: e.target.value as "sjtuclaw" | "pi" })}
+            >
+              <option value="sjtuclaw">SJTUClaw 内置 Agent</option>
+              <option value="pi">Pi Agent</option>
+            </select>
+          </div>
+          {settings.backend === "pi" && (
+            <div className="grid gap-3 rounded-lg border border-border/50 bg-background/40 p-3 md:grid-cols-2">
+              <div>
+                <FieldLabel>Pi provider（可选）</FieldLabel>
+                <Input className="mt-1" value={settings.piProvider} onChange={(e) => setSettings({ ...settings, piProvider: e.target.value })} placeholder="留空则复用下方 LLM 或 Pi auth" />
+              </div>
+              <div>
+                <FieldLabel>Pi model（可选）</FieldLabel>
+                <Input className="mt-1" value={settings.piModel} onChange={(e) => setSettings({ ...settings, piModel: e.target.value })} placeholder="provider 原生模型 ID" />
+              </div>
+              <div>
+                <FieldLabel>Pi thinking</FieldLabel>
+                <select
+                  className="mt-1 h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
+                  value={settings.piThinking}
+                  onChange={(e) => setSettings({ ...settings, piThinking: e.target.value })}
+                >
+                  <option value="">使用 Pi 默认值</option>
+                  {['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].map((level) => <option key={level} value={level}>{level}</option>)}
+                </select>
+              </div>
+              <label className="flex items-center gap-2 self-end pb-2 text-sm">
+                <input type="checkbox" checked={settings.piTrustTools} onChange={(e) => setSettings({ ...settings, piTrustTools: e.target.checked })} />
+                信任 Pi 的写入和 Shell 工具（跳过审批）
+              </label>
+            </div>
+          )}
           <div>
             <FieldLabel>Base_url</FieldLabel>
             <Input className="mt-1" value={settings.baseUrl} onChange={(e) => setSettings({ ...settings, baseUrl: e.target.value })} placeholder="https://api.example.com/v1" />

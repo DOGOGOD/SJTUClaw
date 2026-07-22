@@ -34,7 +34,7 @@
 开发环境仍使用项目内的 `data/`。打包后的安装版会把可写数据放到：
 
 ```text
-%APPDATA%\SJTUClaw\data
+%USERPROFILE%\.sjtuclaw\data
 ```
 
 其中包括会话、记忆、运行时设置、定时任务、用户宠物和用户技能。

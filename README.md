@@ -111,7 +111,7 @@ SJTUClaw/
 安装版的可写数据默认保存在：
 
 ```text
-%APPDATA%\SJTUClaw\data
+%USERPROFILE%\.sjtuclaw\data
 ```
 
 其中包括会话、记忆、模型设置、定时任务、用户 Skill 和宠物资源。重新安装或覆盖升级不会主动删除这些用户数据。卸载可通过 Windows“已安装的应用”、开始菜单中的“卸载 SJTUClaw”，或安装目录内的卸载程序完成。
@@ -158,7 +158,7 @@ npm install
 npm run dev         # http://127.0.0.1:5173
 ```
 
-源码方式默认在项目目录下使用 `data/`、`prompts/` 和 `skills/`；安装版则使用 `%APPDATA%\SJTUClaw\data` 保存可写数据。两种方式共用同一套 Agent、Tool、Memory、Skill、Scheduler、Workspace 回退和 Gateway 代码，主要区别在启动入口、资源路径和运行数据位置。
+源码方式默认以项目根目录作为 Agent 主目录，并在项目内使用 `data/`、`prompts/` 和 `skills/`；安装版则以当前用户主目录下的 `.sjtuclaw` 作为 Agent 主目录，并使用 `.sjtuclaw/data`（Windows 示例：`C:\Users\<用户名>\.sjtuclaw\data`）保存可写数据。日志、环境配置与运行时文件也统一位于 `.sjtuclaw`。两种方式共用同一套 Agent、Tool、Memory、Skill、Scheduler、Workspace 回退和 Gateway 代码，主要区别在启动入口、资源路径和运行数据位置。
 
 `requirements.txt` 提供可复现的完整 Python 开发环境，包含核心运行时、Desktop、PyInstaller 和 pytest。若只希望安装最小核心运行时，可改用 `python -m pip install -e .`；只添加 Desktop 支持可使用 `python -m pip install -e ".[desktop]"`。
 

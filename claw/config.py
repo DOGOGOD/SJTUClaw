@@ -12,10 +12,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from dotenv import load_dotenv
-from claw.paths import data_dir, env_example_path, env_path, resource_root
+from claw.paths import data_dir, env_example_path, env_path, main_dir, resource_root
 
 # Source checkout root in development; bundled resource root in packaged builds.
 PROJECT_ROOT = resource_root()
+MAIN_DIR = main_dir()
 ENV_PATH = env_path()
 ENV_EXAMPLE_PATH = env_example_path()
 

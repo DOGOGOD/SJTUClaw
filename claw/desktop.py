@@ -109,6 +109,9 @@ def _run_window(url: str) -> None:
 
 def main() -> int:
     force_utf8_stdio()
+    # The packaged app's default agent directory must exist before the first
+    # tool call.  Source runs keep using the checkout root and need no setup.
+    user_root().mkdir(parents=True, exist_ok=True)
     parser = argparse.ArgumentParser(description="SJTUClaw desktop launcher")
     parser.add_argument("--pet", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--server-only", action="store_true", help=argparse.SUPPRESS)

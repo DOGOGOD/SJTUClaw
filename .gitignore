@@ -35,7 +35,7 @@ yarn-error.log*
 
 # Generated runtime artifacts
 /claw_shell_*.txt
-/check.txt
+check.txt
 /skills/.usage.json
 *.log
 *.tmp

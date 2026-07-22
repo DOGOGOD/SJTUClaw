@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 
-APP_NAME = "SJTUClaw"
+USER_DIR_NAME = ".sjtuclaw"
 
 
 def is_frozen() -> bool:
@@ -27,10 +27,19 @@ def user_root() -> Path:
     override = os.getenv("SJTUCLAW_USER_DIR", "").strip()
     if override:
         return Path(override).expanduser().resolve()
-    if os.name == "nt":
-        base = os.getenv("APPDATA") or os.getenv("LOCALAPPDATA") or str(Path.home())
-        return Path(base) / APP_NAME
-    return Path(os.getenv("XDG_DATA_HOME", Path.home() / ".local" / "share")) / APP_NAME
+    return Path.home() / USER_DIR_NAME
+
+
+def main_dir() -> Path:
+    """Default directory exposed to the agent when no workspace is selected.
+
+    Source runs should behave as if they were started from the checkout root,
+    regardless of the shell directory used to launch the Gateway.  A packaged
+    desktop build instead gets a stable, writable home under ``.sjtuclaw``.
+    """
+    if is_frozen():
+        return user_root()
+    return resource_root()
 
 
 def data_dir() -> Path:

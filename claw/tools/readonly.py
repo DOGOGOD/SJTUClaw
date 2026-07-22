@@ -25,6 +25,7 @@ from typing import Any, Callable
 
 from claw.tools.base import Tool, ToolResult
 from claw.utils import default_timezone_name
+from claw.paths import main_dir
 from claw.workspace.manager import WorkspaceManager, WorkspaceError
 
 # Maximum file size before truncation: 64 KiB of UTF-8 text.
@@ -79,8 +80,12 @@ def _resolve_path(
                     f"path outside workspace: \"{path_str}\""
                 )
             return resolved
-    # No workspace manager or no workspace set - use raw path (backward compat)
-    return Path(path_str)
+    # No explicit workspace: use the runtime's stable main directory rather
+    # than inheriting whichever cwd happened to launch the Gateway/WebUI.
+    path = Path(path_str)
+    if path.is_absolute():
+        return path.resolve()
+    return (main_dir() / path).resolve()
 
 
 # ---------------------------------------------------------------------------

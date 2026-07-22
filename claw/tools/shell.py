@@ -130,6 +130,13 @@ def _shell_args() -> list[str]:
     return ["/C"] if _IS_WINDOWS else ["-c"]
 
 
+def _subprocess_creation_flags() -> int:
+    """Keep command subprocesses from flashing a console on Windows."""
+    if not _IS_WINDOWS:
+        return 0
+    return subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+
+
 def _cwd_command() -> str:
     """Return a command that prints the current working directory."""
     return "cd" if _IS_WINDOWS else "pwd"
@@ -174,9 +181,7 @@ def _get_real_cwd(session: ShellSession, timeout: float = 5) -> str:
             text=False,
             cwd=str(session.cwd),
             timeout=timeout,
-            creationflags=(
-                subprocess.CREATE_NEW_PROCESS_GROUP if _IS_WINDOWS else 0
-            ),
+            creationflags=_subprocess_creation_flags(),
         )
         out = decode_subprocess_output(proc.stdout).strip()
         if out:
@@ -430,9 +435,7 @@ def _run_script(
             capture_output=True,
             text=False,
             timeout=timeout,
-            creationflags=(
-                subprocess.CREATE_NEW_PROCESS_GROUP if _IS_WINDOWS else 0
-            ),
+            creationflags=_subprocess_creation_flags(),
         )
     except subprocess.TimeoutExpired:
         return None, "", cwd, True

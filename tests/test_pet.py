@@ -5,6 +5,7 @@ import json
 import tempfile
 import unittest
 import zipfile
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -76,6 +77,29 @@ class PetCatalogTests(unittest.TestCase):
         self.catalog.update_settings(selected_pet_id="test-pet")
         self.catalog.remove("test-pet")
         self.assertEqual(self.catalog.load_settings().selected_pet_id, "yuexinmiao")
+
+    def test_list_pets_deduplicates_identical_spritesheets(self):
+        bundled_asset = self.catalog._bundled / "yuexinmiao" / "spritesheet.webp"
+        duplicate_dir = self.catalog._user_pets / "duplicate-cat"
+        duplicate_dir.mkdir(parents=True)
+        (duplicate_dir / "spritesheet.webp").write_bytes(bundled_asset.read_bytes())
+        (duplicate_dir / "pet.json").write_text(
+            json.dumps(
+                {
+                    "id": "duplicate-cat",
+                    "displayName": "月薪喵",
+                    "description": "",
+                    "spriteVersionNumber": 1,
+                    "spritesheetPath": "spritesheet.webp",
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        listed = self.catalog.list_pets()
+
+        self.assertEqual([pet["id"] for pet in listed], ["yuexinmiao"])
         persisted = json.loads(
             (Path(self.tempdir.name) / "data" / "pet" / "settings.json").read_text(
                 encoding="utf-8"
@@ -253,6 +277,26 @@ class PetStateBrokerTests(unittest.TestCase):
                 self.assertTrue(first)
                 with _single_instance_lock(path) as second:
                     self.assertFalse(second)
+
+    def test_desktop_pet_lock_stays_in_its_data_directory(self):
+        from claw.pet import app as pet_app
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            data_dir = Path(tempdir) / "project-data"
+            lock_paths = []
+
+            @contextmanager
+            def record_lock(path):
+                lock_paths.append(path)
+                yield False
+
+            with patch.object(pet_app, "_single_instance_lock", side_effect=record_lock):
+                self.assertEqual(
+                    pet_app.run_desktop_pet("http://127.0.0.1:8000", data_dir),
+                    0,
+                )
+
+            self.assertEqual(lock_paths, [data_dir / "pet" / "desktop.lock"])
 
     def test_bubble_is_hidden_only_when_idle_without_approval(self):
         self.assertFalse(should_show_bubble({"phase": "idle"}, []))

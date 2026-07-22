@@ -7,6 +7,7 @@ future WebUI can manage them without changing package files.
 from __future__ import annotations
 
 import io
+import hashlib
 import json
 import re
 import shutil
@@ -126,6 +127,8 @@ class PetCatalog:
     def list_pets(self) -> list[dict[str, Any]]:
         pets: list[dict[str, Any]] = []
         seen: set[str] = set()
+        asset_indexes: dict[str, int] = {}
+        selected_id = self.load_settings().selected_pet_id
         for source, root, read_only in (
             ("user", self._user_pets, False),
             ("bundled", self._bundled, True),
@@ -134,9 +137,25 @@ class PetCatalog:
                 continue
             for manifest_path in sorted(root.glob("*/pet.json")):
                 pet = self._read_pet(manifest_path.parent, source, read_only)
-                if pet is not None and pet["id"] not in seen:
-                    pets.append(pet)
-                    seen.add(pet["id"])
+                if pet is None or pet["id"] in seen:
+                    continue
+                # A previously imported copy of a bundled pet can have a
+                # different id while containing the exact same spritesheet.
+                # Treat the asset itself as the identity for listing so the
+                # settings page does not present duplicate visual pets.
+                asset_key = _pet_asset_key(pet)
+                existing_index = asset_indexes.get(asset_key)
+                if existing_index is not None:
+                    # Keep the selected ID visible if a bundled pet and a
+                    # user-installed copy share the same spritesheet.
+                    if pet["id"] == selected_id and pets[existing_index]["id"] != selected_id:
+                        seen.discard(pets[existing_index]["id"])
+                        pets[existing_index] = pet
+                        seen.add(pet["id"])
+                    continue
+                pets.append(pet)
+                seen.add(pet["id"])
+                asset_indexes[asset_key] = len(pets) - 1
         return pets
 
     def get_pet(self, pet_id: str) -> dict[str, Any] | None:
@@ -466,3 +485,20 @@ def _optional_int(value: Any) -> int | None:
         return None if value is None else int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _pet_asset_key(pet: dict[str, Any]) -> str:
+    """Return a stable identity for a pet's visual asset."""
+    try:
+        # Hash decoded pixels rather than compressed file bytes so an
+        # identical PNG/WebP re-encode is also recognized as a duplicate.
+        with Image.open(Path(str(pet["spritesheetPath"]))) as image:
+            pixels = image.convert("RGBA").tobytes()
+        digest = hashlib.sha256(pixels).hexdigest()
+    except (KeyError, OSError, TypeError, ValueError):
+        # _read_pet already validates the path; retain a malformed entry as a
+        # distinct item if a caller supplies a hand-built pet mapping.
+        digest = str(pet.get("spritesheetPath", ""))
+    display_name = str(pet.get("displayName", "")).strip().casefold()
+    description = str(pet.get("description", "")).strip()
+    return f"{display_name}\0{description}\0{digest}"

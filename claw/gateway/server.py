@@ -46,9 +46,9 @@ from claw.config import (
     ConfigError,
     LLMConfig,
     DATA_DIR,
+    MAIN_DIR,
     load_heartbeat_config,
     MEMORY_DIR,
-    PROJECT_ROOT,
     SESSIONS_DIR,
     load_config,
     load_compaction_config,
@@ -179,7 +179,7 @@ _context_builder = ContextBuilder(
     _system_prompt,
     _soul,
     _memory_store,
-    workspace_path=str(PROJECT_ROOT),
+    workspace_path=str(MAIN_DIR),
     timezone=default_timezone_name(),
     workspace_manager=_workspace_manager,
 )
@@ -1657,9 +1657,9 @@ def get_local_image(session_id: str, path: str = Query(...)):
     if not _session_store.exists(session_id):
         raise HTTPException(status_code=404, detail=f"Session 不存在: {session_id}")
     workspace = _workspace_manager.get(session_id)
-    # Sessions without an explicit binding still operate from the project
-    # workspace, so expose images there while retaining the same boundary.
-    root = (workspace or PROJECT_ROOT).resolve()
+    # Sessions without an explicit binding operate from the runtime main
+    # directory (checkout root in source runs, ~/.sjtuclaw when packaged).
+    root = (workspace or MAIN_DIR).resolve()
     candidate_path = Path(path)
     candidate = (
         candidate_path.resolve()

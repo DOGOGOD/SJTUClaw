@@ -38,6 +38,22 @@ def test_force_utf8_stdio_reconfigures_available_streams(monkeypatch) -> None:
     assert calls == [("utf-8", "replace")] * 3
 
 
+def test_windows_shell_subprocesses_do_not_open_a_console(monkeypatch) -> None:
+    import claw.tools.shell as shell_module
+
+    monkeypatch.setattr(shell_module, "_IS_WINDOWS", True)
+    monkeypatch.setattr(
+        shell_module.subprocess, "CREATE_NEW_PROCESS_GROUP", 0x0200, raising=False
+    )
+    monkeypatch.setattr(
+        shell_module.subprocess, "CREATE_NO_WINDOW", 0x08000000, raising=False
+    )
+    flags = shell_module._subprocess_creation_flags()
+
+    assert flags & 0x0200
+    assert flags & 0x08000000
+
+
 def test_shell_failure_keeps_chinese_output(monkeypatch, tmp_path: Path) -> None:
     """A failed tool call must not replace localized stderr with mojibake."""
     import claw.tools.shell as shell_module

@@ -17,7 +17,9 @@ from claw.pet.app import (
     PET_BASE_SCALE,
     DesktopPet,
     GatewayClient,
+    _clear_pending_image,
     _make_color_key_safe,
+    _point_in_bbox,
     _rounded_rectangle_points,
     _single_instance_lock,
     should_show_bubble,
@@ -73,6 +75,23 @@ class PetCatalogTests(unittest.TestCase):
         self.catalog.update_settings(selected_pet_id="test-pet")
         self.catalog.remove("test-pet")
         self.assertEqual(self.catalog.load_settings().selected_pet_id, "yuexinmiao")
+        persisted = json.loads(
+            (Path(self.tempdir.name) / "data" / "pet" / "settings.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(persisted["selectedPetId"], "yuexinmiao")
+
+    def test_invalid_selected_pet_is_repaired_on_disk(self):
+        settings_path = Path(self.tempdir.name) / "data" / "pet" / "settings.json"
+        settings_path.write_text(
+            json.dumps({"selectedPetId": "missing-pet"}),
+            encoding="utf-8",
+        )
+
+        self.assertEqual(self.catalog.load_settings().selected_pet_id, "yuexinmiao")
+        persisted = json.loads(settings_path.read_text(encoding="utf-8"))
+        self.assertEqual(persisted["selectedPetId"], "yuexinmiao")
 
     def test_rejects_bad_atlas_dimensions(self):
         buffer = io.BytesIO()
@@ -143,6 +162,42 @@ class PetStateBrokerTests(unittest.TestCase):
         cleaned = _make_color_key_safe(image)
         alpha = cleaned.getchannel("A")
         self.assertEqual([alpha.getpixel((x, 0)) for x in range(3)], [0, 0, 255])
+
+    def test_pending_image_remove_hit_area_includes_padding(self):
+        badge_bounds = (16, 10, 56, 26)
+
+        self.assertTrue(_point_in_bbox(12, 18, badge_bounds, padding=5))
+        self.assertTrue(_point_in_bbox(61, 18, badge_bounds, padding=5))
+        self.assertFalse(_point_in_bbox(62, 18, badge_bounds, padding=5))
+        self.assertFalse(_point_in_bbox(20, 20, None, padding=5))
+
+    def test_clearing_pending_image_restores_input_layout_and_focus(self):
+        image = Image.new("RGB", (2, 2), (255, 0, 0))
+        pending_image = {"value": image}
+        calls = []
+
+        class _Canvas:
+            def itemconfigure(self, item, **kwargs):
+                calls.append(("itemconfigure", item, kwargs))
+
+        class _Entry:
+            def focus_set(self):
+                calls.append(("focus_set",))
+
+        _clear_pending_image(
+            pending_image,
+            _Canvas(),
+            7,
+            lambda: calls.append(("resize",)),
+            _Entry(),
+        )
+
+        self.assertIsNone(pending_image["value"])
+        self.assertEqual(calls, [
+            ("itemconfigure", 7, {"text": ""}),
+            ("resize",),
+            ("focus_set",),
+        ])
 
 
 class GatewayClientImageUploadTests(unittest.TestCase):

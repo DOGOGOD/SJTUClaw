@@ -21,6 +21,7 @@ import {
   uploadPet,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import { usePetSelection } from "@/contexts/PetSelectionContext";
 import type { PetInfo, PetSettings } from "@/lib/types";
 
 interface PetRuntimeResult {
@@ -86,6 +87,7 @@ function PetPreview({ pet }: { pet: PetInfo }) {
 }
 
 export function PetSettingsSection() {
+  const { setSelectedPet } = usePetSelection();
   const [settings, setSettings] = useState<PetSettings | null>(null);
   const [pets, setPets] = useState<PetInfo[]>([]);
   const [running, setRunning] = useState(false);
@@ -103,13 +105,17 @@ export function PetSettingsSection() {
       setSettings(settingsResult.settings);
       setRunning(settingsResult.running);
       setPets(petsResult.pets || []);
+      const selected = petsResult.pets.find(
+        (pet) => pet.id === settingsResult.settings.selectedPetId,
+      );
+      if (selected) setSelectedPet(selected);
       setError("");
     } catch (err) {
       setError(errorMessage(err));
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [setSelectedPet]);
 
   useEffect(() => {
     void refresh();
@@ -118,6 +124,7 @@ export function PetSettingsSection() {
   const runMutation = async (
     action: () => Promise<PetRuntimeResult>,
     successMessage: string,
+    onSuccess?: (result: PetRuntimeResult) => void,
   ) => {
     setBusy(true);
     setError("");
@@ -125,6 +132,7 @@ export function PetSettingsSection() {
       const result = await action();
       setSettings(result.settings);
       setRunning(result.running);
+      onSuccess?.(result);
       setStatus(successMessage);
       window.setTimeout(() => setStatus(""), 2200);
     } catch (err) {
@@ -139,6 +147,7 @@ export function PetSettingsSection() {
     void runMutation(
       () => savePetSettings({ selectedPetId: pet.id }),
       `已选择 ${pet.displayName}`,
+      () => setSelectedPet(pet),
     );
   };
 
@@ -281,9 +290,11 @@ export function PetSettingsSection() {
                     <span className="mt-1 block text-xs leading-relaxed text-muted-foreground">
                       {pet.description || "自定义桌面宠物"}
                     </span>
-                    <span className="mt-2 block text-[10px] text-muted-foreground/60">
-                      v{pet.spriteVersionNumber} {pet.readOnly ? "内置" : "自定义"}
-                    </span>
+                    {!pet.readOnly && (
+                      <span className="mt-2 block text-[10px] text-muted-foreground/60">
+                        自定义宠物
+                      </span>
+                    )}
                   </span>
                 </button>
                 {!pet.readOnly && (

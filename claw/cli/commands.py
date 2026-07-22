@@ -1061,10 +1061,9 @@ def _handle_pet_command(args: list[str], state: RuntimeState) -> str:
         lines = ["可用宠物："]
         for pet in pets:
             selected = " [当前]" if pet["id"] == settings.selected_pet_id else ""
-            source = "内置" if pet.get("readOnly") else "自定义"
-            lines.append(
-                f"  {pet['id']}  {pet['displayName']}  v{pet['spriteVersionNumber']}  {source}{selected}"
-            )
+            lines.append(f"  {pet['id']}  {pet['displayName']}{selected}")
+            if pet.get("description"):
+                lines.append(f"    {pet['description']}")
         return "\n".join(lines)
 
     if sub in ("open", "on", "enable"):

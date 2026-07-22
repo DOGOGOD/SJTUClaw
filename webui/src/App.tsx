@@ -5,9 +5,10 @@ import { Sidebar } from "@/components/sidebar/Sidebar";
 import { ThreadShell } from "@/components/thread/ThreadShell";
 import { SettingsView } from "@/components/settings/SettingsView";
 import { ThemeProvider, useTheme } from "@/hooks/useTheme";
+import { PetSelectionProvider, usePetSelection } from "@/contexts/PetSelectionContext";
 import { useSessions } from "@/hooks/useSessions";
 import { cn, escapeMarkdownImageAlt } from "@/lib/utils";
-import { isSlashCommand } from "@/lib/commands";
+import { isPetSelectionCommand, isSlashCommand } from "@/lib/commands";
 import { messagesAfterCommandRefresh, resolveCommandNavigation } from "@/lib/commandState";
 import { fetchMessages, sendMessage, sendCommand, stopChat, uploadAttachment, renameSession, fetchApprovals, approveApproval, rejectApproval, previewRollback, applyRollback } from "@/lib/api";
 import type { ApprovalInfo } from "@/lib/types";
@@ -18,6 +19,7 @@ const SIDEBAR_COLLAPSED_WIDTH = 0;
 
 function Shell() {
   const { theme, toggle: toggleTheme } = useTheme();
+  const { refreshSelectedPet } = usePetSelection();
   const { sessions, loading: sessionsLoading, refresh: refreshSessions, createChat, deleteChat, updateTitle } = useSessions();
 
   const [view, setView] = useState<ShellView>("chat");
@@ -216,6 +218,9 @@ function Shell() {
         if (d.actions?.includes("open_pet_settings")) {
           navigateToSettings("pet");
         }
+        if (isPetSelectionCommand(message)) {
+          await refreshSelectedPet();
+        }
         if (message.trim().toLowerCase().startsWith("/workspace")) {
           setWorkspaceRefreshToken((value) => value + 1);
         }
@@ -309,7 +314,7 @@ function Shell() {
       setPendingApproval(null);
       setSending(false);
     }
-  }, [activeSessionId, createChat, navigateToChat, refreshSessions, updateTitle]);
+  }, [activeSessionId, createChat, navigateToChat, refreshSelectedPet, refreshSessions, updateTitle]);
 
   const handleStop = useCallback(async () => {
     if (!activeSessionId) return;
@@ -508,9 +513,11 @@ function Shell() {
 export default function App() {
   return (
     <ThemeProvider>
-      <ErrorBoundary>
-        <Shell />
-      </ErrorBoundary>
+      <PetSelectionProvider>
+        <ErrorBoundary>
+          <Shell />
+        </ErrorBoundary>
+      </PetSelectionProvider>
     </ThemeProvider>
   );
 }

@@ -77,6 +77,7 @@ class PetCatalog:
             )
             if self.get_pet(settings.selected_pet_id) is None:
                 settings.selected_pet_id = "yuexinmiao"
+                self._write_settings(settings)
             return settings
 
     def update_settings(
@@ -190,15 +191,16 @@ class PetCatalog:
         return pet
 
     def remove(self, pet_id: str) -> None:
-        if (self._bundled / pet_id).exists():
-            raise PetCatalogError("不能删除内置宠物")
-        pet_dir = self._user_pets / pet_id
-        if not pet_dir.is_dir():
-            raise PetCatalogError(f"宠物不存在: {pet_id}")
-        shutil.rmtree(pet_dir)
-        settings = self.load_settings()
-        if settings.selected_pet_id == pet_id:
-            self.update_settings(selected_pet_id="yuexinmiao")
+        with self._lock:
+            if (self._bundled / pet_id).exists():
+                raise PetCatalogError("不能删除内置宠物")
+            pet_dir = self._user_pets / pet_id
+            if not pet_dir.is_dir():
+                raise PetCatalogError(f"宠物不存在: {pet_id}")
+            was_selected = self.load_settings().selected_pet_id == pet_id
+            shutil.rmtree(pet_dir)
+            if was_selected:
+                self.update_settings(selected_pet_id="yuexinmiao")
 
     def _write_settings(self, settings: PetSettings) -> None:
         tmp = self._settings_path.with_suffix(".tmp")

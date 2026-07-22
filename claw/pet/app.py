@@ -15,7 +15,7 @@ import urllib.error
 import urllib.request
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import tkinter as tk
 import tkinter.font as tkfont
@@ -177,6 +177,36 @@ def _make_color_key_safe(image: Image.Image, alpha_cutoff: int = 128) -> Image.I
     )
     rgba.putalpha(alpha)
     return rgba
+
+
+def _point_in_bbox(
+    x: float,
+    y: float,
+    bbox: tuple[int, int, int, int] | None,
+    padding: int = 0,
+) -> bool:
+    """Return whether a canvas point is inside a possibly padded item bbox."""
+    if bbox is None:
+        return False
+    left, top, right, bottom = bbox
+    return (
+        left - padding <= x <= right + padding
+        and top - padding <= y <= bottom + padding
+    )
+
+
+def _clear_pending_image(
+    pending_image: dict[str, Image.Image | None],
+    popup_canvas: tk.Canvas,
+    image_badge: int,
+    resize_popup: Callable[[], None],
+    entry: tk.Entry,
+) -> None:
+    """Clear the desktop pet's pending image and restore its input layout."""
+    pending_image["value"] = None
+    popup_canvas.itemconfigure(image_badge, text="")
+    resize_popup()
+    entry.focus_set()
 
 
 class GatewayClient:
@@ -713,6 +743,18 @@ class DesktopPet:
         btn_pos = {"x": btn_cx, "y": btn_cy, "r": btn_radius}
 
         def _on_canvas_click(event: tk.Event):
+            badge_bbox = popup_canvas.bbox(image_badge)
+            if (
+                pending_image["value"] is not None
+                and _point_in_bbox(
+                    event.x, event.y, badge_bbox, padding=self._px(5)
+                )
+            ):
+                _clear_pending_image(
+                    pending_image, popup_canvas, image_badge, _resize_popup, entry
+                )
+                return "break"
+
             dx = event.x - btn_pos["x"]
             dy = event.y - btn_pos["y"]
             if dx * dx + dy * dy <= btn_pos["r"] * btn_pos["r"]:
@@ -747,7 +789,11 @@ class DesktopPet:
                     self._px(12),
                 ),
             )
-            badge_width = self._px(42) if pending_image["value"] is not None else 0
+            badge_width = (
+                entry_font.measure("图片 ×") + self._px(8)
+                if pending_image["value"] is not None
+                else 0
+            )
             popup_canvas.coords(image_badge, self._px(16), height // 2)
             popup_canvas.coords(entry_window, self._px(16) + badge_width, height // 2)
             popup_canvas.itemconfigure(
@@ -796,7 +842,7 @@ class DesktopPet:
             if image is None:
                 return None
             pending_image["value"] = image
-            popup_canvas.itemconfigure(image_badge, text="图片 ✓")
+            popup_canvas.itemconfigure(image_badge, text="图片 ×")
             _resize_popup()
             entry.focus_set()
             return "break"

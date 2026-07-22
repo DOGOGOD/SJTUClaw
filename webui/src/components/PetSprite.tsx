@@ -1,11 +1,11 @@
 import { useEffect, useRef } from "react";
+import { usePetSelection } from "@/contexts/PetSelectionContext";
 import { cn } from "@/lib/utils";
 
 /**
- * WebUI 首页猫猫精灵图动画组件。
+ * WebUI 首页当前宠物的精灵图动画组件。
  *
- * 使用 pet 模块（claw/pet/assets/yuexinmiao/spritesheet.webp）中已定义的
- * 精灵图资源，实现与桌宠一致的帧动画。
+ * 使用宠物设置中当前角色的 spritesheet，实现与桌宠一致的帧动画。
  *
  * 状态机：
  * - walk: 左右来回走动（running-right / running-left），参考拖动桌宠的移动
@@ -19,7 +19,6 @@ import { cn } from "@/lib/utils";
 const CELL_WIDTH = 192;
 const CELL_HEIGHT = 208;
 const SHEET_COLS = 8;
-const SHEET_ROWS = 9;
 
 // ---- 显示尺寸（缩放到适合 WebUI 首页的大小）----
 const DISPLAY_WIDTH = 85;
@@ -47,6 +46,8 @@ interface PetSpriteProps {
 
 export function PetSprite({ className }: PetSpriteProps) {
   const spriteRef = useRef<HTMLDivElement>(null);
+  const { selectedPet } = usePetSelection();
+  const spritesheetUrl = selectedPet.spritesheetUrl;
 
   useEffect(() => {
     const el = spriteRef.current;
@@ -156,10 +157,11 @@ export function PetSprite({ className }: PetSpriteProps) {
 
     raf = requestAnimationFrame(tick);
     return () => cancelAnimationFrame(raf);
-  }, []);
+  }, [spritesheetUrl]);
 
+  const sheetRows = selectedPet.spriteVersionNumber === 2 ? 11 : 9;
   const sheetW = SHEET_COLS * DISPLAY_WIDTH;
-  const sheetH = SHEET_ROWS * DISPLAY_HEIGHT;
+  const sheetH = sheetRows * DISPLAY_HEIGHT;
   // 容器宽度需容纳精灵图 + 左右移动范围，确保移动时不被裁切
   const containerW = DISPLAY_WIDTH + MAX_OFFSET * 2;
 
@@ -167,13 +169,16 @@ export function PetSprite({ className }: PetSpriteProps) {
     <div
       className={cn("flex justify-center mx-auto", className)}
       style={{ width: containerW, height: DISPLAY_HEIGHT }}
+      role="img"
+      aria-label={`${selectedPet.displayName} 动画`}
+      data-pet-id={selectedPet.id}
     >
       <div
         ref={spriteRef}
         style={{
           width: DISPLAY_WIDTH,
           height: DISPLAY_HEIGHT,
-          backgroundImage: "url(/pet-spritesheet.webp)",
+          backgroundImage: `url("${spritesheetUrl}")`,
           backgroundSize: `${sheetW}px ${sheetH}px`,
           backgroundRepeat: "no-repeat",
           flexShrink: 0,

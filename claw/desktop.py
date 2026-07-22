@@ -14,7 +14,7 @@ from pathlib import Path
 
 import uvicorn
 
-from claw.paths import user_root
+from claw.paths import resource_root, user_root
 from claw.utils import force_utf8_stdio
 
 
@@ -76,6 +76,18 @@ def _run_server(host: str, port: int) -> None:
         raise
 
 
+def _window_icon_path() -> str | None:
+    candidates = [
+        Path(sys.executable).resolve().parent / "SJTUClaw.ico",
+        resource_root() / "packaging" / "windows" / "assets" / "SJTUClaw.ico",
+        resource_root() / "web" / "favicon.ico",
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
 def _run_window(url: str) -> None:
     try:
         import webview
@@ -92,7 +104,7 @@ def _run_window(url: str) -> None:
         min_size=(960, 640),
         text_select=True,
     )
-    webview.start()
+    webview.start(icon=_window_icon_path())
 
 
 def main() -> int:

@@ -59,7 +59,9 @@ class PetCommandTests(unittest.TestCase):
     def test_pet_slash_command_is_registered_and_manages_runtime(self):
         self.assertTrue(is_command("/pet"))
         self.assertTrue(is_command("/pet open"))
-        self.assertIn("月薪喵", _handle_pet_command([], self.state))
+        pet_list = _handle_pet_command(["list"], self.state)
+        self.assertIn("月薪喵", pet_list)
+        self.assertNotIn("内置", pet_list)
         self.assertIn("已开启", _handle_pet_command(["open"], self.state))
         self.assertTrue(self.process.running)
         self.assertIn("已关闭", _handle_pet_command(["close"], self.state))

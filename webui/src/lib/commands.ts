@@ -23,3 +23,8 @@ export function isSlashCommand(input: string): boolean {
   const command = input.trim().split(/\s+/, 1)[0]?.toLowerCase();
   return !!command && SLASH_COMMANDS.has(command);
 }
+
+/** Return true only for the command that changes the selected pet. */
+export function isPetSelectionCommand(input: string): boolean {
+  return /^\/pet\s+select(?:\s|$)/i.test(input.trim());
+}

@@ -1,4 +1,5 @@
 const API_BASE = "";
+const DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
 
 // Deduplication map: prevents concurrent duplicate GET requests
 const _pendingRequests = new Map<string, Promise<any>>();
@@ -30,7 +31,11 @@ async function _parseJsonResponse<T>(res: Response): Promise<T> {
   }
 }
 
-async function request<T>(url: string, options?: RequestInit): Promise<T> {
+async function request<T>(
+  url: string,
+  options?: RequestInit,
+  timeoutMs: number | null = DEFAULT_REQUEST_TIMEOUT_MS,
+): Promise<T> {
   const method = options?.method || "GET";
   const cacheKey = method === "GET" ? `${method}:${url}` : "";
 
@@ -40,7 +45,9 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
   }
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 60_000);
+  const timeout = timeoutMs === null
+    ? null
+    : setTimeout(() => controller.abort(), timeoutMs);
 
   const promise = (async () => {
     try {
@@ -68,7 +75,7 @@ async function request<T>(url: string, options?: RequestInit): Promise<T> {
       }
       throw err;
     } finally {
-      clearTimeout(timeout);
+      if (timeout !== null) clearTimeout(timeout);
       if (cacheKey) _pendingRequests.delete(cacheKey);
     }
   })();
@@ -108,10 +115,13 @@ export async function fetchMessages(sessionId: string): Promise<{
 }
 
 export async function sendMessage(data: import("@/lib/types").SendMessageRequest): Promise<import("@/lib/types").SendMessageResponse> {
+  // Agent turns may legitimately take several minutes and can be cancelled
+  // explicitly through /stop. A fixed client-side timeout would only detach
+  // the UI while the backend keeps running, producing a false failure.
   return request("/chat", {
     method: "POST",
     body: JSON.stringify(data),
-  });
+  }, null);
 }
 
 /**

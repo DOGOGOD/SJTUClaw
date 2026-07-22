@@ -1,6 +1,6 @@
 {
-  "generatedAt": "2026-07-22T11:32:23.336750+00:00",
-  "dataDir": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\.claw-eval-round2-baseline",
+  "generatedAt": "2026-07-22T12:10:04.638623+00:00",
+  "dataDir": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\.claw-eval-data-rerun1",
   "workspace": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\claw_evaluation_workspace",
   "passed": 13,
   "failed": 0,
@@ -85,9 +85,9 @@
       "name": "一次性 Scheduler 任务与 Session 回写",
       "passed": true,
       "evidence": {
-        "jobId": "9134b920",
+        "jobId": "bd2a6459",
         "lastState": {
-          "nextRunAtMs": 1784719932108,
+          "nextRunAtMs": 1784722193418,
           "lastRunAtMs": null,
           "lastStatus": null,
           "lastError": null,
@@ -109,7 +109,7 @@
       "evidence": {
         "approvals": [
           {
-            "approvalId": "apr_106145825eb8",
+            "approvalId": "apr_bd92870b0816",
             "sessionId": "session_008",
             "toolName": "overwrite_file",
             "toolArgs": {
@@ -118,7 +118,7 @@
             },
             "status": "pending",
             "rejectReason": "",
-            "createdAt": "2026-07-22T11:32:12+00:00"
+            "createdAt": "2026-07-22T12:09:53+00:00"
           }
         ],
         "file": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\claw_evaluation_workspace\\outputs\\raft_course_report.md",
@@ -148,7 +148,7 @@
       "evidence": {
         "approvals": [
           {
-            "approvalId": "apr_88a212be1781",
+            "approvalId": "apr_fcc932b45796",
             "sessionId": "session_008",
             "toolName": "overwrite_file",
             "toolArgs": {
@@ -157,10 +157,10 @@
             },
             "status": "pending",
             "rejectReason": "",
-            "createdAt": "2026-07-22T11:32:12+00:00"
+            "createdAt": "2026-07-22T12:09:53+00:00"
           },
           {
-            "approvalId": "apr_b7e3d8af7215",
+            "approvalId": "apr_49c6f770ce00",
             "sessionId": "session_008",
             "toolName": "overwrite_file",
             "toolArgs": {
@@ -169,7 +169,7 @@
             },
             "status": "pending",
             "rejectReason": "",
-            "createdAt": "2026-07-22T11:32:12+00:00"
+            "createdAt": "2026-07-22T12:09:54+00:00"
           }
         ],
         "fileExists": false,

@@ -93,6 +93,11 @@ class PetReplyStoreTests(unittest.TestCase):
         self.assertEqual(self.store.load("coding-cat"), result.replies)
         messages = client.chat.call_args.args[0]
         self.assertIn(pet["description"], messages[1]["content"])
+        system_prompt = messages[0]["content"]
+        self.assertIn("每条回复都必须至少体现一项", system_prompt)
+        self.assertIn("让人不看名字也能辨认这个角色", system_prompt)
+        self.assertIn("不得杜撰 description 未支持", system_prompt)
+        self.assertIn("不要写旁白、动作描写", system_prompt)
 
     def test_generation_failure_stores_pet_bound_fallback(self):
         client = Mock(configured=True)

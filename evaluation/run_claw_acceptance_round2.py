@@ -6,6 +6,7 @@ import asyncio
 import io
 import json
 import os
+import shutil
 import time
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
@@ -231,6 +232,13 @@ def zip_bytes(entries: dict[str, bytes]) -> bytes:
 
 
 def run() -> None:
+    # The workspace is a runner-owned fixture.  Recreate it so a previous
+    # acceptance run cannot make a "new file" look pre-existing and produce a
+    # false rollback failure.
+    if WORKSPACE.resolve().parent != ROOT.resolve():
+        raise RuntimeError(f"refusing to clean unexpected workspace: {WORKSPACE}")
+    if WORKSPACE.exists():
+        shutil.rmtree(WORKSPACE)
     WORKSPACE.mkdir(parents=True, exist_ok=True)
     fake = AdvancedLocalLLM()
     server._llm_client.chat_with_tools = fake.chat_with_tools

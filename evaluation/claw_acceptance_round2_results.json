@@ -1,6 +1,6 @@
 {
-  "generatedAt": "2026-07-22T19:35:58+0800",
-  "dataDir": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\.claw-eval-round2-advanced2",
+  "generatedAt": "2026-07-22T20:10:04+0800",
+  "dataDir": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\.claw-eval-data-rerun2",
   "workspace": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\claw_evaluation_workspace_round2",
   "passed": 12,
   "failed": 0,
@@ -40,7 +40,7 @@
       "passed": true,
       "evidence": {
         "preview": {
-          "checkpointId": "cp_6514fa2baf214fd1af150c0c0c259deb",
+          "checkpointId": "cp_62f66c59da4341e2a4cf5c9d50d2c722",
           "messagePreview": "执行 ROLLBACK-V2",
           "filesToRestore": 1,
           "filesToDelete": 1,
@@ -57,15 +57,15 @@
         "messagesBefore": 9,
         "messagesAfter": 4,
         "undo": {
-          "checkpointId": "cp_d0353c85b7c047818e291be7754e62fb",
+          "checkpointId": "cp_2d7866a8487d471a83839e7c8cccfa66",
           "restored": 2,
           "deleted": 0,
           "messages": [
             {
               "role": "user",
               "content": "执行 ROLLBACK-V1",
-              "messageId": "msg_7ad3d38b7b8f45dfaed7abcbb0471407",
-              "rollbackCheckpointId": "cp_998f62ce06814813847bce036467aa40",
+              "messageId": "msg_3423cfac22434ce59f62d0d820f1ba4f",
+              "rollbackCheckpointId": "cp_15e71c9376614f489992f98cba236d34",
               "rollbackAvailable": true
             },
             {
@@ -95,8 +95,8 @@
             {
               "role": "user",
               "content": "执行 ROLLBACK-V2",
-              "messageId": "msg_ad8ab49603044845ad06519c3cb9eefb",
-              "rollbackCheckpointId": "cp_6514fa2baf214fd1af150c0c0c259deb",
+              "messageId": "msg_438163d9837d43f9a50f79d1215562d2",
+              "rollbackCheckpointId": "cp_62f66c59da4341e2a4cf5c9d50d2c722",
               "rollbackAvailable": true
             },
             {

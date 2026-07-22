@@ -15,16 +15,21 @@ Key improvements over v4:
 from __future__ import annotations
 
 import base64
+import errno
 import json
 import os
 import re
 import shutil
+import threading
+import time
 import uuid
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from filelock import FileLock, Timeout as FileLockTimeout
 
 from claw.session.models import Message, Session, _now_iso
 
@@ -55,6 +60,13 @@ _SESSION_ID_MAX_LEN = 200
 # control characters.  Base64 encoding neutralises most traversal
 # attempts, but rejecting these upfront is defence-in-depth.
 _SESSION_ID_FORBIDDEN_CHARS = frozenset({"/", "\\", "\x00", "\n", "\r", "\t"})
+
+# Windows may briefly reject an otherwise valid atomic replacement while an
+# indexer, antivirus scanner, or another process still has the destination
+# open.  Keep the retry window short so genuine permission failures surface
+# promptly.
+_REPLACE_RETRY_DELAYS = (0.01, 0.025, 0.05, 0.1, 0.2)
+_TRANSIENT_WINDOWS_ERRORS = frozenset({5, 32, 33})
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +191,8 @@ class SessionStore:
     def __init__(self, sessions_dir: Path):
         self._sessions_dir = Path(sessions_dir)
         self._cache: dict[str, Session] = {}
+        self._session_locks_guard = threading.Lock()
+        self._session_locks: dict[str, threading.RLock] = {}
         self.load_warnings: list[str] = []
         self._legacy_sessions_dir: Path | None = None  # set for migration
         # Cache for list_summaries() — invalidated on save/delete/rename.
@@ -370,6 +384,16 @@ class SessionStore:
     def _key_path(self, key: str) -> Path:
         return self._sessions_dir / f"{self._encode_key(key)}{_SESSION_FILE_EXT}"
 
+    def _session_lock(self, session_id: str) -> threading.RLock:
+        """Return the stable in-process lock for one session."""
+        with self._session_locks_guard:
+            return self._session_locks.setdefault(session_id, threading.RLock())
+
+    @staticmethod
+    def _file_lock(path: Path) -> FileLock:
+        """Return the cross-instance lock associated with a session file."""
+        return FileLock(str(path) + ".lock", timeout=10)
+
     # ------------------------------------------------------------------
     # CRUD
     # ------------------------------------------------------------------
@@ -388,20 +412,21 @@ class SessionStore:
     ) -> Session:
         resolved_id = session_id or self._generate_session_id()
         _validate_session_id(resolved_id)
-        if resolved_id in self._cache:
-            raise SessionStoreError(f"session id 已存在: {resolved_id}")
-        session = Session(
-            session_id=resolved_id,
-            title=title or resolved_id,
-        )
-        # Persist title into metadata so it survives reload.
-        # (rename() does the same sync; create_session was missing it.)
-        if title:
-            session.metadata["title"] = title
-        self._cache[resolved_id] = session
-        self._summaries_cache = None
-        self.save(session)
-        return session
+        with self._session_lock(resolved_id):
+            if resolved_id in self._cache:
+                raise SessionStoreError(f"session id 已存在: {resolved_id}")
+            session = Session(
+                session_id=resolved_id,
+                title=title or resolved_id,
+            )
+            # Persist title into metadata so it survives reload.
+            # (rename() does the same sync; create_session was missing it.)
+            if title:
+                session.metadata["title"] = title
+            # save() publishes the session to the cache only after the atomic
+            # replacement succeeds, avoiding a cache-only phantom session.
+            self.save(session)
+            return session
 
     def get(self, session_id: str) -> Session:
         _validate_session_id(session_id)
@@ -436,35 +461,43 @@ class SessionStore:
                 automatic title generation from overwriting it).
         """
         _validate_session_id(session_id)
-        session = self.get(session_id)
-        session.title = new_title
-        session.metadata["title"] = new_title
-        if user_edited:
-            session.metadata["title_user_edited"] = True
-        else:
-            # Auto-generated title — remove the user_edited flag so it can
-            # be overwritten by a future auto-title if needed.
-            session.metadata.pop("title_user_edited", None)
-        session.touch()
-        self._summaries_cache = None
-        self.save(session)
-        return session
+        with self._session_lock(session_id):
+            session = self.get(session_id)
+            session.title = new_title
+            session.metadata["title"] = new_title
+            if user_edited:
+                session.metadata["title_user_edited"] = True
+            else:
+                # Auto-generated title — remove the user_edited flag so it can
+                # be overwritten by a future auto-title if needed.
+                session.metadata.pop("title_user_edited", None)
+            session.touch()
+            self._summaries_cache = None
+            self.save(session)
+            return session
 
     def delete(self, session_id: str) -> bool:
         """Delete a session from disk and cache. Returns True if deleted."""
         _validate_session_id(session_id)
-        self.get(session_id)  # raises if missing
-        del self._cache[session_id]
-        self._summaries_cache = None
         path = self._key_path(session_id)
-        deleted = False
-        if path.exists():
+        with self._session_lock(session_id):
+            self.get(session_id)  # raises if missing
             try:
-                path.unlink()
-                deleted = True
-            except OSError:
-                pass
-        return deleted
+                with self._file_lock(path):
+                    deleted = False
+                    if path.exists():
+                        try:
+                            path.unlink()
+                            deleted = True
+                        except OSError:
+                            pass
+                    del self._cache[session_id]
+                    self._summaries_cache = None
+                    return deleted
+            except FileLockTimeout as exc:
+                raise SessionStoreError(
+                    f"删除 session {session_id} 失败: 等待文件锁超时"
+                ) from exc
 
     # ------------------------------------------------------------------
     # Persistence (JSONL, atomic write)
@@ -477,30 +510,48 @@ class SessionStore:
         explicitly flushed (for graceful shutdown).
         """
         path = self._key_path(session.session_id)
-        # A unique temporary file prevents concurrent background compaction or
-        # shutdown flushes from replacing another writer's in-progress file.
-        tmp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+        with self._session_lock(session.session_id):
+            # A unique temporary file prevents stale temporary data from being
+            # shared by writers.  The locks serialize the final replacement.
+            tmp_path = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
 
-        try:
-            self._write_jsonl(session, tmp_path, fsync=fsync)
-            os.replace(tmp_path, path)
+            try:
+                with self._file_lock(path):
+                    self._write_jsonl(session, tmp_path, fsync=fsync)
+                    self._replace_with_retry(tmp_path, path)
 
-            if fsync:
-                with suppress(PermissionError):
-                    fd = os.open(str(path.parent), os.O_RDONLY)
-                    try:
-                        os.fsync(fd)
-                    finally:
-                        os.close(fd)
-        except OSError as exc:
-            tmp_path.unlink(missing_ok=True)
-            raise SessionStoreError(
-                f"保存 session {session.session_id} 失败: {exc}"
-            ) from exc
+                    if fsync:
+                        with suppress(PermissionError):
+                            fd = os.open(str(path.parent), os.O_RDONLY)
+                            try:
+                                os.fsync(fd)
+                            finally:
+                                os.close(fd)
+            except (OSError, FileLockTimeout) as exc:
+                tmp_path.unlink(missing_ok=True)
+                raise SessionStoreError(
+                    f"保存 session {session.session_id} 失败: {exc}"
+                ) from exc
 
-        self._cache[session.session_id] = session
-        # Invalidate the summaries cache — the session list has changed.
-        self._summaries_cache = None
+            self._cache[session.session_id] = session
+            # Invalidate the summaries cache — the session list has changed.
+            self._summaries_cache = None
+
+    @staticmethod
+    def _replace_with_retry(source: Path, destination: Path) -> None:
+        """Atomically replace *destination*, retrying transient sharing errors."""
+        for delay in (*_REPLACE_RETRY_DELAYS, None):
+            try:
+                os.replace(source, destination)
+                return
+            except OSError as exc:
+                transient = (
+                    getattr(exc, "winerror", None) in _TRANSIENT_WINDOWS_ERRORS
+                    or exc.errno in {errno.EACCES, errno.EBUSY}
+                )
+                if not transient or delay is None:
+                    raise
+                time.sleep(delay)
 
     @staticmethod
     def _write_jsonl(session: Session, path: Path, *, fsync: bool = False) -> None:

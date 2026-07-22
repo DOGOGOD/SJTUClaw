@@ -494,6 +494,23 @@ def _run_agent_turn_unlocked(
 
     """
 
+    # Pi owns a complete agent loop. Capable clients may handle the whole
+    # turn; ordinary LLM clients continue through the unchanged loop below.
+    full_turn_runner = getattr(llm_client, "run_agent_turn", None)
+    if callable(full_turn_runner):
+        return full_turn_runner(
+            session_id, user_message, session_store=session_store,
+            context_builder=context_builder, tool_registry=tool_registry,
+            approval_handler=approval_handler, media=media,
+            skill_registry=skill_registry, skill_source=skill_source,
+            skill_name=skill_name, auto_reason=auto_reason,
+            compaction_worker=compaction_worker, auto_mode=auto_mode,
+            unlimited_mode=unlimited_mode, event_callback=event_callback,
+            cancel_event=cancel_event, input_event=input_event,
+            rollback_message_id=_rollback_message_id,
+            rollback_checkpoint_id=_rollback_checkpoint_id,
+        )
+
     from claw.agent.health import LoopHealthMonitor
     from claw.agent.metrics import TurnMetrics, TurnMetricsAggregator
 

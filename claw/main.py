@@ -28,6 +28,7 @@ from claw.scheduler.callbacks import (
 )
 from claw.scheduler import CronService
 from claw.llm.client import LLMClient
+from claw.pi import create_agent_client
 from claw.memory.reflection import ReflectionManager
 from claw.memory.store import MemoryStore
 from claw.prompts import PromptLoadError, load_soul, load_system_prompt
@@ -59,7 +60,7 @@ def main() -> int:
         print(f"[配置错误] {exc}", file=sys.stderr)
         return 1
 
-    client = LLMClient(config)
+    client = create_agent_client(config)
     session_store = SessionStore(SESSIONS_DIR)
     memory_store = MemoryStore(MEMORY_DIR)
     workspace_manager = WorkspaceManager()

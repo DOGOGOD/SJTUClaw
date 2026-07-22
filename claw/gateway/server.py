@@ -57,6 +57,7 @@ from claw.config import (
 from claw.context.builder import ContextBuilder
 from claw.context.compaction_worker import CompactionWorker
 from claw.llm.client import LLMClient, LLMError
+from claw.pi import create_agent_client
 from claw.memory.store import MemoryStore, MemoryStoreError
 from claw.prompts import load_soul, load_system_prompt
 from claw.session.store import SessionStore, SessionStoreError
@@ -121,7 +122,7 @@ class RuntimeLLMClient:
         return self._client is not None and bool(cfg.api_key and cfg.base_url and cfg.model)
 
     def set_config(self, config: LLMConfig) -> None:
-        self._client = LLMClient(config)
+        self._client = create_agent_client(config)
         self._config = config
         self.error_message = ""
 

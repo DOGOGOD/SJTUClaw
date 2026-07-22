@@ -162,6 +162,50 @@ npm run dev         # http://127.0.0.1:5173
 
 `requirements.txt` 提供可复现的完整 Python 开发环境，包含核心运行时、Desktop、PyInstaller 和 pytest。若只希望安装最小核心运行时，可改用 `python -m pip install -e .`；只添加 Desktop 支持可使用 `python -m pip install -e ".[desktop]"`。
 
+### 桌面宠物与自定义宠物包
+
+在 Web UI 的“设置 → Pet”中可以开启或关闭桌面宠物、选择角色、设置是否随 Gateway 启动，以及导入或删除自定义宠物。自定义宠物必须以 ZIP 压缩包导入，包内只能包含 `pet.json` 和一张 `spritesheet.webp` 或 `spritesheet.png`。两个文件可以直接位于 ZIP 根目录，也可以放在一个与宠物 ID 同名的顶层目录中：
+
+```text
+shin-chan.zip
+└── shin-chan/                 # 这一层可以省略
+    ├── pet.json
+    └── spritesheet.webp
+```
+
+`pet.json` 示例：
+
+```json
+{
+  "id": "shin-chan",
+  "displayName": "蜡笔小新",
+  "description": "陪伴你完成任务的桌面宠物。",
+  "spriteVersionNumber": 2,
+  "spritesheetPath": "spritesheet.webp"
+}
+```
+
+字段要求：
+
+- `id`：1–64 个字符，只允许小写字母 `a-z`、数字 `0-9`、下划线 `_` 和短横线 `-`，不能使用 Windows 系统保留名称；例如应写成 `shin-chan`，不能写成 `Shin-chan`。
+- `displayName`：界面显示名称，可以使用中文，不能为空，最长 100 个字符。
+- `description`：可选说明，最长 1000 个字符。它也是 LLM 生成宠物互动台词时的角色设定，建议写清性格、口吻、自称和与用户的关系。
+- `spriteVersionNumber`：必须是数字 `1` 或 `2`，并与图集尺寸匹配。
+- `spritesheetPath`：必须是 `spritesheet.webp` 或 `spritesheet.png`。
+
+| 图集版本 | 布局 | 固定尺寸 | 功能 |
+|---------|------|----------|------|
+| v1 | 8 列 × 9 行 | 1536 × 1872 | 9 行基础动画；保留用于兼容现有宠物 |
+| v2 | 8 列 × 11 行 | 1536 × 2288 | 包含全部基础动画，并增加两行共 16 个观察方向 |
+
+目前内置的“月薪喵”和“线条小狗”均为 v1。新制作的宠物建议使用 v2；`spriteVersionNumber` 必须写成 JSON 数字，例如 `2`，不能写成字符串 `"2"`。
+
+导入时，Gateway 会在写入用户宠物目录前检查 ZIP 完整性、路径安全、重复或额外文件、加密与异常压缩比、压缩包大小、`pet.json` 字段、图片真实格式、透明通道、图集尺寸、必用动画帧以及未使用格子的透明性。校验失败时，具体原因会直接显示在添加宠物弹窗中。相同 ID 的宠物不能重复安装，自定义宠物也不能覆盖内置宠物。
+
+宠物导入成功后，Gateway 会调用当前配置的 LLM，根据 `displayName` 和 `description` 生成 12 条符合角色人设的“被点击/轻戳”回复。回复不会写入宠物压缩包，而是按宠物 ID 独立保存到 `data/pet/replies/<pet-id>.json`；桌面宠物被点击时，只会从当前宠物自己的回复中随机选择一句。按 ID 分文件的结构也便于后续删除宠物时同步清理其台词，而不影响其他宠物。
+
+如果尚未配置 LLM，或者模型调用失败、返回格式不正确，导入仍会成功，系统会为该宠物单独保存通用备用台词，并在 Web UI 中显示提示。之后重新导入同一宠物前仍需先删除原宠物；当前版本不会自动重新生成已经保存的备用台词。
+
 ### AUTO 与 UNLIMITED 模式
 
 SJTUClaw 默认对写入和 Shell 等高风险工具进行审批，并将文件及命令操作限制在当前 Session 绑定的 workspace 内。AUTO 和 UNLIMITED 是两个相互独立、按 Session 生效的执行模式；新建 Session 时二者默认均为关闭状态，Gateway 重启后也会恢复为关闭状态。

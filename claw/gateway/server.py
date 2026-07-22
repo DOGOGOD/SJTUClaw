@@ -82,6 +82,7 @@ from claw.scheduler.callbacks import (
 from claw.memory.reflection import ReflectionManager
 from claw.pet.catalog import PetCatalog, PetCatalogError
 from claw.pet.process import PetProcessManager
+from claw.pet.replies import PetReplyStore, generate_and_store_pet_replies
 from claw.pet.state import PetStateBroker
 from claw.runtime_settings import (
     load_runtime_settings_raw,
@@ -185,6 +186,7 @@ _context_builder = ContextBuilder(
 
 _approval_manager = ApprovalManager()
 _pet_catalog = PetCatalog(DATA_DIR)
+_pet_reply_store = PetReplyStore(DATA_DIR)
 _pet_state = PetStateBroker()
 
 
@@ -1904,28 +1906,41 @@ def get_pet_spritesheet(pet_id: str):
 
 @app.post("/pet/pets")
 async def install_pet(
-    spritesheet: UploadFile = File(...),
-    pet_id: str = Form(..., alias="petId"),
-    display_name: str = Form(..., alias="displayName"),
-    description: str = Form(""),
-    sprite_version_number: int | None = Form(None, alias="spriteVersionNumber"),
+    package: UploadFile = File(...),
 ):
-    if spritesheet.size is not None and spritesheet.size > MAX_ATTACHMENT_BYTES:
-        raise HTTPException(status_code=413, detail="spritesheet 超过 50 MB 限制")
+    if package.size is not None and package.size > MAX_ATTACHMENT_BYTES:
+        raise HTTPException(status_code=413, detail="宠物包超过 50 MB 限制")
     try:
-        pet = _pet_catalog.install(
-            pet_id=pet_id,
-            display_name=display_name,
-            description=description,
-            spritesheet=spritesheet.file,
-            filename=spritesheet.filename or "spritesheet.webp",
-            sprite_version_number=sprite_version_number,
+        pet = _pet_catalog.install_package(
+            package=package.file,
+            filename=package.filename or "pet.zip",
         )
     except PetCatalogError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     finally:
-        await spritesheet.close()
-    return {"ok": True, "pet": _public_pet(pet)}
+        await package.close()
+    try:
+        reply_generation = await asyncio.to_thread(
+            generate_and_store_pet_replies,
+            pet,
+            _llm_client,
+            _pet_reply_store,
+        )
+    except (OSError, ValueError) as exc:
+        logger.exception("保存宠物 %s 的互动台词失败，正在回滚导入", pet["id"])
+        try:
+            _pet_catalog.remove(pet["id"])
+        except PetCatalogError:
+            logger.exception("回滚宠物 %s 导入失败", pet["id"])
+        raise HTTPException(
+            status_code=500,
+            detail="互动台词保存失败，宠物导入已回滚，请检查数据目录后重试",
+        ) from exc
+    return {
+        "ok": True,
+        "pet": _public_pet(pet),
+        "replyGeneration": reply_generation.to_public_dict(),
+    }
 
 
 @app.delete("/pet/pets/{pet_id}")

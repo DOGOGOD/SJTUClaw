@@ -22,6 +22,7 @@ import tkinter.font as tkfont
 from PIL import Image, ImageGrab, ImageTk
 
 from claw.pet.catalog import PetCatalog
+from claw.pet.replies import PetReplyStore, fallback_pet_replies
 
 
 CELL_WIDTH = 192
@@ -50,45 +51,6 @@ ANIMATIONS: dict[str, tuple[int, list[int]]] = {
     "running": (7, [120, 120, 120, 120, 120, 220]),
     "review": (8, [150, 150, 150, 150, 150, 280]),
 }
-
-# 点击桌宠时随机显示的俏皮回复
-_PLAYFUL_REPLIES: tuple[str, ...] = (
-    "喵～戳我干嘛？",
-    "在呢在呢，别戳啦！",
-    "想我了吗？",
-    "今天也要加油哦～",
-    "点击有惊喜？并没有～",
-    "哎呀，别闹！",
-    "我可是很忙的喵！",
-    "嘿嘿，又被你发现了～",
-    "要不要给我起个名字？",
-    "戳一下，开心一整天～",
-    "我在看着你哦～",
-    "月薪喵，随时待命！",
-    "再戳我就生气了喵！",
-    "你今天看起来不错呢～",
-    "嗨，有什么吩咐？",
-    "呜哇，轻点戳，脑袋要扁啦喵！",
-    "咕噜咕噜，找本喵何事呀？",
-    "偷偷探头，不会只有你在戳我吧？",
-    "再戳就要蹭你手手咯～",
-    "本喵在线营业，欢迎投喂！",
-    "等等等等，让我伸个懒腰先！",
-    "眼光真好，居然选中我啦喵",
-    "戳多了要收小鱼干手续费哦",
-    "发呆被你逮住啦，完蛋！",
-    "软软小脑袋专供你戳一下",
-    "有事说事，没事陪我摸鱼喵",
-    "哇，又来找我玩啦，好开心",
-    "别一直戳，我会害羞躲起来",
-    "小鱼干准备好了就听你安排",
-    "探头！捕捉一只正在戳我的你",
-    "揉一揉小耳朵，有话慢慢说",
-    "警告警告，连续戳击触发撒娇模式",
-    "本喵摸鱼中，小声一点哦",
-    "见到你心情瞬间变好啦喵",
-    "要是戳够十下，我就跟你贴贴"
-)
 
 # 本地消息显示时长（秒）
 _LOCAL_MESSAGE_TTL = 4.0
@@ -321,10 +283,19 @@ class DesktopPet:
     def __init__(self, gateway_url: str, data_dir: Path):
         self.client = GatewayClient(gateway_url)
         self.catalog = PetCatalog(data_dir)
+        self.reply_store = PetReplyStore(data_dir)
         self.settings = self.catalog.load_settings()
         self.pet = self.catalog.get_pet(self.settings.selected_pet_id)
         if self.pet is None:
             raise RuntimeError("没有可用的宠物资源")
+        self._playful_replies = self.reply_store.load(self.pet["id"])
+        if not self._playful_replies:
+            self._playful_replies = self.reply_store.save(
+                pet_id=self.pet["id"],
+                description=self.pet.get("description", ""),
+                replies=fallback_pet_replies(self.pet["displayName"]),
+                source="fallback",
+            )
 
         self._dpi_scale = _enable_dpi_awareness()
         self.window_width = self._px(WINDOW_BASE_WIDTH)
@@ -620,9 +591,9 @@ class DesktopPet:
             )
 
     def _show_playful_reply(self) -> None:
-        """点击桌宠时随机显示一条俏皮回复气泡。"""
+        """随机显示一条与当前宠物绑定的互动台词。"""
         self._pending_reply_job = None
-        reply = random.choice(_PLAYFUL_REPLIES)
+        reply = random.choice(self._playful_replies)
         self._set_local_message(reply)
 
     def _set_local_message(self, message: str, ttl: float = _LOCAL_MESSAGE_TTL) -> None:

@@ -8,7 +8,7 @@ from claw.pet.catalog import PetCatalog
 def test_xiaohuang_is_a_valid_bundled_pet(tmp_path: Path):
     catalog = PetCatalog(tmp_path / "data")
 
-    pet = catalog.get_pet("xiaohuang_webp")
+    pet = catalog.get_pet("xiaohuang")
 
     assert pet is not None
     assert pet["displayName"] == "线条小狗"

@@ -4,6 +4,7 @@ import io
 import json
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
@@ -81,6 +82,127 @@ class PetCatalogTests(unittest.TestCase):
             )
         )
         self.assertEqual(persisted["selectedPetId"], "yuexinmiao")
+
+    def _make_pet_package(
+        self,
+        *,
+        pet_id: str = "zip-pet",
+        root: str = "zip-pet",
+        version: int = 2,
+        height: int = 2288,
+        extra_files: dict[str, bytes] | None = None,
+        omit_first_frame: bool = False,
+        fill_unused_frame: bool = False,
+    ) -> io.BytesIO:
+        spritesheet = io.BytesIO()
+        atlas = Image.new("RGBA", (1536, height), (0, 0, 0, 0))
+        frame_counts = (6, 8, 8, 4, 5, 8, 6, 6, 6, *((8, 8) if version == 2 else ()))
+        for row, frame_count in enumerate(frame_counts):
+            for column in range(frame_count):
+                if omit_first_frame and row == 0 and column == 0:
+                    continue
+                left = column * 192 + 72
+                top = row * 208 + 80
+                atlas.paste((255, 120, 40, 255), (left, top, left + 48, top + 48))
+        if fill_unused_frame:
+            atlas.putpixel((7 * 192 + 96, 104), (255, 120, 40, 255))
+        atlas.save(spritesheet, "WEBP", lossless=True)
+        prefix = f"{root}/" if root else ""
+        manifest = {
+            "id": pet_id,
+            "displayName": "ZIP Pet",
+            "description": "installed from package",
+            "spriteVersionNumber": version,
+            "spritesheetPath": "spritesheet.webp",
+        }
+        package = io.BytesIO()
+        with zipfile.ZipFile(package, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr(f"{prefix}pet.json", json.dumps(manifest))
+            archive.writestr(f"{prefix}spritesheet.webp", spritesheet.getvalue())
+            for name, data in (extra_files or {}).items():
+                archive.writestr(name, data)
+        package.seek(0)
+        return package
+
+    def test_install_valid_zip_pet_package(self):
+        pet = self.catalog.install_package(
+            package=self._make_pet_package(),
+            filename="zip-pet.zip",
+        )
+
+        self.assertEqual(pet["id"], "zip-pet")
+        self.assertEqual(pet["displayName"], "ZIP Pet")
+        self.assertEqual(pet["spriteVersionNumber"], 2)
+
+    def test_install_pet_package_accepts_files_at_zip_root(self):
+        pet = self.catalog.install_package(
+            package=self._make_pet_package(pet_id="root-pet", root=""),
+            filename="root-pet.zip",
+        )
+        self.assertEqual(pet["id"], "root-pet")
+
+    def test_install_pet_package_rejects_unsafe_or_extra_members(self):
+        for extra_name in ("../escape.txt", "zip-pet/readme.txt"):
+            with self.subTest(extra_name=extra_name), self.assertRaises(PetCatalogError):
+                self.catalog.install_package(
+                    package=self._make_pet_package(extra_files={extra_name: b"no"}),
+                    filename="zip-pet.zip",
+                )
+
+    def test_install_pet_package_rejects_mismatched_root_and_version(self):
+        with self.assertRaisesRegex(PetCatalogError, "顶层目录名"):
+            self.catalog.install_package(
+                package=self._make_pet_package(root="wrong-root"),
+                filename="zip-pet.zip",
+            )
+        with self.assertRaisesRegex(PetCatalogError, "尺寸不匹配"):
+            self.catalog.install_package(
+                package=self._make_pet_package(version=1),
+                filename="zip-pet.zip",
+            )
+
+    def test_install_pet_package_rejects_empty_and_nontransparent_unused_frames(self):
+        with self.assertRaisesRegex(PetCatalogError, "第 1 行第 1 帧为空"):
+            self.catalog.install_package(
+                package=self._make_pet_package(omit_first_frame=True),
+                filename="zip-pet.zip",
+            )
+        with self.assertRaisesRegex(PetCatalogError, "未使用帧必须完全透明"):
+            self.catalog.install_package(
+                package=self._make_pet_package(fill_unused_frame=True),
+                filename="zip-pet.zip",
+            )
+
+    def test_install_pet_package_rejects_invalid_zip_and_duplicate_id(self):
+        with self.assertRaisesRegex(PetCatalogError, "有效的 ZIP"):
+            self.catalog.install_package(package=io.BytesIO(b"not a zip"), filename="bad.zip")
+
+        self.catalog.install_package(
+            package=self._make_pet_package(),
+            filename="zip-pet.zip",
+        )
+        with self.assertRaisesRegex(PetCatalogError, "已存在"):
+            self.catalog.install_package(
+                package=self._make_pet_package(),
+                filename="zip-pet.zip",
+            )
+
+    def test_install_pet_package_rejects_invalid_spritesheet_image(self):
+        package = io.BytesIO()
+        manifest = {
+            "id": "bad-image",
+            "displayName": "Bad Image",
+            "description": "",
+            "spriteVersionNumber": 2,
+            "spritesheetPath": "spritesheet.webp",
+        }
+        with zipfile.ZipFile(package, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("bad-image/pet.json", json.dumps(manifest))
+            archive.writestr("bad-image/spritesheet.webp", b"not an image")
+        package.seek(0)
+
+        with self.assertRaisesRegex(PetCatalogError, "有效的 PNG 或 WebP"):
+            self.catalog.install_package(package=package, filename="bad-image.zip")
 
     def test_invalid_selected_pet_is_repaired_on_disk(self):
         settings_path = Path(self.tempdir.name) / "data" / "pet" / "settings.json"

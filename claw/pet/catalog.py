@@ -6,12 +6,17 @@ future WebUI can manage them without changing package files.
 
 from __future__ import annotations
 
+import io
 import json
 import re
 import shutil
+import stat
+import tempfile
 import threading
+import zipfile
+import zlib
 from dataclasses import asdict, dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO
 
 from PIL import Image
@@ -19,7 +24,19 @@ from claw.paths import pet_assets_dir
 
 
 _PET_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+_WINDOWS_RESERVED_IDS = {
+    "con", "prn", "aux", "nul",
+    *(f"com{number}" for number in range(1, 10)),
+    *(f"lpt{number}" for number in range(1, 10)),
+}
 _CELL_SIZE = (192, 208)
+_STANDARD_FRAME_COUNTS = (6, 8, 8, 4, 5, 8, 6, 6, 6)
+_MAX_PACKAGE_FILES = 8
+_MAX_MANIFEST_BYTES = 64 * 1024
+_MAX_SPRITESHEET_BYTES = 50 * 1024 * 1024
+_MAX_PACKAGE_UNCOMPRESSED_BYTES = _MAX_SPRITESHEET_BYTES + _MAX_MANIFEST_BYTES
+_MAX_COMPRESSION_RATIO = 500
+_SUPPORTED_ZIP_COMPRESSION = {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}
 
 
 @dataclass
@@ -142,10 +159,11 @@ class PetCatalog:
         spritesheet: BinaryIO,
         filename: str = "spritesheet.webp",
         sprite_version_number: int | None = None,
+        validate_frames: bool = False,
     ) -> dict[str, Any]:
         pet_id = pet_id.strip().lower()
-        if not _PET_ID_RE.fullmatch(pet_id):
-            raise PetCatalogError("宠物 ID 只能包含小写字母、数字、下划线和短横线")
+        if not _PET_ID_RE.fullmatch(pet_id) or pet_id in _WINDOWS_RESERVED_IDS:
+            raise PetCatalogError("宠物 ID 只能包含小写字母、数字、下划线和短横线，且不能使用系统保留名称")
         if (self._bundled / pet_id).exists():
             raise PetCatalogError("不能覆盖内置宠物")
         suffix = Path(filename).suffix.lower()
@@ -153,13 +171,32 @@ class PetCatalog:
             raise PetCatalogError("spritesheet 仅支持 PNG 或 WebP")
 
         pet_dir = self._user_pets / pet_id
-        tmp_path = self._root / f".{pet_id}-upload{suffix}"
+        if pet_dir.exists():
+            raise PetCatalogError(f"宠物已存在: {pet_id}")
+        with tempfile.NamedTemporaryFile(
+            prefix=f".{pet_id}-upload-",
+            suffix=suffix,
+            dir=self._root,
+            delete=False,
+        ) as upload_tmp:
+            tmp_path = Path(upload_tmp.name)
+            shutil.copyfileobj(spritesheet, upload_tmp)
         try:
-            with tmp_path.open("wb") as out:
-                shutil.copyfileobj(spritesheet, out)
-            with Image.open(tmp_path) as image:
-                width, height = image.size
-                image.verify()
+            try:
+                with Image.open(tmp_path) as image:
+                    width, height = image.size
+                    image_format = image.format
+                    has_transparency = (
+                        image.mode in {"RGBA", "LA"} or "transparency" in image.info
+                    )
+                    image.verify()
+            except (OSError, SyntaxError, ValueError, Image.DecompressionBombError) as exc:
+                raise PetCatalogError("spritesheet 不是有效的 PNG 或 WebP 图像") from exc
+            expected_format = ".png" if image_format == "PNG" else ".webp" if image_format == "WEBP" else ""
+            if expected_format != suffix:
+                raise PetCatalogError("spritesheet 的实际格式必须与 .png 或 .webp 扩展名一致")
+            if not has_transparency:
+                raise PetCatalogError("spritesheet 必须包含透明通道")
             if width != _CELL_SIZE[0] * 8 or height not in {
                 _CELL_SIZE[1] * 9,
                 _CELL_SIZE[1] * 11,
@@ -169,8 +206,18 @@ class PetCatalog:
             version = sprite_version_number or inferred_version
             if version not in (1, 2) or (version == 2) != (inferred_version == 2):
                 raise PetCatalogError("spriteVersionNumber 与 spritesheet 尺寸不匹配")
+            if validate_frames:
+                try:
+                    self._validate_atlas_frames(tmp_path, version)
+                except PetCatalogError:
+                    raise
+                except (OSError, ValueError) as exc:
+                    raise PetCatalogError("spritesheet 图像数据损坏或无法读取") from exc
 
-            pet_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                pet_dir.mkdir(parents=True, exist_ok=False)
+            except FileExistsError as exc:
+                raise PetCatalogError(f"宠物已存在: {pet_id}") from exc
             asset_name = f"spritesheet{suffix}"
             shutil.move(str(tmp_path), str(pet_dir / asset_name))
             manifest = {
@@ -189,6 +236,185 @@ class PetCatalog:
         pet = self.get_pet(pet_id)
         assert pet is not None
         return pet
+
+    def install_package(
+        self,
+        *,
+        package: BinaryIO,
+        filename: str = "pet.zip",
+    ) -> dict[str, Any]:
+        """Validate and install a self-contained pet ZIP package.
+
+        A package contains exactly ``pet.json`` and one referenced
+        ``spritesheet.png`` or ``spritesheet.webp``. They may live at the ZIP
+        root or inside one top-level directory whose name matches the pet id.
+        Archive members are never extracted directly, avoiding path traversal.
+        """
+        if Path(filename).suffix.lower() != ".zip":
+            raise PetCatalogError("宠物包仅支持 ZIP 格式")
+
+        try:
+            package.seek(0)
+            with zipfile.ZipFile(package) as archive:
+                members = self._validate_package_members(archive)
+                manifest_members = [
+                    member for member in members
+                    if PurePosixPath(member.filename).name == "pet.json"
+                ]
+                if len(manifest_members) != 1:
+                    raise PetCatalogError("宠物包内必须且只能包含一个 pet.json")
+
+                manifest_member = manifest_members[0]
+                if manifest_member.file_size > _MAX_MANIFEST_BYTES:
+                    raise PetCatalogError("pet.json 超过 64 KB 限制")
+                try:
+                    raw = json.loads(archive.read(manifest_member).decode("utf-8"))
+                except UnicodeDecodeError as exc:
+                    raise PetCatalogError("pet.json 必须使用 UTF-8 编码") from exc
+                except json.JSONDecodeError as exc:
+                    raise PetCatalogError(f"pet.json 不是有效 JSON: {exc.msg}") from exc
+
+                manifest = self._validate_package_manifest(raw)
+                manifest_path = PurePosixPath(manifest_member.filename)
+                root_parts = manifest_path.parts[:-1]
+                if len(root_parts) > 1:
+                    raise PetCatalogError("宠物包最多只能包含一个顶层目录")
+                if root_parts and root_parts[0] != manifest["id"]:
+                    raise PetCatalogError("宠物包顶层目录名必须与 pet.json 中的 id 一致")
+                if any(PurePosixPath(member.filename).parts[:-1] != root_parts for member in members):
+                    raise PetCatalogError("pet.json 和 spritesheet 必须位于同一目录")
+
+                asset_name = manifest["spritesheetPath"]
+                expected_names = {"pet.json", asset_name}
+                actual_names = {PurePosixPath(member.filename).name for member in members}
+                if actual_names != expected_names or len(members) != 2:
+                    raise PetCatalogError("宠物包只能包含 pet.json 和其引用的 spritesheet 文件")
+                asset_member = next(
+                    member for member in members
+                    if PurePosixPath(member.filename).name == asset_name
+                )
+                if asset_member.file_size > _MAX_SPRITESHEET_BYTES:
+                    raise PetCatalogError("spritesheet 超过 50 MB 限制")
+
+                bad_member = archive.testzip()
+                if bad_member is not None:
+                    raise PetCatalogError(f"宠物包完整性校验失败: {bad_member}")
+                spritesheet = io.BytesIO(archive.read(asset_member))
+        except (zipfile.BadZipFile, zlib.error) as exc:
+            raise PetCatalogError("文件不是有效的 ZIP 宠物包") from exc
+        except (RuntimeError, NotImplementedError) as exc:
+            raise PetCatalogError("宠物包使用了不支持的加密或压缩方式") from exc
+
+        return self.install(
+            pet_id=manifest["id"],
+            display_name=manifest["displayName"],
+            description=manifest["description"],
+            spritesheet=spritesheet,
+            filename=asset_name,
+            sprite_version_number=manifest["spriteVersionNumber"],
+            validate_frames=True,
+        )
+
+    @staticmethod
+    def _validate_package_members(archive: zipfile.ZipFile) -> list[zipfile.ZipInfo]:
+        members: list[zipfile.ZipInfo] = []
+        seen: set[str] = set()
+        total_size = 0
+        for member in archive.infolist():
+            name = member.filename
+            if not name or "\x00" in name or "\\" in name:
+                raise PetCatalogError(f"宠物包包含非法路径: {name!r}")
+            path = PurePosixPath(name.rstrip("/"))
+            if (
+                path.is_absolute()
+                or re.match(r"^[A-Za-z]:", name)
+                or any(part in {"", ".", ".."} for part in path.parts)
+                or len(name) > 240
+                or any(len(part) > 100 for part in path.parts)
+            ):
+                raise PetCatalogError(f"宠物包包含非法路径: {name}")
+            mode = member.external_attr >> 16
+            if stat.S_ISLNK(mode):
+                raise PetCatalogError("宠物包不能包含符号链接")
+            file_type = stat.S_IFMT(mode)
+            if file_type not in {0, stat.S_IFREG, stat.S_IFDIR}:
+                raise PetCatalogError("宠物包不能包含设备文件或其他特殊文件")
+            if member.flag_bits & 0x1:
+                raise PetCatalogError("宠物包不能加密")
+            if member.compress_type not in _SUPPORTED_ZIP_COMPRESSION:
+                raise PetCatalogError("宠物包仅支持 Store 或 Deflate 压缩")
+            if member.is_dir():
+                continue
+            canonical_name = name.casefold()
+            if canonical_name in seen:
+                raise PetCatalogError(f"宠物包包含重复文件: {name}")
+            seen.add(canonical_name)
+            members.append(member)
+            total_size += member.file_size
+            if member.file_size and (
+                member.compress_size == 0
+                or member.file_size / member.compress_size > _MAX_COMPRESSION_RATIO
+            ):
+                raise PetCatalogError(f"宠物包内文件压缩比异常: {name}")
+
+        if not members:
+            raise PetCatalogError("宠物包内没有文件")
+        if len(members) > _MAX_PACKAGE_FILES:
+            raise PetCatalogError(f"宠物包文件过多，最多允许 {_MAX_PACKAGE_FILES} 个文件")
+        if total_size > _MAX_PACKAGE_UNCOMPRESSED_BYTES:
+            raise PetCatalogError("宠物包解压后超过大小限制")
+        return members
+
+    @staticmethod
+    def _validate_package_manifest(raw: Any) -> dict[str, Any]:
+        if not isinstance(raw, dict):
+            raise PetCatalogError("pet.json 顶层必须是 JSON 对象")
+        pet_id = raw.get("id")
+        if (
+            not isinstance(pet_id, str)
+            or not _PET_ID_RE.fullmatch(pet_id)
+            or pet_id in _WINDOWS_RESERVED_IDS
+        ):
+            raise PetCatalogError(
+                "pet.json 的 id 只能包含小写字母、数字、下划线和短横线，且不能使用系统保留名称"
+            )
+        display_name = raw.get("displayName")
+        if not isinstance(display_name, str) or not display_name.strip():
+            raise PetCatalogError("pet.json 的 displayName 不能为空")
+        if len(display_name.strip()) > 100:
+            raise PetCatalogError("pet.json 的 displayName 不能超过 100 个字符")
+        description = raw.get("description", "")
+        if not isinstance(description, str) or len(description) > 1000:
+            raise PetCatalogError("pet.json 的 description 必须是最多 1000 个字符的字符串")
+        version = raw.get("spriteVersionNumber")
+        if type(version) is not int or version not in (1, 2):
+            raise PetCatalogError("pet.json 的 spriteVersionNumber 必须是 1 或 2")
+        asset_name = raw.get("spritesheetPath")
+        if asset_name not in {"spritesheet.png", "spritesheet.webp"}:
+            raise PetCatalogError("pet.json 的 spritesheetPath 必须是 spritesheet.png 或 spritesheet.webp")
+        return {
+            "id": pet_id,
+            "displayName": display_name.strip(),
+            "description": description.strip(),
+            "spriteVersionNumber": version,
+            "spritesheetPath": asset_name,
+        }
+
+    @staticmethod
+    def _validate_atlas_frames(path: Path, version: int) -> None:
+        with Image.open(path) as source:
+            atlas = source.convert("RGBA")
+        row_counts = (*_STANDARD_FRAME_COUNTS, *((8, 8) if version == 2 else ()))
+        alpha = atlas.getchannel("A")
+        for row, used_count in enumerate(row_counts):
+            for column in range(8):
+                left = column * _CELL_SIZE[0]
+                top = row * _CELL_SIZE[1]
+                cell_alpha = alpha.crop((left, top, left + _CELL_SIZE[0], top + _CELL_SIZE[1]))
+                if column < used_count and cell_alpha.getbbox() is None:
+                    raise PetCatalogError(f"spritesheet 的第 {row + 1} 行第 {column + 1} 帧为空")
+                if column >= used_count and cell_alpha.getbbox() is not None:
+                    raise PetCatalogError(f"spritesheet 的第 {row + 1} 行未使用帧必须完全透明")
 
     def remove(self, pet_id: str) -> None:
         with self._lock:

@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Check, MonitorUp, PawPrint, Plus, Power, Trash2, Upload } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { Input, Textarea } from "@/components/ui/input";
 import {
   Dialog,
   DialogContent,
@@ -249,11 +248,14 @@ export function PetSettingsSection() {
         </div>
         <AddPetDialog
           disabled={busy}
-          onAdded={async () => {
+          onAdded={async (replyGeneration) => {
             await refresh();
-            setStatus("新宠物已添加");
+            setStatus(
+              replyGeneration.source === "llm"
+                ? `新宠物已添加，并生成了 ${replyGeneration.count} 条专属互动台词`
+                : `新宠物已添加。${replyGeneration.warning}`,
+            );
           }}
-          onError={setError}
         />
       </div>
 
@@ -331,54 +333,61 @@ export function PetSettingsSection() {
 function AddPetDialog({
   disabled,
   onAdded,
-  onError,
 }: {
   disabled: boolean;
-  onAdded: () => Promise<void>;
-  onError: (message: string) => void;
+  onAdded: (replyGeneration: {
+    source: "llm" | "fallback";
+    count: number;
+    warning: string;
+  }) => Promise<void>;
 }) {
   const [open, setOpen] = useState(false);
-  const [petId, setPetId] = useState("");
-  const [displayName, setDisplayName] = useState("");
-  const [description, setDescription] = useState("");
   const [file, setFile] = useState<File | null>(null);
   const [uploading, setUploading] = useState(false);
+  const [uploadError, setUploadError] = useState("");
   const fileRef = useRef<HTMLInputElement>(null);
 
   const reset = () => {
-    setPetId("");
-    setDisplayName("");
-    setDescription("");
     setFile(null);
+    setUploadError("");
     if (fileRef.current) fileRef.current.value = "";
   };
 
+  const handleOpenChange = (nextOpen: boolean) => {
+    if (!nextOpen && uploading) return;
+    setOpen(nextOpen);
+    if (!nextOpen) reset();
+  };
+
   const handleUpload = async () => {
-    if (!petId.trim() || !displayName.trim() || !file) {
-      onError("请填写宠物 ID、名称并选择 spritesheet 文件");
+    if (!file) {
+      setUploadError("请选择宠物 ZIP 压缩包");
+      return;
+    }
+    if (!file.name.toLowerCase().endsWith(".zip")) {
+      setUploadError("宠物包仅支持 ZIP 格式");
+      return;
+    }
+    if (file.size > 50 * 1024 * 1024) {
+      setUploadError("宠物包超过 50 MB 限制");
       return;
     }
     setUploading(true);
-    onError("");
+    setUploadError("");
     try {
-      await uploadPet({
-        petId: petId.trim().toLowerCase(),
-        displayName: displayName.trim(),
-        description: description.trim(),
-        spritesheet: file,
-      });
-      await onAdded();
+      const result = await uploadPet(file);
+      await onAdded(result.replyGeneration);
       setOpen(false);
       reset();
     } catch (err) {
-      onError(errorMessage(err));
+      setUploadError(errorMessage(err));
     } finally {
       setUploading(false);
     }
   };
 
   return (
-    <Dialog open={open} onOpenChange={setOpen}>
+    <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogTrigger asChild>
         <Button size="sm" variant="outline" disabled={disabled}>
           <Plus className="mr-1.5 h-3.5 w-3.5" />
@@ -389,55 +398,40 @@ function AddPetDialog({
         <DialogHeader>
           <DialogTitle>添加桌面宠物</DialogTitle>
           <DialogDescription>
-            上传 8×9 的 v1 或 8×11 的 v2 PNG、WebP spritesheet。
+            上传包含 pet.json 和 spritesheet 的 ZIP 宠物包。导入成功后会根据 description 自动生成专属互动台词。
           </DialogDescription>
         </DialogHeader>
         <div className="grid gap-4 py-2">
           <label className="grid gap-1.5 text-xs font-medium">
-            宠物 ID
-            <Input
-              value={petId}
-              onChange={(event) => setPetId(event.target.value)}
-              placeholder="coding-cat"
-              pattern="[a-z0-9][a-z0-9_-]{0,63}"
-              aria-describedby="pet-id-help"
-            />
-            <span id="pet-id-help" className="font-normal text-muted-foreground">
-              仅限小写字母、数字、下划线和短横线
-            </span>
-          </label>
-          <label className="grid gap-1.5 text-xs font-medium">
-            显示名称
-            <Input value={displayName} onChange={(event) => setDisplayName(event.target.value)} placeholder="编程猫" />
-          </label>
-          <label className="grid gap-1.5 text-xs font-medium">
-            描述
-            <Textarea
-              value={description}
-              onChange={(event) => setDescription(event.target.value)}
-              placeholder="简单介绍这个角色"
-              className="min-h-20"
-            />
-          </label>
-          <label className="grid gap-1.5 text-xs font-medium">
-            Spritesheet
+            宠物压缩包
             <span className="flex min-h-20 cursor-pointer items-center justify-center gap-2 rounded-xl border border-dashed border-border bg-muted/25 px-4 text-center text-xs font-normal text-muted-foreground transition-colors hover:border-primary/45 hover:bg-primary/[0.025]">
               <Upload className="h-4 w-4 shrink-0" />
-              {file ? file.name : "选择 PNG 或 WebP 文件"}
+              {file ? file.name : "选择 .zip 文件"}
               <input
                 ref={fileRef}
                 type="file"
-                accept="image/png,image/webp,.png,.webp"
+                accept="application/zip,.zip"
                 className="sr-only"
-                onChange={(event) => setFile(event.target.files?.[0] || null)}
+                onChange={(event) => {
+                  setFile(event.target.files?.[0] || null);
+                  setUploadError("");
+                }}
               />
             </span>
+            <span className="font-normal leading-relaxed text-muted-foreground">
+              包内仅允许 pet.json 与 spritesheet.webp（或 spritesheet.png），可置于 ZIP 根目录或与宠物 ID 同名的顶层目录。
+            </span>
           </label>
+          {uploadError && (
+            <p className="text-xs text-destructive" role="alert">
+              {uploadError}
+            </p>
+          )}
         </div>
         <DialogFooter>
-          <Button variant="outline" onClick={() => setOpen(false)} disabled={uploading}>取消</Button>
+          <Button variant="outline" onClick={() => handleOpenChange(false)} disabled={uploading}>取消</Button>
           <Button onClick={() => void handleUpload()} disabled={uploading}>
-            {uploading ? "正在上传..." : "添加"}
+            {uploading ? "正在导入并生成台词..." : "添加"}
           </Button>
         </DialogFooter>
       </DialogContent>

@@ -69,6 +69,11 @@ beforeEach(() => {
     settings: { ...baseSettings, selectedPetId: xiaohuang.id },
     running: true,
   });
+  api.uploadPet.mockResolvedValue({
+    ok: true,
+    pet: xiaohuang,
+    replyGeneration: { source: "llm", count: 12, warning: "" },
+  });
 });
 
 afterEach(() => {
@@ -78,6 +83,61 @@ afterEach(() => {
 });
 
 describe("selected pet artwork", () => {
+  it("opens the add-pet dialog above the settings modal", async () => {
+    const view = render(
+      <PetSelectionProvider>
+        <PetSettingsSection />
+      </PetSelectionProvider>,
+    );
+
+    await waitFor(() => expect(view.getByRole("button", { name: "添加宠物" })).toBeTruthy());
+    fireEvent.click(view.getByRole("button", { name: "添加宠物" }));
+
+    const dialog = await view.findByRole("dialog", { name: "添加桌面宠物" });
+    expect(dialog.className).toContain("z-[180]");
+    const overlay = document.querySelector('[data-state="open"].fixed.inset-0');
+    expect(overlay?.className).toContain("z-[180]");
+  });
+
+  it("uploads a ZIP pet package and refreshes the catalog", async () => {
+    const view = render(
+      <PetSelectionProvider>
+        <PetSettingsSection />
+      </PetSelectionProvider>,
+    );
+    await waitFor(() => expect(view.getByRole("button", { name: "添加宠物" })).toBeTruthy());
+    fireEvent.click(view.getByRole("button", { name: "添加宠物" }));
+
+    const packageFile = new File(["package"], "coding-cat.zip", { type: "application/zip" });
+    fireEvent.change(view.getByLabelText(/^宠物压缩包/), { target: { files: [packageFile] } });
+    fireEvent.click(view.getByRole("button", { name: "添加" }));
+
+    await waitFor(() => expect(api.uploadPet).toHaveBeenCalledWith(packageFile));
+    await waitFor(() => expect(api.fetchPets).toHaveBeenCalledTimes(3));
+    await waitFor(() => {
+      expect(view.getByText("新宠物已添加，并生成了 12 条专属互动台词")).toBeTruthy();
+    });
+  });
+
+  it("shows package validation errors inside the open dialog", async () => {
+    api.uploadPet.mockRejectedValueOnce(
+      new Error(JSON.stringify({ detail: "宠物包内必须且只能包含一个 pet.json" })),
+    );
+    const view = render(
+      <PetSelectionProvider>
+        <PetSettingsSection />
+      </PetSelectionProvider>,
+    );
+    await waitFor(() => expect(view.getByRole("button", { name: "添加宠物" })).toBeTruthy());
+    fireEvent.click(view.getByRole("button", { name: "添加宠物" }));
+    const packageFile = new File(["invalid"], "invalid.zip", { type: "application/zip" });
+    fireEvent.change(view.getByLabelText(/^宠物压缩包/), { target: { files: [packageFile] } });
+    fireEvent.click(view.getByRole("button", { name: "添加" }));
+
+    expect((await view.findByRole("alert")).textContent).toContain("宠物包内必须且只能包含一个 pet.json");
+    expect(view.getByRole("dialog", { name: "添加桌面宠物" })).toBeTruthy();
+  });
+
   it("updates the home animation and every brand avatar after a settings switch", async () => {
     const view = render(
       <PetSelectionProvider>

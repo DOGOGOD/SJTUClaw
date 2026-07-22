@@ -552,18 +552,20 @@ export async function closePet(): Promise<{
   return request("/pet/close", { method: "POST" });
 }
 
-export async function uploadPet(data: {
-  petId: string;
-  displayName: string;
-  description: string;
-  spritesheet: File;
-}): Promise<{ ok: boolean; pet: import("@/lib/types").PetInfo }> {
+export async function uploadPet(packageFile: File): Promise<{
+  ok: boolean;
+  pet: import("@/lib/types").PetInfo;
+  replyGeneration: {
+    source: "llm" | "fallback";
+    count: number;
+    warning: string;
+  };
+}> {
   const form = new FormData();
-  form.append("petId", data.petId);
-  form.append("displayName", data.displayName);
-  form.append("description", data.description);
-  form.append("spritesheet", data.spritesheet);
-  return request("/pet/pets", { method: "POST", body: form });
+  form.append("package", packageFile);
+  // Atlas validation and LLM reply generation can legitimately exceed the
+  // ordinary request timeout. The dialog remains visibly busy throughout.
+  return request("/pet/pets", { method: "POST", body: form }, null);
 }
 
 export async function deletePet(petId: string): Promise<{ ok: boolean }> {

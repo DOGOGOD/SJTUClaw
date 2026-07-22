@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { fetchSessions, sendMessage } from "./api";
+import { fetchSessions, sendMessage, uploadPet } from "./api";
 
 function jsonResponse(body: unknown): Response {
   return {
@@ -49,5 +49,26 @@ describe("API request timeouts", () => {
 
     await vi.advanceTimersByTimeAsync(1_000);
     await expect(request).resolves.toMatchObject({ ok: true });
+  });
+});
+
+describe("pet package upload", () => {
+  it("sends the ZIP file as the package form field", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      jsonResponse({
+        ok: true,
+        pet: { id: "coding-cat" },
+        replyGeneration: { source: "llm", count: 12, warning: "" },
+      }),
+    );
+    const packageFile = new File(["zip"], "coding-cat.zip", { type: "application/zip" });
+
+    await uploadPet(packageFile);
+
+    const init = fetchMock.mock.calls[0]?.[1];
+    expect(init?.method).toBe("POST");
+    const body = init?.body as FormData;
+    expect(body.get("package")).toBe(packageFile);
+    expect(body.get("spritesheet")).toBeNull();
   });
 });

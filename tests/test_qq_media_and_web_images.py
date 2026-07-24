@@ -182,7 +182,7 @@ def test_chat_sends_uploaded_image_and_text_in_one_agent_turn(monkeypatch, tmp_p
     session = store.create_session(session_id="combined-image-session")
     monkeypatch.setattr(server, "_session_store", store)
     monkeypatch.setattr(server, "SESSIONS_DIR", tmp_path / "session-data")
-    monkeypatch.setattr(server, "_llm_ready", lambda: True)
+    monkeypatch.setattr(server, "_llm_ready", lambda *_args: True)
     monkeypatch.setattr(server, "auto_title_if_first_turn", lambda *args, **kwargs: None)
 
     upload = UploadFile(

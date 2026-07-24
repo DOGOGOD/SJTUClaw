@@ -160,6 +160,7 @@ export interface SendMessageResponse {
   error?: string;
   autoMode?: boolean;
   unlimitedMode?: boolean;
+  piMode?: boolean;
   /** Auto-generated session title from the first user message (null if not applicable). */
   title?: string | null;
 }
@@ -218,6 +219,8 @@ export interface SSESessionInfoEvent {
   type: "_session_info";
   sessionId: string;
   autoMode: boolean;
+  unlimitedMode?: boolean;
+  piMode?: boolean;
 }
 
 export interface SSETitleEvent {

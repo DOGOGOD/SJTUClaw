@@ -57,7 +57,12 @@ from claw.config import (
 from claw.context.builder import ContextBuilder
 from claw.context.compaction_worker import CompactionWorker
 from claw.llm.client import LLMClient, LLMError
-from claw.pi import create_agent_client, is_pi_backend
+from claw.pi import (
+    RuntimeAgentClient,
+    get_session_backend,
+    initialize_session_backends,
+    set_session_backend,
+)
 from claw.memory.store import MemoryStore, MemoryStoreError
 from claw.prompts import load_soul, load_system_prompt
 from claw.session.store import SessionStore, SessionStoreError
@@ -108,7 +113,7 @@ class RuntimeLLMClient:
     """Mutable LLM client holder so WebUI can start before LLM is configured."""
 
     def __init__(self) -> None:
-        self._client: LLMClient | None = None
+        self._client: RuntimeAgentClient | None = None
         self._config = LLMConfig(api_key="", base_url="https://api.openai.com/v1", model="")
         self.error_message = _LLM_NOT_CONFIGURED_MESSAGE
 
@@ -118,14 +123,16 @@ class RuntimeLLMClient:
 
     @property
     def configured(self) -> bool:
-        cfg = self.config
-        return self._client is not None and (
-            callable(getattr(self._client, "run_agent_turn", None))
-            or bool(cfg.api_key and cfg.base_url and cfg.model)
+        return self._client is not None and self._client.configured
+
+    def configured_for_session(self, session_id: str, session_store) -> bool:
+        return (
+            self._client is not None
+            and self._client.configured_for_session(session_id, session_store)
         )
 
     def set_config(self, config: LLMConfig) -> None:
-        self._client = create_agent_client(config)
+        self._client = RuntimeAgentClient(config)
         self._config = config
         self.error_message = ""
 
@@ -133,7 +140,7 @@ class RuntimeLLMClient:
         self._client = None
         self.error_message = message or _LLM_NOT_CONFIGURED_MESSAGE
 
-    def _require_client(self) -> LLMClient:
+    def _require_client(self) -> RuntimeAgentClient:
         if self._client is None:
             raise LLMError(self.error_message or _LLM_NOT_CONFIGURED_MESSAGE)
         return self._client
@@ -144,18 +151,14 @@ class RuntimeLLMClient:
     def chat_with_tools(self, *args, **kwargs):
         return self._require_client().chat_with_tools(*args, **kwargs)
 
-    def __getattr__(self, name: str):
-        """Expose optional full-turn capabilities of the active backend.
+    def backend_for_session(self, session_id: str, session_store) -> str:
+        return self._require_client().backend_for_session(session_id, session_store)
 
-        ``run_agent_turn`` must remain absent for the legacy client so the
-        shared loop does not bypass its normal Think/Act/Observe path.
-        """
-        if name in {"run_agent_turn", "compact_session"}:
-            client = self.__dict__.get("_client")
-            runner = getattr(client, name, None) if client is not None else None
-            if callable(runner):
-                return runner
-        raise AttributeError(name)
+    def run_agent_turn(self, *args, **kwargs):
+        return self._require_client().run_agent_turn(*args, **kwargs)
+
+    def compact_session(self, *args, **kwargs):
+        return self._require_client().compact_session(*args, **kwargs)
 
 
 def _load_initial_llm() -> tuple[LLMConfig, RuntimeLLMClient]:
@@ -165,14 +168,13 @@ def _load_initial_llm() -> tuple[LLMConfig, RuntimeLLMClient]:
         client.set_config(config)
         return config, client
     except ConfigError as exc:
-        if is_pi_backend():
-            config = client.config
-            client.set_config(config)
-            logger.info("Pi Agent 已启用；辅助 LLM 未配置: %s", exc)
-            return config, client
-        client.clear(_LLM_NOT_CONFIGURED_MESSAGE)
-        logger.warning("LLM 未配置，WebUI 将以设置模式启动: %s", exc)
-        return client.config, client
+        # Keep the session router alive even without legacy credentials:
+        # individual persisted Pi sessions must remain usable regardless of
+        # the default backend selected in settings.
+        config = client.config
+        client.set_config(config)
+        logger.warning("辅助 LLM 未配置；Pi session 仍可独立运行: %s", exc)
+        return config, client
 
 # ---------------------------------------------------------------------------
 # Shared runtime (initialised once at startup)
@@ -183,6 +185,7 @@ _system_prompt = load_system_prompt()
 _soul = load_soul()
 
 _session_store = SessionStore(SESSIONS_DIR)
+initialize_session_backends(_session_store)
 _memory_store = MemoryStore(MEMORY_DIR)
 _compact_cfg = load_compaction_config()
 _workspace_manager = WorkspaceManager()
@@ -257,8 +260,18 @@ def _llm_missing_reply() -> str:
     return _LLM_NOT_CONFIGURED_MESSAGE
 
 
-def _llm_ready() -> bool:
+def _llm_ready(session_id: str | None = None) -> bool:
+    if session_id:
+        return _llm_client.configured_for_session(session_id, _session_store)
     return bool(getattr(_llm_client, "configured", False))
+
+
+def _session_backend(session_id: str) -> str:
+    return get_session_backend(_session_store, session_id)
+
+
+def _session_pi_mode(session_id: str) -> bool:
+    return _session_backend(session_id) == "pi"
 
 # -- Cron service (must be created before register_all_tools) --------------
 _cron_store_path = DATA_DIR / "cron" / "jobs.json"
@@ -425,7 +438,7 @@ _reflection_mgr = ReflectionManager(
 
 # -- Compaction worker (v3: with idle auto-compaction) --------------------
 _compact_llm: LLMClient | None = None
-if _compact_cfg.model and (_compact_cfg.api_key or _llm_ready()):
+if _compact_cfg.model and (_compact_cfg.api_key or _config.api_key):
     from claw.config import LLMConfig as LC
     _compact_llm_config = LC(
         api_key=_compact_cfg.api_key or _config.api_key,
@@ -441,6 +454,7 @@ _compaction_worker = CompactionWorker(
     compact_llm=_compact_llm,
     config=_compact_cfg,
     idle_ttl_minutes=_compact_cfg.idle_ttl_minutes,
+    session_filter=lambda session: _session_backend(session.session_id) != "pi",
 )
 
 
@@ -472,7 +486,7 @@ async def _lifespan(_app: FastAPI):
     loop = asyncio.get_running_loop()
     _cron_service.start(loop=loop)
     _reflection_mgr.start()
-    if not is_pi_backend():
+    if _config.api_key and _config.model:
         _compaction_worker.start_idle_compaction()
 
     pet_settings = _pet_catalog.load_settings()
@@ -783,7 +797,7 @@ async def _qq_message_handler(
         finally:
             _set_turn_session_id(None)
 
-    if not _llm_ready():
+    if not _llm_ready(session_key):
         reply = _llm_missing_reply()
         try:
             session.append_message("user", content)
@@ -1126,10 +1140,11 @@ async def handle_chat(req: ChatRequest):
             "messages": messages,
             "autoMode": _auto_mode.get(sid, False),
             "unlimitedMode": _workspace_manager.is_unlimited(sid),
+            "piMode": _session_pi_mode(sid),
             "title": session.title,
         }
 
-    if not _llm_ready():
+    if not _llm_ready(sid):
         reply = _llm_missing_reply()
         try:
             session = _session_store.get(sid)
@@ -1152,6 +1167,7 @@ async def handle_chat(req: ChatRequest):
             "messages": messages,
             "autoMode": _auto_mode.get(sid, False),
             "unlimitedMode": _workspace_manager.is_unlimited(sid),
+            "piMode": _session_pi_mode(sid),
             "title": title,
         }
 
@@ -1244,6 +1260,7 @@ async def handle_chat(req: ChatRequest):
         "messages": messages,
         "autoMode": _auto_mode.get(sid, False),
         "unlimitedMode": _workspace_manager.is_unlimited(sid),
+        "piMode": _session_pi_mode(sid),
         "title": new_title,
     }
 
@@ -1329,9 +1346,9 @@ def _execute_slash_command(
         return "bye."
 
     def _switch_backend(target: str) -> str:
-        current = setting_value("AGENT_BACKEND", "sjtuclaw").strip().lower()
+        current = _session_backend(sid)
         if target == "status":
-            return f"当前 Agent 后端：{'Pi' if current == 'pi' else 'SJTUClaw'}。"
+            return f"当前 session 的 Agent 后端：{'Pi' if current == 'pi' else 'SJTUClaw'}。"
         if target == current:
             if target == "pi":
                 try:
@@ -1339,23 +1356,26 @@ def _execute_slash_command(
                     load_pi_config()
                 except Exception as exc:
                     return f"[错误] Pi Agent 运行环境不可用：{exc}"
-                return "Pi Agent 后端已连接，运行环境检查通过。"
-            return f"Agent 后端已经是 {'Pi' if target == 'pi' else 'SJTUClaw'}。"
-        previous = load_runtime_settings_raw()
+                return "当前 session 已启用 Pi，运行环境检查通过。"
+            return "当前 session 已使用 SJTUClaw 原生后端。"
         try:
             if target == "pi":
                 from claw.pi import load_pi_config
                 load_pi_config()
-            update_runtime_settings({"AGENT_BACKEND": target})
-            _apply_llm_runtime_config()
+            elif not (
+                _config.api_key
+                and _config.base_url
+                and _config.model
+            ):
+                raise RuntimeError("SJTUClaw 原生后端需要完整的 LLM API Key、Base URL 和模型配置")
+            set_session_backend(_session_store, sid, target)
         except Exception as exc:
-            replace_runtime_settings_raw(previous)
-            try:
-                _apply_llm_runtime_config()
-            except Exception:
-                logger.exception("恢复先前 Agent 后端失败")
-            return f"[错误] Agent 后端切换失败：{exc}"
-        return "已接入 Pi Agent 后端。" if target == "pi" else "已切回 SJTUClaw 原生后端。"
+            return f"[错误] 当前 session 的 Agent 后端切换失败：{exc}"
+        return (
+            "当前 session 已接入 Pi Agent 后端。"
+            if target == "pi"
+            else "当前 session 已切回 SJTUClaw 原生后端。"
+        )
 
     state = RuntimeState(
         session_store=_session_store,
@@ -1412,7 +1432,7 @@ async def _run_explicit_skill_command(
     marker must never escape to clients; this function consumes it and mirrors
     the normal Gateway chat lifecycle, including cancellation and approvals.
     """
-    if not _llm_ready():
+    if not _llm_ready(session_id):
         return {
             "ok": True,
             "type": "config_required",
@@ -1421,6 +1441,7 @@ async def _run_explicit_skill_command(
             "actions": [],
             "autoMode": _auto_mode.get(session_id, False),
             "unlimitedMode": _workspace_manager.is_unlimited(session_id),
+            "piMode": _session_pi_mode(session_id),
         }
 
     cancel_event = _register_active_turn(session_id)
@@ -1493,6 +1514,7 @@ async def _run_explicit_skill_command(
         ],
         "autoMode": _auto_mode.get(session_id, False),
         "unlimitedMode": _workspace_manager.is_unlimited(session_id),
+        "piMode": _session_pi_mode(session_id),
     }
 
 
@@ -1551,14 +1573,17 @@ async def handle_command(req: CommandRequest):
     elif root == "/pi":
         actions = ["reload_sessions"]
 
+    mode_sid = switch_to or sid
+    mode_session_exists = _session_store.exists(mode_sid)
     resp: dict = {
         "ok": True,
         "type": "command",
         "format": "markdown",
         "result": result_text,
         "actions": actions,
-        "autoMode": _auto_mode.get(sid, False),
-        "unlimitedMode": _workspace_manager.is_unlimited(sid),
+        "autoMode": _auto_mode.get(mode_sid, False),
+        "unlimitedMode": _workspace_manager.is_unlimited(mode_sid),
+        "piMode": _session_pi_mode(mode_sid) if mode_session_exists else False,
     }
     if switch_to:
         resp["switchToSessionId"] = switch_to
@@ -1595,6 +1620,7 @@ def create_session(req: CreateSessionRequest | None = None):
         "ok": True,
         "sessionId": session.session_id,
         "title": session.title,
+        "piMode": _session_pi_mode(session.session_id),
     }
 
 
@@ -1610,6 +1636,7 @@ def get_messages(session_id: str):
         "summary": session.summary,
         "autoMode": _auto_mode.get(session_id, False),
         "unlimitedMode": _workspace_manager.is_unlimited(session_id),
+        "piMode": _session_pi_mode(session_id),
         "rollback": _rollback_manager.status(session_id),
     }
 
@@ -2829,10 +2856,10 @@ def _apply_llm_runtime_config() -> None:
         consolidation_ratio=settings["consolidationRatio"],
     )
     _llm_client.set_config(_config)
-    if backend == "pi":
-        _compaction_worker.stop_idle_compaction()
-    else:
+    if api_key and settings["model"]:
         _compaction_worker.start_idle_compaction()
+    else:
+        _compaction_worker.stop_idle_compaction()
 
 
 async def _apply_qq_runtime_config() -> None:
@@ -3172,7 +3199,7 @@ async def handle_chat_stream(req: ChatRequest):
 
         async def _command_events():
             yield _event_to_sse(FinalEvent(content=result_text))
-            yield f"data: {json.dumps({'type': '_session_info', 'sessionId': sid, 'autoMode': _auto_mode.get(sid, False), 'unlimitedMode': _workspace_manager.is_unlimited(sid)}, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'type': '_session_info', 'sessionId': sid, 'autoMode': _auto_mode.get(sid, False), 'unlimitedMode': _workspace_manager.is_unlimited(sid), 'piMode': _session_pi_mode(sid)}, ensure_ascii=False)}\n\n"
             yield "data: {\"type\": \"_done\"}\n\n"
 
         return StreamingResponse(
@@ -3185,7 +3212,7 @@ async def handle_chat_stream(req: ChatRequest):
             },
         )
 
-    if not _llm_ready():
+    if not _llm_ready(sid):
         reply = _llm_missing_reply()
         try:
             session = _session_store.get(sid)
@@ -3197,7 +3224,7 @@ async def handle_chat_stream(req: ChatRequest):
 
         async def _config_required_events():
             yield _event_to_sse(FinalEvent(content=reply))
-            yield f"data: {json.dumps({'type': '_session_info', 'sessionId': sid, 'autoMode': _auto_mode.get(sid, False), 'unlimitedMode': _workspace_manager.is_unlimited(sid)}, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'type': '_session_info', 'sessionId': sid, 'autoMode': _auto_mode.get(sid, False), 'unlimitedMode': _workspace_manager.is_unlimited(sid), 'piMode': _session_pi_mode(sid)}, ensure_ascii=False)}\n\n"
             yield "data: {\"type\": \"_done\"}\n\n"
 
         return StreamingResponse(
@@ -3245,7 +3272,7 @@ async def handle_chat_stream(req: ChatRequest):
             )
             # The FinalEvent is emitted inside run_agent_turn, but we
             # also send a session_id + autoMode info event
-            event_queue.put({"type": "_session_info", "sessionId": sid, "autoMode": _auto_mode.get(sid, False), "unlimitedMode": _workspace_manager.is_unlimited(sid)})
+            event_queue.put({"type": "_session_info", "sessionId": sid, "autoMode": _auto_mode.get(sid, False), "unlimitedMode": _workspace_manager.is_unlimited(sid), "piMode": _session_pi_mode(sid)})
 
             # Auto-title
             try:

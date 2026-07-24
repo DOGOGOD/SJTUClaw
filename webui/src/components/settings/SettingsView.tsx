@@ -453,7 +453,7 @@ function LLMSection() {
       });
       setSettings(data.settings);
       setApiKey("");
-      setMessage("已保存，新的 LLM 配置已动态应用");
+      setMessage("已保存；后端默认值用于新会话，当前会话可用 /pi 切换");
       setTimeout(() => setMessage(""), 2600);
     } catch (err) {
       setError(loadErrorMessage(err));
@@ -471,11 +471,11 @@ function LLMSection() {
   );
 
   return (
-    <Section title="Agent 与 LLM 设置" desc="选择 SJTUClaw 或 Pi Agent；保存后后续请求立即使用新后端。">
+    <Section title="Agent 与 LLM 设置" desc="配置新会话的默认 Agent 后端；已有会话保持各自状态，可用 /pi 单独切换。">
       <div className="rounded-xl border border-border/60 bg-card/40 p-4">
         <div className="grid gap-3">
           <div>
-            <FieldLabel>Agent backend</FieldLabel>
+            <FieldLabel>新会话默认 Agent backend</FieldLabel>
             <select
               className="mt-1 h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
               value={settings.backend}

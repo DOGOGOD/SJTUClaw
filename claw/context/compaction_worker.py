@@ -17,6 +17,7 @@ import threading
 import time
 import traceback
 from datetime import datetime, timezone
+from typing import Callable
 
 from claw.config import CompactionConfig
 from claw.llm.client import LLMClient
@@ -43,12 +44,14 @@ class CompactionWorker:
         compact_llm: LLMClient | None = None,
         config: CompactionConfig | None = None,
         idle_ttl_minutes: int = 0,
+        session_filter: Callable[[Session], bool] | None = None,
     ):
         self._main_llm = main_llm
         self._session_store = session_store
         self._compact_llm = compact_llm or main_llm
         self._config = config or CompactionConfig()
         self._idle_ttl_minutes = idle_ttl_minutes
+        self._session_filter = session_filter
 
         self._lock = threading.Lock()
         self._running = False
@@ -64,6 +67,8 @@ class CompactionWorker:
         Returns True if the task was accepted, False if a compaction is
         already in progress (the submission is silently dropped).
         """
+        if self._session_filter is not None and not self._session_filter(session):
+            return False
         with self._lock:
             if self._running:
                 return False
@@ -180,6 +185,8 @@ class CompactionWorker:
                 return
 
         # Apply result to the live session (brief lock)
+        if self._session_filter is not None and not self._session_filter(session):
+            return
         with self._lock:
             # A user turn or rollback changed the session while the LLM was
             # producing this summary.  Applying it would resurrect context
@@ -240,6 +247,8 @@ class CompactionWorker:
             try:
                 session = self._session_store.get(s.session_id)
             except SessionStoreError:
+                continue
+            if self._session_filter is not None and not self._session_filter(session):
                 continue
 
             from claw.context.compaction import has_compactable_idle_tail

@@ -13,7 +13,13 @@ from fastapi import HTTPException
 from claw.agent.events import FinalEvent, ToolCallEndEvent, ToolCallStartEvent
 from claw.approval.manager import ApprovalStatus
 from claw.config import LLMConfig
-from claw.pi.client import PiAgentClient, PiRuntimeConfig, RuntimeAgentClient
+from claw.pi.client import (
+    PiAgentClient,
+    PiRuntimeConfig,
+    RuntimeAgentClient,
+    get_session_backend,
+    set_session_backend,
+)
 from claw.session.store import SessionStore
 from claw.tools.base import Tool, ToolRegistry, ToolResult
 
@@ -36,6 +42,19 @@ for line in sys.stdin:
         send({"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":decision}})
         send({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":decision}]}})
         send({"type":"agent_settled"})
+'''
+
+_ANONYMOUS_TOOL_PI = r'''
+import json, sys
+command = json.loads(sys.stdin.readline())
+def send(v):
+    sys.stdout.write(json.dumps(v, ensure_ascii=False) + "\n"); sys.stdout.flush()
+send({"type":"response","id":command["id"],"command":"prompt","success":True})
+send({"type":"agent_start"})
+send({"type":"tool_execution_start","toolName":"read","args":{"path":"README.md"}})
+send({"type":"tool_execution_end","toolName":"read","result":{"content":[{"type":"text","text":"read ok"}]},"isError":False})
+send({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"完成"}]}})
+send({"type":"agent_settled"})
 '''
 
 _CANCELLABLE_PI = r'''
@@ -117,9 +136,52 @@ def test_pi_rpc_maps_events_approval_and_only_keeps_last_assistant(tmp_path, mon
     assert any(isinstance(event, ToolCallStartEvent) for event in events)
     assert any(isinstance(event, ToolCallEndEvent) for event in events)
     assert isinstance(events[-1], FinalEvent)
-    assert [(message.role, message.content) for message in store.get("pi-test").messages] == [
-        ("user", "写入文件"), ("assistant", "完成喵"),
+    messages = store.get("pi-test").messages
+    assert [(message.role, message.content) for message in messages] == [
+        ("user", "写入文件"),
+        ("assistant", ""),
+        ("tool", "written"),
+        ("assistant", "完成喵"),
     ]
+    assert messages[1].tool_calls == [{
+        "id": "call-1",
+        "type": "function",
+        "function": {
+            "name": "write",
+            "arguments": '{"path": "x.txt"}',
+        },
+    }]
+    assert messages[2].tool_call_id == "call-1"
+    assert messages[2].name == "write"
+
+
+def test_pi_rpc_pairs_anonymous_tool_events_with_generated_id(tmp_path, monkeypatch):
+    monkeypatch.setenv("PYTHONIOENCODING", "utf-8")
+    monkeypatch.setattr(
+        "claw.pi.client.load_pi_config",
+        lambda: _runtime(tmp_path, _ANONYMOUS_TOOL_PI),
+    )
+    client, store = _client_and_store(tmp_path)
+    events = []
+
+    result = client.run_agent_turn(
+        "pi-test",
+        "读取文件",
+        session_store=store,
+        event_callback=events.append,
+    )
+
+    tool_events = [
+        event
+        for event in events
+        if isinstance(event, (ToolCallStartEvent, ToolCallEndEvent))
+    ]
+    assert result == "完成"
+    assert [event.call_id for event in tool_events] == ["pi-tool-1", "pi-tool-1"]
+    messages = store.get("pi-test").messages
+    assert messages[1].tool_calls[0]["id"] == "pi-tool-1"
+    assert messages[2].tool_call_id == "pi-tool-1"
+    assert messages[2].content == "read ok"
 
 
 def test_pi_cancel_sends_abort_without_waiting_for_more_stdout(tmp_path, monkeypatch):
@@ -219,6 +281,43 @@ def test_new_pi_branch_receives_existing_sjtuclaw_history_once(tmp_path, monkeyp
     assert metadata["pi_initialized_generation"] == metadata["pi_session_generation"]
 
 
+def test_returning_to_pi_hands_off_turns_completed_by_native_backend(
+    tmp_path, monkeypatch
+):
+    configured = _runtime(tmp_path, _ERROR_PI)
+    monkeypatch.setattr("claw.pi.client.load_pi_config", lambda: configured)
+    client, store = _client_and_store(tmp_path)
+    set_session_backend(store, "pi-test", "pi")
+    session = store.get("pi-test")
+    old_generation = session.metadata["pi_session_generation"]
+    session.metadata["pi_session_owner"] = "pi-test"
+    session.metadata["pi_initialized_generation"] = old_generation
+    store.save(session)
+
+    set_session_backend(store, "pi-test", "sjtuclaw")
+    session = store.get("pi-test")
+    session.append_message("user", "原生后端问题")
+    session.append_message("assistant", "原生后端回答")
+    store.save(session)
+    set_session_backend(store, "pi-test", "pi")
+
+    prompts = []
+
+    def fake_rpc(_command, _config, prompt, **kwargs):
+        prompts.append(prompt)
+        kwargs["on_prompt_accepted"]()
+        return "ok"
+
+    monkeypatch.setattr(client, "_run_rpc", fake_rpc)
+    client.run_agent_turn("pi-test", "回到 Pi", session_store=store)
+
+    metadata = store.get("pi-test").metadata
+    assert metadata["pi_session_generation"] != old_generation
+    assert "sjtuclaw_session_handoff" in prompts[0]
+    assert "原生后端问题" in prompts[0]
+    assert "原生后端回答" in prompts[0]
+
+
 def test_pi_unknown_dialog_is_cancelled_fail_closed():
     replies = []
     PiAgentClient._handle_ui_request(
@@ -240,29 +339,31 @@ def test_clearing_session_rotates_pi_session_generation():
     assert len(session.metadata["pi_session_generation"]) == 32
 
 
-def test_gateway_considers_pi_configured_without_auxiliary_llm(monkeypatch):
+def test_gateway_considers_pi_session_configured_without_auxiliary_llm(tmp_path):
     from claw.gateway import server
 
     config = LLMConfig("", "https://api.openai.com/v1", "")
-    monkeypatch.setattr(server, "create_agent_client", PiAgentClient)
     runtime = server.RuntimeLLMClient()
     runtime.set_config(config)
+    store = SessionStore(tmp_path / "sessions")
+    store.create_session(session_id="pi-only")
+    set_session_backend(store, "pi-only", "pi")
 
-    assert runtime.configured is True
+    assert runtime.configured_for_session("pi-only", store) is True
     assert callable(getattr(runtime, "run_agent_turn"))
 
 
-def test_gateway_legacy_runtime_does_not_expose_full_turn(monkeypatch):
+def test_gateway_legacy_session_requires_llm_credentials(tmp_path):
     from claw.gateway import server
 
-    class Legacy:
-        config = LLMConfig("key", "https://example.test/v1", "model")
-
-    monkeypatch.setattr(server, "create_agent_client", lambda _config: Legacy())
+    config = LLMConfig("", "https://example.test/v1", "")
     runtime = server.RuntimeLLMClient()
-    runtime.set_config(Legacy.config)
+    runtime.set_config(config)
+    store = SessionStore(tmp_path / "sessions")
+    store.create_session(session_id="legacy-only")
+    set_session_backend(store, "legacy-only", "sjtuclaw")
 
-    assert getattr(runtime, "run_agent_turn", None) is None
+    assert runtime.configured_for_session("legacy-only", store) is False
 
 
 def test_apply_runtime_config_accepts_pi_without_legacy_credentials(monkeypatch):
@@ -439,32 +540,75 @@ def test_pi_slash_command_switches_backend_through_runtime_callback(tmp_path):
     assert calls == ["pi", "status", "sjtuclaw"]
 
 
-def test_gateway_pi_command_updates_runtime_backend(monkeypatch):
+def test_gateway_pi_command_is_isolated_to_current_session(tmp_path, monkeypatch):
     from claw.gateway import server
     import claw.pi as pi_module
 
-    settings = {"AGENT_BACKEND": "sjtuclaw"}
-    applied = []
+    store = SessionStore(tmp_path / "sessions")
+    store.create_session(session_id="pi-command-a")
+    store.create_session(session_id="pi-command-b")
+    set_session_backend(store, "pi-command-a", "sjtuclaw")
+    set_session_backend(store, "pi-command-b", "sjtuclaw")
+    monkeypatch.setattr(server, "_session_store", store)
+    monkeypatch.setattr(server, "_session_turn_active", lambda _sid: False)
     monkeypatch.setattr(
         server,
-        "setting_value",
-        lambda name, default="": settings.get(name, default),
+        "update_runtime_settings",
+        lambda *_args, **_kwargs: pytest.fail(
+            "session-level /pi must not mutate global runtime settings"
+        ),
     )
-    monkeypatch.setattr(server, "load_runtime_settings_raw", lambda: dict(settings))
-    monkeypatch.setattr(server, "replace_runtime_settings_raw", lambda values: settings.update(values))
-    monkeypatch.setattr(server, "update_runtime_settings", lambda values: settings.update(values))
-    monkeypatch.setattr(server, "_apply_llm_runtime_config", lambda: applied.append(settings["AGENT_BACKEND"]))
-    monkeypatch.setattr(server, "_session_turn_active", lambda _sid: False)
     monkeypatch.setattr(pi_module, "load_pi_config", lambda: object())
 
-    result = server._execute_slash_command("/pi", "pi-command-test")
+    result = server._execute_slash_command("/pi", "pi-command-a")
 
-    assert "已接入 Pi" in result
-    assert settings["AGENT_BACKEND"] == "pi"
-    assert applied == ["pi"]
+    assert "当前 session 已接入 Pi" in result
+    assert get_session_backend(store, "pi-command-a") == "pi"
+    assert get_session_backend(store, "pi-command-b") == "sjtuclaw"
+    assert "Pi" in server._execute_slash_command("/pi status", "pi-command-a")
+    assert "SJTUClaw" in server._execute_slash_command("/pi status", "pi-command-b")
+    reloaded = SessionStore(tmp_path / "sessions")
+    assert get_session_backend(reloaded, "pi-command-a") == "pi"
+    assert get_session_backend(reloaded, "pi-command-b") == "sjtuclaw"
 
 
-def test_runtime_agent_router_switches_background_and_foreground_capability(monkeypatch):
+def test_gateway_message_state_reports_pi_mode_per_session(tmp_path, monkeypatch):
+    from claw.gateway import server
+
+    store = SessionStore(tmp_path / "sessions")
+    store.create_session(session_id="mode-pi")
+    store.create_session(session_id="mode-native")
+    set_session_backend(store, "mode-pi", "pi")
+    set_session_backend(store, "mode-native", "sjtuclaw")
+    monkeypatch.setattr(server, "_session_store", store)
+    monkeypatch.setattr(
+        server._rollback_manager,
+        "status",
+        lambda _session_id: {"enabled": False},
+    )
+
+    assert server.get_messages("mode-pi")["piMode"] is True
+    assert server.get_messages("mode-native")["piMode"] is False
+
+
+def test_background_compaction_skips_pi_sessions(tmp_path):
+    from claw.context.compaction_worker import CompactionWorker
+
+    store = SessionStore(tmp_path / "sessions")
+    pi_session = store.create_session(session_id="compact-pi")
+    set_session_backend(store, "compact-pi", "pi")
+    worker = CompactionWorker(
+        object(),
+        store,
+        session_filter=lambda session: get_session_backend(
+            store, session.session_id
+        ) != "pi",
+    )
+
+    assert worker.submit(pi_session) is False
+
+
+def test_runtime_agent_router_dispatches_each_session_independently(tmp_path, monkeypatch):
     class Legacy:
         config = LLMConfig("key", "https://example.test/v1", "legacy")
 
@@ -474,16 +618,37 @@ def test_runtime_agent_router_switches_background_and_foreground_capability(monk
         def chat_with_tools(self, *_args, **_kwargs):
             return "legacy-tools"
 
-    legacy = Legacy()
-    monkeypatch.setattr("claw.pi.client.create_agent_client", lambda _config: legacy)
-    router = RuntimeAgentClient(legacy.config)
-    assert router.chat([]) == "legacy-chat"
-    assert getattr(router, "run_agent_turn", None) is None
+    class Pi:
+        def run_agent_turn(self, session_id, user_message, **_kwargs):
+            return f"pi:{session_id}:{user_message}"
 
-    pi = PiAgentClient(LLMConfig("", "https://example.test/v1", ""))
-    router.set_client(pi)
-    assert callable(getattr(router, "run_agent_turn"))
-    assert callable(getattr(router, "compact_session"))
+    legacy = Legacy()
+    router = RuntimeAgentClient(legacy.config)
+    router._legacy_client = legacy
+    router._pi_client = Pi()
+    assert router.chat([]) == "legacy-chat"
+    store = SessionStore(tmp_path / "sessions")
+    store.create_session(session_id="route-pi")
+    store.create_session(session_id="route-native")
+    set_session_backend(store, "route-pi", "pi")
+    set_session_backend(store, "route-native", "sjtuclaw")
+
+    legacy_turns = []
+    monkeypatch.setattr(
+        "claw.agent.loop.run_agent_turn",
+        lambda session_id, message, **kwargs: (
+            legacy_turns.append((session_id, message, kwargs["llm_client"]))
+            or f"native:{session_id}:{message}"
+        ),
+    )
+
+    assert router.run_agent_turn(
+        "route-pi", "hello", session_store=store
+    ) == "pi:route-pi:hello"
+    assert router.run_agent_turn(
+        "route-native", "hello", session_store=store
+    ) == "native:route-native:hello"
+    assert legacy_turns == [("route-native", "hello", legacy)]
 
 
 def test_compact_command_routes_to_pi_native_compaction(tmp_path):

@@ -93,7 +93,7 @@ _HELP_TEXT = (
     "    status                   查看当前状态\n"
     "    on / off                 开启 / 关闭 UNLIMITED 模式\n"
     "    toggle                   切换 UNLIMITED 模式\n"
-    "  /pi                      检查并切换到 Pi Agent 后端\n"
+    "  /pi                      为当前 session 启用 Pi Agent 后端\n"
     "    status                   查看当前 Agent 后端\n"
     "    off                      切回 SJTUClaw 原生后端\n"
     "  /stop                    终止当前正在运行的 Agent 任务\n"
@@ -163,9 +163,9 @@ _HELP_MARKDOWN = """# SJTUClaw 可用指令
   - `/unlimited status`：查看当前状态
   - `/unlimited on` / `/unlimited off`：开启或关闭 UNLIMITED 模式
   - `/unlimited toggle`：切换 UNLIMITED 模式
-- `/pi` / `/pi on`：检查 Pi 运行环境并立即切换到 Pi Agent 后端
-- `/pi status`：查看当前 Agent 后端
-- `/pi off`：切回 SJTUClaw 原生后端
+- `/pi` / `/pi on`：检查 Pi 运行环境并为当前 session 启用 Pi
+- `/pi status`：查看当前 session 的 Agent 后端
+- `/pi off`：仅将当前 session 切回 SJTUClaw 原生后端
 
 > **安全提示：** AUTO 模式只会自动批准 workspace 内的操作。UNLIMITED 模式下涉及 workspace 外部的写入、覆盖、删除和 Shell 操作仍需用户明确审批。
 
@@ -279,7 +279,7 @@ def handle_command(user_input: str, state: RuntimeState, *, markdown: bool = Fal
 
 
 def _handle_pi_command(args: list[str], state: RuntimeState) -> str:
-    """Switch the process-wide main agent backend through its entrypoint."""
+    """Switch only the current session's main agent backend."""
     action = args[0].lower() if args else "on"
     target = {
         "on": "pi", "enable": "pi",
@@ -623,7 +623,13 @@ def _delete_memory(memory_id: str, state: RuntimeState) -> str:
 
 def _handle_compact_command(state: RuntimeState) -> str:
     pi_compact = getattr(state.llm_client, "compact_session", None)
-    if callable(pi_compact):
+    backend_resolver = getattr(state.llm_client, "backend_for_session", None)
+    session_uses_pi = (
+        backend_resolver(state.current_session_id, state.session_store) == "pi"
+        if callable(backend_resolver)
+        else callable(pi_compact)
+    )
+    if session_uses_pi and callable(pi_compact):
         try:
             return pi_compact(
                 state.current_session_id,

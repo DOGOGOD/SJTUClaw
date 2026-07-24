@@ -29,7 +29,11 @@ from claw.scheduler.callbacks import (
 )
 from claw.scheduler import CronService
 from claw.llm.client import LLMClient
-from claw.pi import RuntimeAgentClient, is_pi_backend
+from claw.pi import (
+    RuntimeAgentClient,
+    get_session_backend,
+    initialize_session_backends,
+)
 from claw.memory.reflection import ReflectionManager
 from claw.memory.store import MemoryStore
 from claw.prompts import PromptLoadError, load_soul, load_system_prompt
@@ -63,18 +67,16 @@ def main() -> int:
     try:
         config = load_config()
     except ConfigError as exc:
-        if not is_pi_backend():
-            print(f"[配置错误] {exc}", file=sys.stderr)
-            return 1
         config = LLMConfig(
             api_key="",
             base_url="https://api.openai.com/v1",
             model="",
         )
-        logging.info("Pi Agent 已启用；辅助 LLM 未配置。")
+        logging.warning("辅助 LLM 未配置；Pi session 仍可独立运行：%s", exc)
 
     client = RuntimeAgentClient(config)
     session_store = SessionStore(SESSIONS_DIR)
+    initialize_session_backends(session_store)
     memory_store = MemoryStore(MEMORY_DIR)
     workspace_manager = WorkspaceManager()
 
@@ -91,7 +93,7 @@ def main() -> int:
 
     # -- Compaction worker (v3: with idle auto-compaction) ------------------
     compact_llm: LLMClient | None = None
-    if compact_cfg.model:
+    if compact_cfg.model and (compact_cfg.api_key or config.api_key):
         from claw.config import LLMConfig as LC
 
         compact_llm_config = LC(
@@ -108,8 +110,11 @@ def main() -> int:
         compact_llm=compact_llm,
         config=compact_cfg,
         idle_ttl_minutes=compact_cfg.idle_ttl_minutes,
+        session_filter=lambda session: (
+            get_session_backend(session_store, session.session_id) != "pi"
+        ),
     )
-    if not is_pi_backend():
+    if config.api_key and config.model:
         compaction_worker.start_idle_compaction()
 
     approval_manager = ApprovalManager()

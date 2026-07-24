@@ -139,7 +139,17 @@ sjtuclaw setup
 
 也可以复制 `.env.example` 为 `.env` 手动配置模型服务。
 
-需要使用 Pi 时，先构建同级目录中的 `pi` 仓库，或在系统中安装可执行的 `pi`；随后在 Web UI 的“设置 → LLM”把 Agent backend 切换为 Pi。Pi 可以直接复用已有的 OpenAI-compatible 模型配置，也可以通过 `PI_PROVIDER`、`PI_MODEL` 使用 Pi 自身的模型与认证配置。
+需要使用 Pi 时，先构建同级目录中的 `pi` 仓库，或在系统中安装可执行的 `pi`。Web UI 的“设置 → LLM”可配置新会话的默认 Agent backend；已有会话可用 `/pi on`、`/pi off` 独立切换，互不影响，标题栏会显示 Pi 状态徽标。Pi 可以直接复用已有的 OpenAI-compatible 模型配置，也可以通过 `PI_PROVIDER`、`PI_MODEL` 使用 Pi 自身的模型与认证配置。
+
+Pi 是 SJTUClaw 的可选外部运行时依赖，不需要把完整 Pi SDK 或 Pi 源码提交到本仓库。源码开发时推荐保持同级目录布局：
+
+```text
+SJTUClaw/
+├── SJTUClaw/    # 本仓库
+└── pi/          # 外部 Pi 仓库或构建产物，不随本仓库上传
+```
+
+如果删除同级 `pi` 目录，`/pi on` 仍会继续查找 `PI_COMMAND`、`PI_CLI_PATH` 或系统 `PATH` 里的 `pi` / `pi.cmd`；都找不到时会提示 Pi 运行环境不可用，并保持当前 session 原来的后端不变。
 
 完整配置项、时区覆盖方式和安全建议见 [配置说明](docs/configuration.md)。
 

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { PanelLeft, Moon, Sun, ShieldCheck, Zap } from "lucide-react";
+import { Bot, PanelLeft, Moon, Sun, ShieldCheck, Zap } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ThreadViewport } from "./ThreadViewport";
 import { ThreadComposer } from "./ThreadComposer";
@@ -14,6 +14,7 @@ interface ThreadShellProps {
   sending: boolean;
   autoMode?: boolean;
   unlimitedMode?: boolean;
+  piMode?: boolean;
   rollbackEnabled?: boolean;
   rollingBack?: boolean;
   workspaceRefreshToken?: number;
@@ -25,6 +26,40 @@ interface ThreadShellProps {
   theme: "light" | "dark";
   onToggleTheme: () => void;
   hideSidebarToggle?: boolean;
+}
+
+export function SessionModeBadges({
+  autoMode,
+  unlimitedMode,
+  piMode,
+}: {
+  autoMode: boolean;
+  unlimitedMode: boolean;
+  piMode: boolean;
+}) {
+  return (
+    <>
+      {autoMode && (
+        <span className="flex shrink-0 items-center gap-1 rounded-lg border border-primary/20 bg-primary/10 px-2 py-1 text-[10px] font-semibold text-primary">
+          <Zap className="h-3 w-3" /> Auto
+        </span>
+      )}
+      {unlimitedMode && (
+        <span className="flex shrink-0 items-center gap-1 rounded-lg border border-destructive/25 bg-destructive/10 px-2 py-1 text-[10px] font-semibold text-destructive">
+          <ShieldCheck className="h-3 w-3" /> Unlimited
+        </span>
+      )}
+      {piMode && (
+        <span
+          data-testid="pi-mode-badge"
+          className="flex shrink-0 items-center gap-1 rounded-lg border border-violet-500/25 bg-violet-500/10 px-2 py-1 text-[10px] font-semibold text-violet-600 dark:text-violet-300"
+          title="当前会话使用 Pi Agent 后端"
+        >
+          <Bot className="h-3 w-3" /> Pi
+        </span>
+      )}
+    </>
+  );
 }
 
 export function ThreadShell({
@@ -39,6 +74,7 @@ export function ThreadShell({
   onToggleTheme,
   autoMode = false,
   unlimitedMode = false,
+  piMode = false,
   rollbackEnabled = false,
   rollingBack = false,
   workspaceRefreshToken = 0,
@@ -105,16 +141,11 @@ export function ThreadShell({
           <h1 className="truncate text-[13px] font-semibold tracking-[-0.01em] text-foreground/85">
             {title || "SJTUClaw"}
           </h1>
-          {autoMode && (
-            <span className="flex shrink-0 items-center gap-1 rounded-lg border border-primary/20 bg-primary/10 px-2 py-1 text-[10px] font-semibold text-primary">
-              <Zap className="h-3 w-3" /> Auto
-            </span>
-          )}
-          {unlimitedMode && (
-            <span className="flex shrink-0 items-center gap-1 rounded-lg border border-destructive/25 bg-destructive/10 px-2 py-1 text-[10px] font-semibold text-destructive">
-              <ShieldCheck className="h-3 w-3" /> Unlimited
-            </span>
-          )}
+          <SessionModeBadges
+            autoMode={autoMode}
+            unlimitedMode={unlimitedMode}
+            piMode={piMode}
+          />
         </div>
         <Button
           variant="ghost"

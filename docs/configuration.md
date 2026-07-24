@@ -18,11 +18,12 @@ cp .env.example .env
 
 ## Pi Agent 后端
 
-设置 `AGENT_BACKEND=pi` 后，主对话由 Pi coding agent 的官方 RPC 模式执行；
+设置 `AGENT_BACKEND=pi` 后，新建会话默认由 Pi coding agent 的官方 RPC 模式执行；
 标题生成、反思等辅助服务仍复用现有 LLM 配置。Pi 的模型提供商、工具循环、
 Skills、Extensions、自动压缩、重试和持久会话均保留，WebUI、QQ 与桌宠接口不变。
-也可以在 CLI、WebUI 或 QQ 对话中输入 `/pi`，系统会先检查 Pi 运行环境并立即
-切换后端；`/pi status` 查看当前后端，`/pi off` 切回 SJTUClaw 原生后端。
+也可以在 CLI、WebUI 或 QQ 对话中输入 `/pi`，系统会先检查 Pi 运行环境并仅为
+当前 session 切换后端；`/pi status` 查看当前 session 后端，`/pi off` 仅将当前
+session 切回 SJTUClaw 原生后端。每个 session 的选择独立持久化。
 
 SJTUClaw 不替换 Pi 的默认 system prompt。Pi 会根据实际启用的工具自动生成
 `Available tools`、每个工具的 `promptSnippet` 与 `promptGuidelines`；SJTUClaw
@@ -32,10 +33,20 @@ ToolRegistry、审批流程和 workspace 边界。
 Pi 后端下的 `/compact` 会直接调用 Pi RPC 的原生压缩命令，不依赖辅助 LLM。
 
 启动前先构建相邻的 `pi` 仓库，或把 `pi` 安装到系统命令路径。SJTUClaw 按
-`PI_COMMAND`、`PI_CLI_PATH`、相邻 Pi 构建产物、系统 `pi` 的顺序查找。
+`PI_COMMAND`、`PI_CLI_PATH`、相邻 Pi 构建产物、系统 `pi` / `pi.cmd` 的顺序查找。
 源码仓库布局为 `SJTUClaw/SJTUClaw` 与 `SJTUClaw/pi` 时可自动发现。Windows
 安装版不会内置完整 Pi/Node 运行时，需要另外安装系统 `pi`，或显式设置
 `PI_COMMAND` / `PI_CLI_PATH`（以及必要时的 `PI_NODE_PATH`）。
+
+Pi 是可选外部依赖，不是 SJTUClaw 仓库的一部分。发布或上传 SJTUClaw 到 GitHub
+时，应提交 `claw/pi/` 下的桥接代码、前后端接入代码、测试、文档和已跟踪的 Web
+构建产物；不应把同级的完整 `pi` SDK 仓库直接复制进本仓库。若需要固定 Pi 版本，
+建议在文档中记录 Pi 的来源、版本或 commit，或按项目策略使用 Git submodule。
+
+如果相邻的 `pi` 目录被删除，但 `PI_COMMAND`、`PI_CLI_PATH` 或系统 `PATH` 中仍有
+可执行 Pi，`/pi on` 仍可启用当前 session 的 Pi 后端。若所有入口都不可用，
+`/pi on` 会返回 Pi 运行环境不可用的错误，且不会把当前 session 切换到不可运行的
+Pi 状态。
 
 | 变量 | 说明 |
 | --- | --- |

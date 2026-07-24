@@ -30,9 +30,93 @@ from claw.utils import now_iso
 
 logger = logging.getLogger(__name__)
 
+SESSION_BACKEND_KEY = "agent_backend"
+_VALID_AGENT_BACKENDS = frozenset({"sjtuclaw", "pi"})
+
 
 class PiError(RuntimeError):
     """Pi could not start or complete a turn."""
+
+
+class _PiToolMessageRecorder:
+    """Persist Pi tool events using SJTUClaw's native message protocol."""
+
+    def __init__(self, session_id: str, session_store, callback=None):
+        self._session_id = session_id
+        self._session_store = session_store
+        self._callback = callback
+        self._pending: dict[str, str] = {}
+
+    def __call__(self, event: Any) -> None:
+        try:
+            if isinstance(event, ToolCallStartEvent):
+                self._record_start(event)
+            elif isinstance(event, ToolCallEndEvent):
+                self._record_end(event)
+        except Exception:
+            # Tool visibility must not be able to break the Pi turn itself.
+            logger.exception("保存 Pi 工具调用详情失败，继续执行当前任务")
+        _emit(self._callback, event)
+
+    def _record_start(self, event: ToolCallStartEvent) -> None:
+        call_id = event.call_id
+        if not call_id or call_id in self._pending:
+            return
+        session = self._session_store.get(self._session_id)
+        session.append_message(
+            "assistant",
+            "",
+            tool_calls=[
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {
+                        "name": event.tool_name,
+                        "arguments": json.dumps(event.args, ensure_ascii=False),
+                    },
+                }
+            ],
+        )
+        self._session_store.save(session, fsync=True)
+        self._pending[call_id] = event.tool_name
+
+    def _record_end(self, event: ToolCallEndEvent) -> None:
+        call_id = event.call_id
+        if not call_id or call_id not in self._pending:
+            return
+        tool_name = event.tool_name or self._pending.get(call_id, "pi_tool")
+        self._pending.pop(call_id, None)
+        if event.ok:
+            content = event.result or "(空结果)"
+        else:
+            content = json.dumps(
+                {
+                    "tool": tool_name,
+                    "ok": False,
+                    "result": f"错误: {event.error or '未知错误'}",
+                },
+                ensure_ascii=False,
+            )
+        session = self._session_store.get(self._session_id)
+        session.append_message(
+            "tool",
+            content,
+            tool_call_id=call_id,
+            name=tool_name,
+        )
+        self._session_store.save(session, fsync=True)
+
+    def finish_pending(self, reason: str) -> None:
+        """Close tool calls that Pi abandoned so stored history stays legal."""
+        for call_id, tool_name in list(self._pending.items()):
+            self(
+                ToolCallEndEvent(
+                    call_id=call_id,
+                    tool_name=tool_name,
+                    ok=False,
+                    error=reason,
+                )
+            )
 
 
 @dataclass(frozen=True)
@@ -53,6 +137,60 @@ class PiRuntimeConfig:
 
 def _truthy(value: str) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def default_agent_backend() -> str:
+    """Return the configured default used only for uninitialised sessions."""
+    backend = setting_value("AGENT_BACKEND", "sjtuclaw").strip().lower()
+    return backend if backend in _VALID_AGENT_BACKENDS else "sjtuclaw"
+
+
+def get_session_backend(session_store, session_id: str, *, persist: bool = True) -> str:
+    """Resolve and, when needed, freeze a session's independent backend."""
+    session = session_store.get(session_id)
+    backend = str(session.metadata.get(SESSION_BACKEND_KEY) or "").strip().lower()
+    if backend in _VALID_AGENT_BACKENDS:
+        return backend
+    backend = default_agent_backend()
+    if persist:
+        session.metadata[SESSION_BACKEND_KEY] = backend
+        session_store.save(session, fsync=True)
+    return backend
+
+
+def set_session_backend(session_store, session_id: str, backend: str) -> str:
+    """Persist a backend selection for exactly one session."""
+    normalized = backend.strip().lower()
+    if normalized not in _VALID_AGENT_BACKENDS:
+        raise ValueError(f"不支持的 Agent 后端: {backend}")
+    session = session_store.get(session_id)
+    current = str(session.metadata.get(SESSION_BACKEND_KEY) or "").strip().lower()
+    if current not in _VALID_AGENT_BACKENDS:
+        current = default_agent_backend()
+    if current != normalized and normalized == "pi":
+        # A previously used Pi process has not seen turns completed by the
+        # native backend. Start a fresh Pi branch so run_agent_turn performs
+        # an authoritative SJTUClaw history handoff instead of resuming stale
+        # Pi state.
+        session.metadata["pi_session_generation"] = secrets.token_hex(16)
+        session.metadata.pop("pi_session_owner", None)
+        session.metadata.pop("pi_initialized_generation", None)
+    session.metadata[SESSION_BACKEND_KEY] = normalized
+    session.touch()
+    session_store.save(session, fsync=True)
+    return normalized
+
+
+def initialize_session_backends(session_store) -> None:
+    """Freeze the current default for legacy sessions during migration."""
+    backend = default_agent_backend()
+    for summary in session_store.list_summaries():
+        session = session_store.get(summary.session_id)
+        current = str(session.metadata.get(SESSION_BACKEND_KEY) or "").strip().lower()
+        if current in _VALID_AGENT_BACKENDS:
+            continue
+        session.metadata[SESSION_BACKEND_KEY] = backend
+        session_store.save(session, fsync=True)
 
 
 def _default_pi_repo() -> Path:
@@ -258,6 +396,11 @@ class PiAgentClient(LLMClient):
 
         started = time.monotonic()
         runtime_files: dict[str, Path] = {}
+        tool_recorder = _PiToolMessageRecorder(
+            session_id,
+            session_store,
+            event_callback,
+        )
         try:
             runtime_files = self._write_runtime_files(
                 config,
@@ -276,13 +419,15 @@ class PiAgentClient(LLMClient):
                                    media=media, session_id=session_id, approval_handler=approval_handler,
                                    tool_registry=tool_registry,
                                    auto_mode=bool(auto_mode), unlimited_mode=bool(unlimited_mode),
-                                   event_callback=event_callback, cancel_event=cancel_event,
+                                   event_callback=tool_recorder, cancel_event=cancel_event,
                                    on_prompt_accepted=mark_pi_session_initialized)
         except Exception as exc:
             logger.exception("Pi Agent 本轮执行失败")
+            tool_recorder.finish_pending(f"Pi 工具调用未完成：{exc}")
             _emit(event_callback, ErrorEvent(error=str(exc)))
             result = f"Pi Agent 执行失败：{exc}"
         finally:
+            tool_recorder.finish_pending("Pi 工具调用未返回完成事件。")
             for path in runtime_files.values():
                 try:
                     path.unlink(missing_ok=True)
@@ -366,6 +511,10 @@ class PiAgentClient(LLMClient):
         threading.Thread(target=watch_cancel, daemon=True).start()
         deadline = time.monotonic() + config.turn_timeout_s
         accepted, streamed_text, last_assistant_text, last_error, settled = False, "", None, "", False
+        tool_started_at: dict[str, float] = {}
+        tool_names: dict[str, str] = {}
+        anonymous_tool_ids: list[str] = []
+        generated_tool_id = 0
         try:
             while time.monotonic() < deadline:
                 try:
@@ -398,14 +547,51 @@ class PiAgentClient(LLMClient):
                 elif kind == "agent_start":
                     _emit(event_callback, ThinkingEvent(iteration=1))
                 elif kind == "tool_execution_start":
-                    _emit(event_callback, ToolCallStartEvent(call_id=str(event.get("toolCallId") or ""),
-                          tool_name=str(event.get("toolName") or ""), args=event.get("args") or {}))
+                    call_id = str(event.get("toolCallId") or "")
+                    if not call_id:
+                        generated_tool_id += 1
+                        call_id = f"pi-tool-{generated_tool_id}"
+                        anonymous_tool_ids.append(call_id)
+                    tool_name = str(event.get("toolName") or "pi_tool")
+                    tool_started_at[call_id] = time.perf_counter()
+                    tool_names[call_id] = tool_name
+                    _emit(event_callback, ToolCallStartEvent(
+                        call_id=call_id,
+                        tool_name=tool_name,
+                        args=event.get("args") if isinstance(event.get("args"), dict) else {},
+                        iteration=1,
+                    ))
                 elif kind == "tool_execution_end":
+                    call_id = str(event.get("toolCallId") or "")
+                    event_tool_name = str(event.get("toolName") or "")
+                    if not call_id and anonymous_tool_ids:
+                        match_index = next(
+                            (
+                                index
+                                for index, pending_id in enumerate(anonymous_tool_ids)
+                                if not event_tool_name
+                                or tool_names.get(pending_id) == event_tool_name
+                            ),
+                            0,
+                        )
+                        call_id = anonymous_tool_ids.pop(match_index)
+                    tool_name = str(event.get("toolName") or tool_names.get(call_id) or "pi_tool")
                     content = self._content_text((event.get("result") or {}).get("content"))
                     failed = bool(event.get("isError"))
-                    _emit(event_callback, ToolCallEndEvent(call_id=str(event.get("toolCallId") or ""),
-                          tool_name=str(event.get("toolName") or ""), ok=not failed,
-                          result=None if failed else content, error=content if failed else None))
+                    started_at = tool_started_at.pop(call_id, None)
+                    tool_names.pop(call_id, None)
+                    duration_ms = (
+                        round((time.perf_counter() - started_at) * 1000, 2)
+                        if started_at is not None else 0.0
+                    )
+                    _emit(event_callback, ToolCallEndEvent(
+                        call_id=call_id,
+                        tool_name=tool_name,
+                        ok=not failed,
+                        result=None if failed else content,
+                        error=content if failed else None,
+                        duration_ms=duration_ms,
+                    ))
                 elif kind == "message_update":
                     delta = event.get("assistantMessageEvent") or {}
                     if delta.get("type") == "text_delta":
@@ -629,36 +815,93 @@ class PiAgentClient(LLMClient):
 
 
 class RuntimeAgentClient:
-    """Mutable client router shared by all CLI foreground/background jobs."""
+    """Route complete turns by session while keeping auxiliary LLM access."""
 
     def __init__(self, config: LLMConfig):
-        self._client = create_agent_client(config)
+        self._config = config
+        self._legacy_client = (
+            LLMClient(config)
+            if config.api_key and config.base_url and config.model
+            else None
+        )
+        self._pi_client = PiAgentClient(config)
 
     @property
     def config(self) -> LLMConfig:
-        return self._client.config
+        return self._config
 
     @property
     def configured(self) -> bool:
-        return callable(getattr(self._client, "run_agent_turn", None)) or bool(
-            self.config.api_key and self.config.base_url and self.config.model
+        return default_agent_backend() == "pi" or self._legacy_configured()
+
+    def _legacy_configured(self) -> bool:
+        return bool(self.config.api_key and self.config.base_url and self.config.model)
+
+    def backend_for_session(self, session_id: str, session_store) -> str:
+        return get_session_backend(session_store, session_id)
+
+    def configured_for_session(self, session_id: str, session_store) -> bool:
+        return (
+            self.backend_for_session(session_id, session_store) == "pi"
+            or self._legacy_configured()
         )
 
     def set_client(self, client) -> None:
-        self._client = client
+        """Compatibility hook for callers that refresh one concrete client."""
+        if isinstance(client, PiAgentClient):
+            self._pi_client = client
+        else:
+            self._legacy_client = client
+        self._config = client.config
 
     def chat(self, *args, **kwargs):
-        return self._client.chat(*args, **kwargs)
+        if self._legacy_client is None:
+            raise LLMError("辅助 LLM 未配置。")
+        return self._legacy_client.chat(*args, **kwargs)
 
     def chat_with_tools(self, *args, **kwargs):
-        return self._client.chat_with_tools(*args, **kwargs)
+        if self._legacy_client is None:
+            raise LLMError("辅助 LLM 未配置。")
+        return self._legacy_client.chat_with_tools(*args, **kwargs)
 
-    def __getattr__(self, name: str):
-        if name in {"run_agent_turn", "compact_session"}:
-            runner = getattr(self._client, name, None)
-            if callable(runner):
-                return runner
-        raise AttributeError(name)
+    def run_agent_turn(
+        self, session_id: str, user_message: str, *, session_store, **kwargs
+    ) -> str:
+        if self.backend_for_session(session_id, session_store) == "pi":
+            return self._pi_client.run_agent_turn(
+                session_id,
+                user_message,
+                session_store=session_store,
+                **kwargs,
+            )
+        if not self._legacy_configured():
+            raise LLMError("SJTUClaw 原生后端未配置完整的 LLM 连接信息。")
+        if self._legacy_client is None:
+            raise LLMError("SJTUClaw 原生后端客户端不可用。")
+        from claw.agent.loop import run_agent_turn as run_legacy_agent_turn
+
+        legacy_kwargs = dict(kwargs)
+        rollback_message_id = legacy_kwargs.pop("rollback_message_id", None)
+        rollback_checkpoint_id = legacy_kwargs.pop("rollback_checkpoint_id", None)
+        if rollback_message_id:
+            legacy_kwargs["_rollback_message_id"] = rollback_message_id
+        if rollback_checkpoint_id:
+            legacy_kwargs["_rollback_checkpoint_id"] = rollback_checkpoint_id
+        return run_legacy_agent_turn(
+            session_id,
+            user_message,
+            session_store=session_store,
+            llm_client=self._legacy_client,
+            **legacy_kwargs,
+        )
+
+    def compact_session(self, session_id: str, *, session_store) -> str:
+        if self.backend_for_session(session_id, session_store) != "pi":
+            raise PiError("当前 session 未启用 Pi，不能使用 Pi 原生压缩。")
+        return self._pi_client.compact_session(
+            session_id,
+            session_store=session_store,
+        )
 
 
 def create_agent_client(config: LLMConfig) -> LLMClient:
@@ -666,5 +909,5 @@ def create_agent_client(config: LLMConfig) -> LLMClient:
 
 
 def is_pi_backend() -> bool:
-    """Return whether the full Pi agent backend is selected."""
-    return setting_value("AGENT_BACKEND", "sjtuclaw").strip().lower() == "pi"
+    """Return whether Pi is the configured default for new sessions."""
+    return default_agent_backend() == "pi"

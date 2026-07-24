@@ -73,26 +73,22 @@ def run_repl(
     )
 
     def _switch_backend(target: str) -> str:
-        from claw.pi import PiAgentClient, create_agent_client, load_pi_config
-        from claw.runtime_settings import (
-            load_runtime_settings_raw,
-            replace_runtime_settings_raw,
-            setting_value,
-            update_runtime_settings,
-        )
+        from claw.pi import get_session_backend, load_pi_config, set_session_backend
 
-        current = setting_value("AGENT_BACKEND", "sjtuclaw").strip().lower()
+        current = get_session_backend(
+            state.session_store,
+            state.current_session_id,
+        )
         if target == "status":
-            return f"当前 Agent 后端：{'Pi' if current == 'pi' else 'SJTUClaw'}。"
+            return f"当前 session 的 Agent 后端：{'Pi' if current == 'pi' else 'SJTUClaw'}。"
         if target == current:
             if target == "pi":
                 try:
                     load_pi_config()
                 except Exception as exc:
                     return f"[错误] Pi Agent 运行环境不可用：{exc}"
-                return "Pi Agent 后端已连接，运行环境检查通过。"
-            return f"Agent 后端已经是 {'Pi' if target == 'pi' else 'SJTUClaw'}。"
-        previous = load_runtime_settings_raw()
+                return "当前 session 已启用 Pi，运行环境检查通过。"
+            return "当前 session 已使用 SJTUClaw 原生后端。"
         try:
             if target == "pi":
                 load_pi_config()
@@ -102,24 +98,18 @@ def run_repl(
                 and state.llm_config.model
             ):
                 raise RuntimeError("SJTUClaw 原生后端需要完整的 LLM API Key、Base URL 和模型配置")
-            update_runtime_settings({"AGENT_BACKEND": target})
-            next_client = create_agent_client(state.llm_config)
-            if target == "sjtuclaw" and isinstance(next_client, PiAgentClient):
-                raise RuntimeError("无法创建 SJTUClaw 原生客户端")
-            if state.compaction_worker is not None:
-                if target == "pi":
-                    state.compaction_worker.stop_idle_compaction()
-                else:
-                    state.compaction_worker.start_idle_compaction()
-            set_client = getattr(state.llm_client, "set_client", None)
-            if callable(set_client):
-                set_client(next_client)
-            else:
-                state.llm_client = next_client
+            set_session_backend(
+                state.session_store,
+                state.current_session_id,
+                target,
+            )
         except Exception as exc:
-            replace_runtime_settings_raw(previous)
-            return f"[错误] Agent 后端切换失败：{exc}"
-        return "已接入 Pi Agent 后端。" if target == "pi" else "已切回 SJTUClaw 原生后端。"
+            return f"[错误] 当前 session 的 Agent 后端切换失败：{exc}"
+        return (
+            "当前 session 已接入 Pi Agent 后端。"
+            if target == "pi"
+            else "当前 session 已切回 SJTUClaw 原生后端。"
+        )
 
     state.backend_switcher = _switch_backend
 

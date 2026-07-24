@@ -42,7 +42,7 @@ def skill_gateway(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(gateway, "_workspace_manager", workspaces)
     monkeypatch.setattr(gateway, "_rollback_manager", rollback)
     monkeypatch.setattr(gateway, "_pet_state", MagicMock())
-    monkeypatch.setattr(gateway, "_llm_ready", lambda: True)
+    monkeypatch.setattr(gateway, "_llm_ready", lambda *_args: True)
     with gateway._active_turns_lock:
         gateway._active_turns.clear()
     return TestClient(gateway.app), sessions
@@ -96,7 +96,7 @@ def test_gateway_explicit_skill_reports_missing_llm_without_leaking_marker(
     skill_gateway, monkeypatch
 ):
     client, _ = skill_gateway
-    monkeypatch.setattr(gateway, "_llm_ready", lambda: False)
+    monkeypatch.setattr(gateway, "_llm_ready", lambda *_args: False)
     monkeypatch.setattr(gateway, "_llm_missing_reply", lambda: "请先配置模型")
 
     response = client.post(

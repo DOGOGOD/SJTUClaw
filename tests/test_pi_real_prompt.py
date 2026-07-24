@@ -58,6 +58,31 @@ def test_real_pi_request_keeps_native_tool_prompt_and_adds_sjtu_tools(tmp_path):
                         "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
                     },
                 ]
+            elif len(requests) == 2:
+                chunks = [
+                    {
+                        "id": "local-test-read",
+                        "object": "chat.completion.chunk",
+                        "created": 1,
+                        "model": "verification-model",
+                        "choices": [{"index": 0, "delta": {
+                            "role": "assistant",
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": "call-read",
+                                "type": "function",
+                                "function": {"name": "read", "arguments": "{\"path\":\"README.md\",\"limit\":2}"},
+                            }],
+                        }, "finish_reason": None}],
+                    },
+                    {
+                        "id": "local-test-read",
+                        "object": "chat.completion.chunk",
+                        "created": 1,
+                        "model": "verification-model",
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+                    },
+                ]
             else:
                 chunks = [
                     {
@@ -168,8 +193,14 @@ def test_real_pi_request_keeps_native_tool_prompt_and_adds_sjtu_tools(tmp_path):
     assert "Use recall before answering questions" in system_text
     assert "SJTUCLAW_PROMPT_MARKER" in system_text
     assert {"read", "bash", "edit", "write", "recall"} <= tool_names
-    assert len(requests) == 2
+    assert len(requests) == 3
     assert any(
         message.get("role") == "tool" and "memory-hit:theme" in str(message.get("content"))
         for message in requests[1]["messages"]
+    )
+    # No approval handler is installed in this test. A guarded read would be
+    # rejected by the permission extension instead of returning file content.
+    assert any(
+        message.get("role") == "tool" and "# SJTUClaw" in str(message.get("content"))
+        for message in requests[2]["messages"]
     )

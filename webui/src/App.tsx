@@ -36,6 +36,7 @@ function Shell() {
   const [pendingApproval, setPendingApproval] = useState<ApprovalInfo | null>(null);
   const [autoMode, setAutoMode] = useState(false);
   const [unlimitedMode, setUnlimitedMode] = useState(false);
+  const [piMode, setPiMode] = useState(false);
   const [rollbackEnabled, setRollbackEnabled] = useState(false);
   const [rollingBack, setRollingBack] = useState(false);
   const [workspaceRefreshToken, setWorkspaceRefreshToken] = useState(0);
@@ -56,6 +57,7 @@ function Shell() {
       // user opens a new-chat draft; the new session starts with both off.
       setAutoMode(false);
       setUnlimitedMode(false);
+      setPiMode(false);
       setRollbackEnabled(false);
       return;
     }
@@ -65,6 +67,11 @@ function Shell() {
       return;
     }
     let cancelled = false;
+    // Never show badges inherited from the previously selected session while
+    // the new session's independent mode state is loading.
+    setAutoMode(false);
+    setUnlimitedMode(false);
+    setPiMode(false);
     setMessagesLoading(true);
     fetchMessages(activeSessionId)
       .then((d) => {
@@ -73,15 +80,22 @@ function Shell() {
           setMessages(d.messages || []);
           if (d.autoMode !== undefined) setAutoMode(!!d.autoMode);
           if (d.unlimitedMode !== undefined) setUnlimitedMode(!!d.unlimitedMode);
+          if (d.piMode !== undefined) setPiMode(!!d.piMode);
           setRollbackEnabled(!!d.rollback?.enabled);
         } else {
           setMessages([]);
+          setAutoMode(false);
+          setUnlimitedMode(false);
+          setPiMode(false);
         }
       })
       .catch((e) => {
         if (cancelled) return;
         console.error("Failed to load messages", e);
         setMessages([]);
+        setAutoMode(false);
+        setUnlimitedMode(false);
+        setPiMode(false);
       })
       .finally(() => { if (!cancelled) setMessagesLoading(false); });
     return () => { cancelled = true; };
@@ -99,6 +113,9 @@ function Shell() {
         if (cancelled) return;
         if (d.ok && d.messages) {
           setRollbackEnabled(!!d.rollback?.enabled);
+          if (d.autoMode !== undefined) setAutoMode(!!d.autoMode);
+          if (d.unlimitedMode !== undefined) setUnlimitedMode(!!d.unlimitedMode);
+          if (d.piMode !== undefined) setPiMode(!!d.piMode);
           setMessages((prev) => {
             // 仅在消息数量增加时更新，避免覆盖正在编辑或流式中的状态
             if (d.messages.length > prev.length) {
@@ -175,6 +192,7 @@ function Shell() {
         }
         sessionId = created.sessionId;
         freshlyCreatedSessionRef.current = sessionId;
+        if (created.piMode !== undefined) setPiMode(!!created.piMode);
         navigateToChat(sessionId);
       } catch (e) {
         console.error("Failed to create chat", e);
@@ -214,6 +232,7 @@ function Shell() {
           setMessages((prev) => [...prev, commandResult!]);
           if (d.autoMode !== undefined) setAutoMode(!!d.autoMode);
           if (d.unlimitedMode !== undefined) setUnlimitedMode(!!d.unlimitedMode);
+          if (d.piMode !== undefined) setPiMode(!!d.piMode);
         }
         if (d.actions?.includes("open_pet_settings")) {
           navigateToSettings("pet");
@@ -239,6 +258,7 @@ function Shell() {
           if (refreshed.ok) {
             setMessages(messagesAfterCommandRefresh(refreshed.messages || [], userMsg, commandResult));
             setRollbackEnabled(!!refreshed.rollback?.enabled);
+            if (refreshed.piMode !== undefined) setPiMode(!!refreshed.piMode);
           }
         }
         await refreshSessions();
@@ -293,6 +313,7 @@ function Shell() {
         }
         if ((d as any).autoMode !== undefined) setAutoMode(!!(d as any).autoMode);
         if ((d as any).unlimitedMode !== undefined) setUnlimitedMode(!!(d as any).unlimitedMode);
+        if (d.piMode !== undefined) setPiMode(!!d.piMode);
         if (d.title) updateTitle(sessionId, d.title);
       } else {
         // On failure, restore and re-fetch
@@ -449,6 +470,7 @@ function Shell() {
           sending={sending}
           autoMode={autoMode}
           unlimitedMode={unlimitedMode}
+          piMode={piMode}
           rollbackEnabled={rollbackEnabled}
           rollingBack={rollingBack}
           workspaceRefreshToken={workspaceRefreshToken}

@@ -90,7 +90,7 @@ export async function fetchSessions(): Promise<{ ok: boolean; sessions: import("
   return request("/sessions");
 }
 
-export async function createSession(): Promise<{ ok: boolean; sessionId: string; title: string }> {
+export async function createSession(): Promise<{ ok: boolean; sessionId: string; title: string; piMode?: boolean }> {
   return request("/sessions", { method: "POST", body: "{}" });
 }
 
@@ -109,7 +109,7 @@ export async function renameSession(sessionId: string, title: string): Promise<{
 
 export async function fetchMessages(sessionId: string): Promise<{
   ok: boolean; sessionId: string; messages: import("@/lib/types").ChatMessage[]; summary: string;
-  autoMode?: boolean; unlimitedMode?: boolean; rollback?: import("@/lib/types").RollbackStatus;
+  autoMode?: boolean; unlimitedMode?: boolean; piMode?: boolean; rollback?: import("@/lib/types").RollbackStatus;
 }> {
   return request(`/sessions/${encodeURIComponent(sessionId)}/messages`);
 }
@@ -216,6 +216,7 @@ export async function sendCommand(data: { sessionId: string; command: string }):
   switchToSessionId?: string;
   autoMode?: boolean;
   unlimitedMode?: boolean;
+  piMode?: boolean;
 }> {
   return request("/command", {
     method: "POST",

@@ -1,10 +1,14 @@
 # Secrets / local configuration
 .env
+.env.*
+!.env.example
 
 # Runtime data / persisted state
 data/
 log/
 /workspace/
+*.sqlite
+*.sqlite3
 
 # Python
 __pycache__/
@@ -12,6 +16,7 @@ __pycache__/
 *.pyo
 .pytest_cache/
 /.pytest-*/
+.pytest_tmp/
 .coverage
 .coverage.*
 coverage.xml
@@ -50,6 +55,9 @@ check.txt
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+# Local reports and test artifacts
+test-results/
 
 # Agent
 .claude

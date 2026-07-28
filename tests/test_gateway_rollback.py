@@ -118,6 +118,50 @@ def test_gateway_command_actions_cover_webui_navigation_and_compact(rollback_cli
     assert not sessions.exists("api-session")
 
 
+def test_auto_compaction_notice_is_visible_in_webui_history(rollback_client):
+    from claw.context.compaction import CompactionResult
+
+    client, sessions, _, _ = rollback_client
+    session = sessions.get("api-session")
+
+    gateway._publish_auto_compaction_notice(
+        session,
+        CompactionResult(
+            old_message_count=6,
+            recent_message_count=4,
+            summary="internal summary",
+        ),
+    )
+
+    response = client.get("/sessions/api-session/messages")
+    assert response.status_code == 200
+    notice = response.json()["messages"][-1]
+    assert notice["role"] == "assistant"
+    assert notice["command"] is True
+    assert notice["content"].startswith("自动压缩已完成")
+    assert "已压缩旧消息：6 条" in notice["content"]
+    assert "未截断正在进行的任务" in notice["content"]
+
+
+def test_compact_command_does_not_interrupt_active_task(rollback_client):
+    client, sessions, _, _ = rollback_client
+    before = sessions.get("api-session").revision
+    cancel_event = gateway._register_active_turn("api-session")
+    assert cancel_event is not None
+    try:
+        response = client.post(
+            "/command",
+            json={"sessionId": "api-session", "command": "/compact"},
+        )
+    finally:
+        gateway._unregister_active_turn("api-session", cancel_event)
+
+    assert response.status_code == 200
+    assert "为避免截断任务，本次未执行压缩" in response.json()["result"]
+    assert cancel_event.is_set() is False
+    assert sessions.get("api-session").revision == before
+
+
 def test_gateway_rollback_requires_workspace(rollback_client):
     client, _, _, _ = rollback_client
     response = client.post("/sessions/api-session/rollback/preview", json={})

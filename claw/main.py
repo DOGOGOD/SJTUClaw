@@ -22,6 +22,7 @@ from claw.config import (
     load_heartbeat_config,
 )
 from claw.context.builder import ContextBuilder
+from claw.context.compaction import format_compaction_brief
 from claw.context.compaction_worker import CompactionWorker
 from claw.scheduler.callbacks import (
     HeartbeatCallback,
@@ -110,6 +111,18 @@ def main() -> int:
             context_usage_ratio=config.context_usage_ratio,
         )
         compact_llm = LLMClient(compact_llm_config)
+    def _show_auto_compaction_completed(session, result) -> None:
+        # The worker finishes asynchronously, so print a self-contained block
+        # that remains understandable even if it appears beside the next
+        # terminal prompt.
+        print()
+        print(format_compaction_brief(
+            session.session_id,
+            result,
+            automatic=True,
+            include_summary=False,
+        ), flush=True)
+
     compaction_worker = CompactionWorker(
         client,
         session_store,
@@ -118,6 +131,7 @@ def main() -> int:
         session_filter=lambda session: (
             get_session_backend(session_store, session.session_id) != "pi"
         ),
+        on_complete=_show_auto_compaction_completed,
     )
 
     approval_manager = ApprovalManager()

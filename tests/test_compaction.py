@@ -190,6 +190,9 @@ class TestCompactionV2:
         )
         result = handle_command("/compact", state)
 
+        assert result.startswith("压缩简报")
+        assert "摘要预览：\nMANUAL_SUMMARY" in result
+        assert "未截断正在进行的任务" in result
         assert "Compacted session manual-compact." in result
         assert "Old messages: 2" in result
         loaded = store.get(session.session_id)
@@ -391,6 +394,89 @@ class TestCompactionV2:
         assert captured.err == ""
         assert llm.calls == 0
         assert session.last_consolidated == 0
+
+    def test_worker_reports_success_after_persist(self, ss):
+        from claw.config import CompactionConfig
+        from claw.context.compaction_worker import CompactionWorker
+
+        class SummaryLLM:
+            def chat(self, _messages):
+                return "AUTO_SUMMARY"
+
+        completed = []
+        worker = CompactionWorker(
+            SummaryLLM(),
+            ss,
+            config=CompactionConfig(
+                keep_recent_tokens=20,
+                keep_recent_messages_min=2,
+            ),
+            on_complete=lambda session, result: completed.append(
+                (
+                    session.session_id,
+                    result.old_message_count,
+                    result.recent_message_count,
+                    result.summary,
+                )
+            ),
+        )
+        session = ss.create_session(session_id="auto-complete-notice")
+        for index in range(8):
+            session.append_message(
+                "user" if index % 2 == 0 else "assistant",
+                f"message {index} " * 20,
+            )
+        ss.save(session)
+
+        assert worker.submit(session)
+        assert worker.wait(timeout=5)
+        assert completed == [
+            (
+                "auto-complete-notice",
+                session.last_consolidated,
+                2,
+                "AUTO_SUMMARY",
+            )
+        ]
+        assert ss.get(session.session_id).summary == "AUTO_SUMMARY"
+
+    def test_ui_only_notices_are_not_sent_to_summary_llm(self, ss):
+        from claw.context.compaction import compact_session
+
+        class RecordingLLM:
+            def __init__(self):
+                self.messages = []
+
+            def chat(self, messages):
+                self.messages = messages
+                return "SUMMARY_WITHOUT_NOTICE"
+
+        llm = RecordingLLM()
+        session = ss.create_session(session_id="skip-compaction-notice")
+        session.append_message(
+            "assistant",
+            "自动压缩已完成 SHOULD_NOT_REACH_LLM",
+            _command=True,
+            injected_event="compaction_notice",
+        )
+        for index in range(6):
+            session.append_message(
+                "user" if index % 2 == 0 else "assistant",
+                f"conversation-{index}",
+            )
+
+        result = compact_session(
+            session,
+            llm,
+            keep_recent_messages_min=2,
+            force=True,
+        )
+
+        assert result.summary == "SUMMARY_WITHOUT_NOTICE"
+        serialized_request = "\n".join(
+            message["content"] for message in llm.messages
+        )
+        assert "SHOULD_NOT_REACH_LLM" not in serialized_request
 
     def test_split_by_tokens(self):
         from claw.context.compaction import _find_split_index

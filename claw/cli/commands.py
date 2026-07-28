@@ -18,6 +18,7 @@ from claw.context.compaction import (
     KEEP_RECENT_MESSAGES_MIN,
     CompactionError,
     compact_and_persist,
+    format_compaction_brief,
 )
 from claw.llm.client import LLMClient
 from claw.memory.reflection import is_valid_reflection_time
@@ -810,14 +811,13 @@ def _handle_compact_command(state: RuntimeState) -> str:
             "已回退到 SJTUClaw 统一会话压缩。",
             "",
         ])
-    lines.extend([
-        f"Compacted session {session.session_id}.",
-        f"Old messages: {result.old_message_count}",
-        f"Recent messages: {result.recent_message_count}",
-        "Summary updated: yes",
-        "Summary:",
-        result.summary,
-    ])
+    lines.append(format_compaction_brief(session.session_id, result))
+    # Retain the original compact status line for terminal/API clients that
+    # used it as a lightweight success marker before structured briefs existed.
+    lines.append(f"\nCompacted session {session.session_id}.")
+    lines.append(f"Old messages: {result.old_message_count}")
+    lines.append(f"Recent messages: {result.recent_message_count}")
+    lines.append("Summary updated: yes")
     if outcome.save_error:
         lines.append(f"[警告] 压缩结果保存可能未成功: {outcome.save_error}")
     return "\n".join(lines)

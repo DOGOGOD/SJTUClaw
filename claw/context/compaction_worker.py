@@ -13,15 +13,20 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 from claw.config import CompactionConfig
 from claw.llm.client import LLMClient
 from claw.session.models import Session
 from claw.session.store import SessionStore, SessionStoreError
 
+if TYPE_CHECKING:
+    from claw.context.compaction import CompactionResult
+
 
 logger = logging.getLogger(__name__)
+
+CompactionCompletedCallback = Callable[[Session, "CompactionResult"], None]
 
 
 class CompactionWorker:
@@ -40,12 +45,14 @@ class CompactionWorker:
         compact_llm: LLMClient | None = None,
         config: CompactionConfig | None = None,
         session_filter: Callable[[Session], bool] | None = None,
+        on_complete: CompactionCompletedCallback | None = None,
     ):
         self._main_llm = main_llm
         self._session_store = session_store
         self._compact_llm = compact_llm or main_llm
         self._config = config or CompactionConfig()
         self._session_filter = session_filter
+        self._on_complete = on_complete
 
         self._lock = threading.Lock()
         self._running = False
@@ -200,3 +207,12 @@ class CompactionWorker:
             )
         except SessionStoreError as exc:
             logger.error("[compaction] 压缩完成但保存失败: %s", exc)
+            return
+
+        if self._on_complete is not None:
+            try:
+                self._on_complete(session, result)
+            except Exception:
+                # A display integration must never turn a successful
+                # compaction into a failed background task.
+                logger.exception("[compaction] 自动压缩完成通知发送失败")

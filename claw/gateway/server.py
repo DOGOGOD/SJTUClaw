@@ -56,6 +56,7 @@ from claw.config import (
     load_qq_config,
 )
 from claw.context.builder import ContextBuilder
+from claw.context.compaction import format_compaction_brief
 from claw.context.compaction_worker import CompactionWorker
 from claw.llm.client import LLMClient, LLMError
 from claw.pi import (
@@ -449,12 +450,32 @@ if _compact_cfg.model and (_compact_cfg.api_key or _config.api_key):
         context_usage_ratio=_config.context_usage_ratio,
     )
     _compact_llm = LLMClient(_compact_llm_config)
+
+
+def _publish_auto_compaction_notice(session, result) -> None:
+    """Persist a WebUI-visible notice without feeding it back to the LLM."""
+    notice = format_compaction_brief(
+        session.session_id,
+        result,
+        automatic=True,
+        include_summary=False,
+    )
+    session.append_message(
+        "assistant",
+        notice,
+        _command=True,
+        injected_event="compaction_notice",
+    )
+    _session_store.save(session)
+
+
 _compaction_worker = CompactionWorker(
     _llm_client,
     _session_store,
     compact_llm=_compact_llm,
     config=_compact_cfg,
     session_filter=lambda session: _session_backend(session.session_id) != "pi",
+    on_complete=_publish_auto_compaction_notice,
 )
 
 
@@ -1408,6 +1429,11 @@ def _execute_slash_command(
     sid = session_id or "default"
     mutation_session = _mutating_command_session(command, sid)
     if mutation_session is not None and _session_turn_active(mutation_session):
+        if command.split(maxsplit=1)[0].lower() == "/compact":
+            return (
+                "[错误] 当前任务正在运行；为避免截断任务，本次未执行压缩。"
+                "请等待任务完成后再执行 /compact。"
+            )
         return "[错误] 当前任务正在运行，请先停止任务后再修改运行配置。"
 
     def _stop_impl() -> str:

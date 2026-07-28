@@ -142,6 +142,33 @@ class CompactionOutcome:
     save_error: str | None
 
 
+def format_compaction_brief(
+    session_id: str,
+    result: CompactionResult,
+    *,
+    automatic: bool = False,
+    include_summary: bool = True,
+) -> str:
+    """Build the user-facing completion report shared by CLI and WebUI.
+
+    Automatic notices deliberately remain short.  Manual ``/compact`` calls
+    include the generated summary so users can verify which task state and
+    constraints will be carried forward.
+    """
+    heading = "自动压缩已完成" if automatic else "压缩简报"
+    lines = [
+        heading,
+        "- 状态：已完成",
+        f"- Session：{session_id}",
+        f"- 已压缩旧消息：{result.old_message_count} 条",
+        f"- 原样保留最近消息：{result.recent_message_count} 条",
+        "- 任务连续性：仅压缩完整旧轮次，未截断正在进行的任务",
+    ]
+    if include_summary:
+        lines.extend(["", "摘要预览：", result.summary])
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------------------
 # Threshold helpers
 # ---------------------------------------------------------------------------
@@ -177,6 +204,46 @@ def _align_split_to_user_boundary(
         if messages[index].role == "user":
             return index
     return 0
+
+
+def _find_compaction_split_index(
+    messages: list[Message],
+    *,
+    keep_recent_tokens: int,
+    keep_recent_messages_min: int,
+    force: bool,
+) -> tuple[int, int]:
+    """Return ``(raw_split_index, compactable_message_count)``.
+
+    Persisted command/notification messages exist only for UI continuity.
+    Excluding them from budget and retention calculations prevents completion
+    notices from changing when the next real conversation turn is compacted.
+    The returned raw index still advances over any such notices that precede
+    the first retained user message.
+    """
+    indexed_messages = [
+        (index, message)
+        for index, message in enumerate(messages)
+        if not message._command
+    ]
+    compactable_messages = [message for _, message in indexed_messages]
+    if len(compactable_messages) <= keep_recent_messages_min:
+        return 0, len(compactable_messages)
+
+    max_old = len(compactable_messages) - keep_recent_messages_min
+    logical_split = (
+        max_old
+        if force
+        else _find_split_index(compactable_messages, keep_recent_tokens)
+    )
+    logical_split = min(logical_split, max_old)
+    logical_split = _align_split_to_user_boundary(
+        compactable_messages,
+        logical_split,
+    )
+    if logical_split <= 0:
+        return 0, len(compactable_messages)
+    return indexed_messages[logical_split][0], len(compactable_messages)
 
 
 def _find_user_boundary_index(
@@ -236,11 +303,16 @@ def needs_compaction(
             return False
 
     unconsolidated = session.get_unconsolidated_messages()
-    if len(unconsolidated) <= KEEP_RECENT_MESSAGES_MIN:
+    context_messages = [
+        message for message in unconsolidated if not message._command
+    ]
+    if len(context_messages) <= KEEP_RECENT_MESSAGES_MIN:
         return False
 
     max_tok = max_message_tokens if max_message_tokens is not None else MAX_MESSAGE_TOKENS
-    message_tokens = count_tokens_for_messages(unconsolidated)
+    # UI-only command/notification messages are persisted in the transcript
+    # for display, but must not create context pressure by themselves.
+    message_tokens = count_tokens_for_messages(context_messages)
     if message_tokens > max_tok:
         return True
 
@@ -277,15 +349,16 @@ def has_compactable_prefix(
         if keep_recent_messages_min is not None
         else KEEP_RECENT_MESSAGES_MIN
     )
-    if len(messages) <= keep_min:
-        return False
-
-    max_old = len(messages) - keep_min
     keep_tok = (
         keep_recent_tokens if keep_recent_tokens is not None else KEEP_RECENT_TOKENS
     )
-    split_index = min(_find_split_index(messages, keep_tok), max_old)
-    return _align_split_to_user_boundary(messages, split_index) > 0
+    split_index, _ = _find_compaction_split_index(
+        messages,
+        keep_recent_tokens=keep_tok,
+        keep_recent_messages_min=keep_min,
+        force=False,
+    )
+    return split_index > 0
 
 
 # ---------------------------------------------------------------------------
@@ -327,21 +400,22 @@ def compact_session(
         else KEEP_RECENT_MESSAGES_MIN
     )
 
-    if len(messages) <= keep_min:
+    context_message_count = sum(not message._command for message in messages)
+    if context_message_count <= keep_min:
         raise CompactionNotNeeded(
-            f"当前 session 只有 {len(messages)} 条消息，"
+            f"当前 session 只有 {context_message_count} 条对话消息，"
             f"不超过保留窗口（{keep_min}），无需压缩。"
         )
 
-    # Enforce the minimum-message floor: never compact more than
-    # (len - keep_min) messages, even if token budget says otherwise.
-    max_old = len(messages) - keep_min
     keep_tok = (
         keep_recent_tokens if keep_recent_tokens is not None else KEEP_RECENT_TOKENS
     )
-    split_index = max_old if force else _find_split_index(messages, keep_tok)
-    split_index = min(split_index, max_old)
-    split_index = _align_split_to_user_boundary(messages, split_index)
+    split_index, _ = _find_compaction_split_index(
+        messages,
+        keep_recent_tokens=keep_tok,
+        keep_recent_messages_min=keep_min,
+        force=force,
+    )
 
     if split_index <= 0:
         if force:
@@ -354,7 +428,12 @@ def compact_session(
         )
 
     old_messages = messages[:split_index]
-    request_messages = _build_compaction_request(session.summary, old_messages)
+    summary_messages = [message for message in old_messages if not message._command]
+    if not summary_messages:
+        raise CompactionNotNeeded(
+            "当前 session 没有可安全压缩的完整旧对话轮次，无需压缩。"
+        )
+    request_messages = _build_compaction_request(session.summary, summary_messages)
 
     try:
         raw_summary = llm_client.chat(request_messages)

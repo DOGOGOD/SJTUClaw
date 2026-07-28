@@ -7,6 +7,7 @@ forwarded to the LLM as ordinary chat messages.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from contextlib import nullcontext
 from typing import Callable
@@ -66,6 +67,7 @@ _HELP_TEXT = (
     "  /rollback list            列出当前分支的可用回退点\n"
     "  /rollback status          查看回退状态\n"
     "  /rollback undo            撤销最近一次回退（开始新回合后失效）\n"
+    "  /rollback help            查看回退指令说明\n"
     "  /approvals               查看待审批操作\n"
     "  /approve [approvalId]    批准操作\n"
     "  /reject [approvalId]     拒绝操作\n"
@@ -92,8 +94,9 @@ _HELP_TEXT = (
     "  /unlimited               查看 UNLIMITED 状态和可用指令\n"
     "    status                   查看当前状态\n"
     "    on / off                 开启 / 关闭 UNLIMITED 模式\n"
-    "  /pi                      为当前 session 启用 Pi Agent 后端\n"
-    "    status                   查看当前 Agent 后端\n"
+    "  /pi                      查看 Pi 状态和可用指令\n"
+    "    on                       启用 Pi Agent 后端\n"
+    "    status                   查看 Pi 状态和可用指令\n"
     "    off                      切回 SJTUClaw 原生后端\n"
     "  /stop                    终止当前正在运行的 Agent 任务\n"
     "  /exit                    退出当前会话\n"
@@ -145,6 +148,7 @@ _HELP_MARKDOWN = """# SJTUClaw 可用指令
 - `/rollback list`：列出当前分支的可用回退点
 - `/rollback status`：查看回退状态
 - `/rollback undo`：撤销最近一次回退；开始新用户回合后 undo 失效
+- `/rollback help`：查看回退指令说明
 
 ## 审批
 
@@ -160,8 +164,8 @@ _HELP_MARKDOWN = """# SJTUClaw 可用指令
 - `/unlimited`：查看 UNLIMITED 状态和可用指令
   - `/unlimited status`：查看当前状态
   - `/unlimited on` / `/unlimited off`：开启或关闭 UNLIMITED 模式
-- `/pi` / `/pi on`：检查 Pi 运行环境并为当前 session 启用 Pi
-- `/pi status`：查看当前 session 的 Agent 后端
+- `/pi` / `/pi status`：查看当前 session 的 Agent 后端和可用指令
+- `/pi on`：检查 Pi 运行环境并为当前 session 启用 Pi
 - `/pi off`：仅将当前 session 切回 SJTUClaw 原生后端
 
 > **安全提示：** AUTO 模式只会自动批准 workspace 内的结构化文件写入；Shell 命令始终需要明确审批。UNLIMITED 模式下所有写入、覆盖、删除和 Shell 操作也都需要明确审批。
@@ -286,7 +290,7 @@ def handle_command(user_input: str, state: RuntimeState, *, markdown: bool = Fal
     if root == "/unlimited":
         return finish(_handle_unlimited_command(args, state, markdown=markdown))
     if root == "/pi":
-        return finish(_handle_pi_command(args, state))
+        return finish(_handle_pi_command(args, state, markdown=markdown))
     if root == "/help":
         if args:
             return finish("用法: /help")
@@ -302,16 +306,45 @@ def handle_command(user_input: str, state: RuntimeState, *, markdown: bool = Fal
     return finish(f"未知命令: {root}（输入 /help 查看可用指令）")
 
 
-def _handle_pi_command(args: list[str], state: RuntimeState) -> str:
-    """Switch only the current session's main agent backend."""
+def _handle_pi_command(
+    args: list[str], state: RuntimeState, *, markdown: bool = False
+) -> str:
+    """Inspect or explicitly switch the current session's agent backend."""
     if len(args) > 1:
         return "用法: /pi [on|off|status]"
-    action = args[0].lower() if args else "on"
+    action = args[0].lower() if args else "status"
+
+    if action in {"status", "show", "help", "?"}:
+        if state.backend_switcher is None:
+            status = "当前入口不支持读取 Agent 后端状态。"
+        else:
+            status = state.backend_switcher("status")
+        if markdown:
+            return (
+                "## Pi Agent 后端\n\n"
+                f"**{status}**\n\n"
+                "### 可用指令\n\n"
+                "- `/pi on`：检查运行环境并为当前 session 启用 Pi\n"
+                "- `/pi off`：将当前 session 切回 SJTUClaw 原生后端\n"
+                "- `/pi status`：查看当前状态和可用指令\n\n"
+                "> Pi 模式通过官方 RPC 接入 Pi coding agent，保留其工具循环、"
+                "Skills、自动压缩和持久会话，并继续使用 SJTUClaw 的界面与审批流程。"
+            )
+        return (
+            f"{status}\n\n"
+            "可用指令：\n"
+            "  /pi on      检查运行环境并为当前 session 启用 Pi\n"
+            "  /pi off     将当前 session 切回 SJTUClaw 原生后端\n"
+            "  /pi status  查看当前状态和可用指令\n\n"
+            "Pi 模式通过官方 RPC 接入 Pi coding agent，保留其工具循环、Skills、"
+            "自动压缩和持久会话，并继续使用 SJTUClaw 的界面与审批流程。"
+        )
+
     target = {
         "on": "pi", "enable": "pi",
         "off": "sjtuclaw", "disable": "sjtuclaw",
     }.get(action, action)
-    if target not in {"pi", "sjtuclaw", "status"}:
+    if target not in {"pi", "sjtuclaw"}:
         return "用法: /pi [on|off|status]"
     if state.backend_switcher is None:
         return "[错误] 当前入口不支持运行时切换 Agent 后端。"
@@ -332,6 +365,13 @@ def _format_command_markdown(result: str) -> str:
         if not stripped:
             formatted.append("")
             continue
+        if stripped in {
+            "用法:", "用法：", "可用指令:", "可用指令：",
+            "相关指令:", "相关指令：",
+        }:
+            formatted.append("### 可用指令")
+            formatted.append("")
+            continue
         if stripped.startswith("用法:") or stripped.startswith("用法："):
             usage = stripped.split(":", 1)[-1].strip() if ":" in stripped else stripped.split("：", 1)[-1].strip()
             formatted.append(f"**用法：** `{usage}`")
@@ -341,6 +381,11 @@ def _format_command_markdown(result: str) -> str:
             formatted.append("")
             continue
         indent = len(line) - len(line.lstrip())
+        usage_parts = re.split(r"\s{2,}", stripped, maxsplit=1)
+        if stripped.startswith("/") and len(usage_parts) == 2:
+            syntax, description = usage_parts
+            formatted.append(f"- `{syntax}`：{description}")
+            continue
         if indent >= 4:
             formatted.append(f"  - {stripped}")
         elif indent >= 1:
@@ -374,9 +419,17 @@ def parse_skill_invoke_result(result: str) -> tuple[str, str] | None:
 # -- /session ---------------------------------------------------------------
 
 
+_SESSION_USAGE = """用法:
+  /session new                  创建并切换到新会话
+  /session list                 列出所有会话和消息数量
+  /session switch <sessionId>   切换到指定会话
+  /session rename <id> <标题>   修改会话标题
+  /session delete <sessionId>   删除指定会话"""
+
+
 def _handle_session_command(args: list[str], state: RuntimeState) -> str:
-    if not args:
-        return "用法: /session <new|list|switch|rename|delete> ..."
+    if not args or args[0].lower() in {"help", "?"}:
+        return _SESSION_USAGE
 
     sub, rest = args[0], args[1:]
 
@@ -412,7 +465,7 @@ def _handle_session_command(args: list[str], state: RuntimeState) -> str:
             return "用法: /session delete <sessionId>"
         return _delete_session(rest[0], state)
 
-    return f"未知 /session 子命令: {sub}"
+    return f"未知 /session 子命令: {sub}\n\n{_SESSION_USAGE}"
 
 
 def _switch_session(session_id: str, state: RuntimeState) -> str:
@@ -504,9 +557,20 @@ def _format_session_list(state: RuntimeState) -> str:
 # -- /memory ------------------------------------------------------------
 
 
+_MEMORY_USAGE = """用法:
+  /memory add [选项] <内容>          添加一条长期记忆
+  /memory list [--category <类别>]   列出记忆，可按类别筛选
+  /memory search <关键词>            搜索相关记忆
+  /memory update <memoryId> <内容>   更新指定记忆
+  /memory delete <memoryId>          删除指定记忆
+  /memory status                     查看记忆数量统计
+
+添加选项: --category <类别>、--tags <t1,t2>、--importance <1-5>"""
+
+
 def _handle_memory_command(args: list[str], state: RuntimeState) -> str:
-    if not args:
-        return "用法: /memory <add|list|search|update|delete|status> ..."
+    if not args or args[0].lower() in {"help", "?"}:
+        return _MEMORY_USAGE
 
     sub = args[0]
 
@@ -538,7 +602,7 @@ def _handle_memory_command(args: list[str], state: RuntimeState) -> str:
             return "用法: /memory delete <memoryId>"
         return _delete_memory(args[1], state)
 
-    return f"未知 /memory 子命令: {sub}"
+    return f"未知 /memory 子命令: {sub}\n\n{_MEMORY_USAGE}"
 
 
 _MEMORY_ADD_USAGE = (
@@ -762,12 +826,20 @@ def _handle_compact_command(state: RuntimeState) -> str:
 # -- /workspace (Step 8) -------------------------------------------------
 
 
+_WORKSPACE_USAGE = """用法:
+  /workspace set <路径>   设置当前 session 的工作区并启用回退
+  /workspace show         查看当前工作区路径
+  /workspace unset        取消工作区并关闭 UNLIMITED 模式
+
+Workspace 用于限制文件操作范围；设置后会为每个用户回合创建回退点。"""
+
+
 def _handle_workspace_command(args: list[str], state: RuntimeState) -> str:
+    if not args or args[0].lower() in {"help", "?"}:
+        return _WORKSPACE_USAGE
+
     if state.workspace_manager is None:
         return "Workspace manager 未初始化。"
-
-    if not args:
-        return "用法: /workspace <set|show|unset> ..."
 
     sub = args[0]
     sid = state.current_session_id
@@ -824,10 +896,24 @@ def _handle_workspace_command(args: list[str], state: RuntimeState) -> str:
             return f"[错误] {exc}"
         return "Workspace 已取消设置，UNLIMITED 模式已关闭。"
 
-    return f"未知 /workspace 子命令: {sub}"
+    return f"未知 /workspace 子命令: {sub}\n\n{_WORKSPACE_USAGE}"
+
+
+_ROLLBACK_USAGE = """用法:
+  /rollback                  回退到上一条用户消息发送前
+  /rollback <n>              回退到倒数第 n 个用户回合之前
+  /rollback <checkpointId>   回退到指定检查点
+  /rollback list             列出当前分支的可用回退点
+  /rollback status           查看回退状态
+  /rollback undo             撤销最近一次回退
+  /rollback help             查看这些指令
+
+回退需要先设置 workspace；它会同时恢复会话和工作区文件。"""
 
 
 def _handle_rollback_command(args: list[str], state: RuntimeState) -> str:
+    if args and args[0].lower() in {"help", "?"}:
+        return _ROLLBACK_USAGE
     manager = state.rollback_manager
     if manager is None:
         return "Workspace 回退服务未初始化。"
@@ -878,6 +964,12 @@ def _handle_rollback_command(args: list[str], state: RuntimeState) -> str:
 # -- /approvals (list pending) ---------------------------------------------
 
 
+_APPROVAL_USAGE = """相关指令:
+  /approvals                  查看当前 session 的待审批操作
+  /approve [approvalId]       批准操作；仅有一项时可省略 ID
+  /reject [approvalId] [原因]  拒绝操作；仅有一项时可省略 ID"""
+
+
 def _handle_approvals_list(state: RuntimeState) -> str:
     if state.approval_manager is None:
         return "Approval manager 未初始化。"
@@ -885,7 +977,7 @@ def _handle_approvals_list(state: RuntimeState) -> str:
     pending = [r for r in state.approval_manager.get_pending()
                if r.session_id == state.current_session_id]
     if not pending:
-        return "当前没有待审批的操作。"
+        return f"当前没有待审批的操作。\n\n{_APPROVAL_USAGE}"
 
     lines = ["待审批操作:"]
     for r in pending:
@@ -899,7 +991,7 @@ def _handle_approvals_list(state: RuntimeState) -> str:
             for k, v in r.tool_args.items()
         }
         lines.append(f"    参数: {args_safe}")
-    lines.append("\n使用 /approve <approvalId> 批准，/reject <approvalId> [原因] 拒绝。")
+    lines.extend(["", _APPROVAL_USAGE])
     return "\n".join(lines)
 
 
@@ -966,16 +1058,25 @@ def _handle_reject(args: list[str], state: RuntimeState) -> str:
 # -- /skill (Step 9) -------------------------------------------------------
 
 
+_SKILL_USAGE = """用法:
+  /skill list                    列出可用 Skills 及其简介
+  /skill show <skill-name>       查看指定 Skill 的详细说明
+  /skill usage                   查看当前 session 的 Skill 使用记录
+  /skill <skill-name> <任务描述>   使用指定 Skill 执行任务
+
+Skill 是可复用的专业工作流；先用 /skill list 查看当前可用项。"""
+
+
 def _handle_skill_command(args: list[str], state: RuntimeState) -> str:
     """Handle /skill commands.  Returns either a plain result string or
     a special ``__SKILL_INVOKE__`` sentinel indicating that the caller
     should run an agent turn with the skill content pre-loaded.
     """
+    if not args or args[0].lower() in {"help", "?"}:
+        return _SKILL_USAGE
+
     if state.skill_registry is None:
         return "Skill registry 未初始化。"
-
-    if not args:
-        return "用法: /skill <list|show|usage|<skill-name> <task>> ..."
 
     sub = args[0]
 
@@ -1037,7 +1138,10 @@ def _handle_skill_command(args: list[str], state: RuntimeState) -> str:
     skill_name = sub
     skill = state.skill_registry.get_skill(skill_name)
     if skill is None:
-        return f"未找到 skill: \"{skill_name}\"。使用 /skill list 查看可用 skill。"
+        return (
+            f"未找到 skill: \"{skill_name}\"。使用 /skill list 查看可用 skill。\n\n"
+            f"{_SKILL_USAGE}"
+        )
 
     task = " ".join(args[1:]).strip()
     if not task:
@@ -1051,15 +1155,23 @@ def _handle_skill_command(args: list[str], state: RuntimeState) -> str:
 # -- /reflect (daily memory reflection) --------------------------------------
 
 
+_REFLECT_USAGE = """用法:
+  /reflect status        查看启用状态、执行时间和上次结果
+  /reflect enable        启用每日记忆反思
+  /reflect disable       禁用每日记忆反思
+  /reflect time <HH:MM>  设置每天执行时间
+  /reflect now           立即整理近期会话并提取长期记忆"""
+
+
 def _handle_reflect_command(args: list[str], state: RuntimeState) -> str:
     """Handle /reflect commands for daily memory reflection config."""
+    if not args or args[0].lower() in {"help", "?"}:
+        return _REFLECT_USAGE
+
     if state.reflection_manager is None:
         return "Reflection manager 未初始化。"
 
     mgr = state.reflection_manager
-
-    if not args:
-        return "用法: /reflect <status|enable|disable|time|now> ..."
 
     sub = args[0]
 
@@ -1122,18 +1234,29 @@ def _handle_reflect_command(args: list[str], state: RuntimeState) -> str:
         else:
             return f"❌ 反思失败: {result.get('error', '未知错误')}"
 
-    return f"未知 /reflect 子命令: {sub}"
+    return f"未知 /reflect 子命令: {sub}\n\n{_REFLECT_USAGE}"
 
 
 # -- /cron ------------------------------------------------------------------
 
 
+_CRON_USAGE = """用法:
+  /cron list                 列出所有定时作业
+  /cron status               查看 Cron 服务状态
+  /cron disable <jobId>      禁用指定作业
+  /cron enable <jobId>       启用指定作业
+  /cron delete <jobId>       删除指定作业"""
+
+
 def _handle_cron_command(args: list[str], state: RuntimeState) -> str:
     """Handle /cron commands."""
+    if not args:
+        return _CRON_USAGE
+
     if state.cron_service is None:
         return "Cron 服务未初始化。"
 
-    sub = args[0] if args else "list"
+    sub = args[0]
 
     if sub == "list":
         try:
@@ -1198,10 +1321,19 @@ def _handle_cron_command(args: list[str], state: RuntimeState) -> str:
             return f"无法删除受保护的系统作业: {args[1]}"
         return f"作业不存在: {args[1]}"
 
-    return f"用法: /cron <list|status|disable|enable|delete> ..."
+    return _CRON_USAGE
 
 
 # -- /pet -------------------------------------------------------------------
+
+
+_PET_USAGE = """用法:
+  /pet status                 查看运行状态和当前角色
+  /pet list                   列出所有可用宠物
+  /pet open                   开启桌面宠物
+  /pet close                  关闭桌面宠物
+  /pet select <petId>         切换宠物角色
+  /pet autostart <on|off>     设置是否随 Gateway 启动"""
 
 
 def _handle_pet_command(args: list[str], state: RuntimeState) -> str:
@@ -1223,7 +1355,7 @@ def _handle_pet_command(args: list[str], state: RuntimeState) -> str:
             f"  功能: {'已启用' if settings.enabled else '已关闭'}\n"
             f"  当前角色: {name} ({settings.selected_pet_id})\n"
             f"  随 Gateway 启动: {'是' if settings.launch_on_gateway_start else '否'}\n\n"
-            "用法: /pet <status|list|open|close|select|autostart>"
+            f"{_PET_USAGE}"
         )
 
     if sub == "list":
@@ -1277,7 +1409,7 @@ def _handle_pet_command(args: list[str], state: RuntimeState) -> str:
         catalog.update_settings(launch_on_gateway_start=enabled)
         return f"随 Gateway 启动已{'开启' if enabled else '关闭'}。"
 
-    return "用法: /pet <status|list|open|close|select|autostart>"
+    return f"未知 /pet 子命令: {sub}\n\n{_PET_USAGE}"
 
 # -- /auto ------------------------------------------------------------------
 

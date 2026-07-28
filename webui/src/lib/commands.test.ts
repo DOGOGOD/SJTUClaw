@@ -7,8 +7,9 @@ describe("desktop pet slash command", () => {
     expect(isSlashCommand("/pet open")).toBe(true);
   });
 
-  it("routes /pi backend switching through the command endpoint", () => {
+  it("routes /pi help and explicit backend switching through the command endpoint", () => {
     expect(isSlashCommand("/pi")).toBe(true);
+    expect(isSlashCommand("/pi on")).toBe(true);
     expect(isSlashCommand("/pi status")).toBe(true);
     expect(isSlashCommand("/pi off")).toBe(true);
   });

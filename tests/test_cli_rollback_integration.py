@@ -77,7 +77,6 @@ def test_real_cli_workspace_rollback_flow(tmp_path: Path):
             "LLM_MODEL": "cli-test-model",
             "LLM_MAX_RETRIES": "0",
             "HEARTBEAT_ENABLED": "false",
-            "COMPACT_IDLE_TTL_MINUTES": "0",
             "PYTHONUTF8": "1",
         })
         completed = subprocess.run(

@@ -403,16 +403,13 @@ def test_apply_runtime_config_accepts_pi_without_legacy_credentials(monkeypatch)
         "consolidationRatio": 0.5,
     }
     configured = []
-    stopped = []
     monkeypatch.setattr(server, "_llm_settings_payload", lambda: settings)
     monkeypatch.setattr(server, "setting_value", lambda *_args: "")
     monkeypatch.setattr(server._llm_client, "set_config", configured.append)
-    monkeypatch.setattr(server._compaction_worker, "stop_idle_compaction", lambda: stopped.append(True))
 
     server._apply_llm_runtime_config()
 
     assert configured and configured[0].api_key == ""
-    assert stopped == [True]
 
 
 def test_settings_reject_invalid_pi_thinking_before_applying_runtime():
@@ -547,7 +544,7 @@ def test_pi_host_tool_bridge_rejects_spoofed_token():
     assert response == {"ok": False, "result": "SJTUClaw 工具桥接认证失败。"}
 
 
-def test_pi_slash_command_switches_backend_through_runtime_callback(tmp_path):
+def test_pi_slash_command_only_switches_backend_when_explicit(tmp_path):
     from claw.cli.commands import RuntimeState, handle_command, is_command
     from claw.memory.store import MemoryStore
 
@@ -561,10 +558,11 @@ def test_pi_slash_command_switches_backend_through_runtime_callback(tmp_path):
     )
 
     assert is_command("/pi") is True
-    assert handle_command("/pi", state) == "switched:pi"
-    assert handle_command("/pi status", state) == "switched:status"
+    assert "可用指令" in handle_command("/pi", state)
+    assert "可用指令" in handle_command("/pi status", state)
+    assert handle_command("/pi on", state) == "switched:pi"
     assert handle_command("/pi off", state) == "switched:sjtuclaw"
-    assert calls == ["pi", "status", "sjtuclaw"]
+    assert calls == ["status", "status", "pi", "sjtuclaw"]
 
 
 def test_gateway_pi_command_is_isolated_to_current_session(tmp_path, monkeypatch):
@@ -587,8 +585,11 @@ def test_gateway_pi_command_is_isolated_to_current_session(tmp_path, monkeypatch
     )
     monkeypatch.setattr(pi_module, "load_pi_config", lambda: object())
 
-    result = server._execute_slash_command("/pi", "pi-command-a")
+    info = server._execute_slash_command("/pi", "pi-command-a")
 
+    assert "可用指令" in info
+    assert get_session_backend(store, "pi-command-a") == "sjtuclaw"
+    result = server._execute_slash_command("/pi on", "pi-command-a")
     assert "当前 session 已接入 Pi" in result
     assert get_session_backend(store, "pi-command-a") == "pi"
     assert get_session_backend(store, "pi-command-b") == "sjtuclaw"

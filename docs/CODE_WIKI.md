@@ -29,7 +29,22 @@
   - [8.3 Reflect 每日反思](#83-reflect-每日反思)
   - [8.4 Auto 与 Unlimited 模式](#84-auto-与-unlimited-模式)
   - [8.5 Pi Agent 接入](#85-pi-agent-接入)
-- [九、测试体系](#九测试体系)
+- [九、核心运行机制与模块关系](#九核心运行机制与模块关系)
+  - [9.1 状态归属与隔离总表](#91-状态归属与隔离总表)
+  - [9.2 Session 隔离](#92-session-隔离)
+  - [9.3 Agent Loop](#93-agent-loop)
+  - [9.4 Compaction 系统](#94-compaction-系统)
+  - [9.5 Memory 系统](#95-memory-系统)
+  - [9.6 Tool 系统](#96-tool-系统)
+  - [9.7 Workspace 系统](#97-workspace-系统)
+  - [9.8 Skill 系统](#98-skill-系统)
+  - [9.9 Cron 系统](#99-cron-系统)
+  - [9.10 Gateway](#910-gateway)
+  - [9.11 Rollback](#911-rollback)
+  - [9.12 AUTO 与 UNLIMITED 模式](#912-auto-与-unlimited-模式)
+  - [9.13 Pi 后端切换](#913-pi-后端切换)
+  - [9.14 端到端流程与模块协作](#914-端到端流程与模块协作)
+- [十、测试体系](#十测试体系)
 
 ---
 
@@ -39,7 +54,7 @@ SJTUClaw 是面向个人与教学场景的本地 AI Agent Runtime。它将多轮
 
 **核心特征：**
 
-- **统一 Agent Loop**：CLI / Web UI / QQ Bot / Heartbeat / Cron 共享同一个 `run_agent_turn()` 入口，绝不绕过底层 runtime。
+- **统一主对话入口**：CLI / Web UI / QQ Bot / Heartbeat / Cron 的完整 turn 共享 `run_agent_turn()`；摘要、反思、标题等辅助 LLM 任务有各自的受控调用链。
 - **可选 Pi Agent 后端**：通过 JSONL RPC 接入 Pi 编码 Agent，按 session 切换后端。
 - **安全审批**：写入/Shell 等高风险工具必须审批，AUTO/UNLIMITED 模式按 session 隔离生效。
 - **三层 Token 安全网**：`ContextBudget.check_overflow` → `ContextGovernor._snip_history` → `compaction.maybe_consolidate_by_tokens`。
@@ -80,7 +95,7 @@ SJTUClaw 是面向个人与教学场景的本地 AI Agent Runtime。它将多轮
 │                       Agent Runtime 核心层                          │
 │                                                                    │
 │   ┌──────────────────────────────────────────────────────────────┐ │
-│   │      run_agent_turn()  ← 唯一调用 LLM 的入口                  │ │
+│   │      run_agent_turn()  ← 主对话 turn 的统一入口               │ │
 │   │      位置: claw/agent/loop.py                                │ │
 │   └──────────────────────────────────────────────────────────────┘ │
 │                             │                                      │
@@ -122,7 +137,11 @@ SJTUClaw 是面向个人与教学场景的本地 AI Agent Runtime。它将多轮
         │
         ├─ 若有 rollback_manager: turn_guard 创建 workspace 检查点
         │
-        ├─ while True (Think-Act-Observe 循环):
+        ├─ RuntimeAgentClient 按 session.metadata.agent_backend 分流
+        │     ├─ sjtuclaw → 原生 Think-Act-Observe 循环
+        │     └─ pi       → Pi JSONL RPC 完整 turn
+        │
+        ├─ 原生后端 while True (Think-Act-Observe 循环):
         │     │
         │     ├─ context_builder.build_messages(session, tool_registry)
         │     │     → 装配 system_prompt + soul + memory + skill_index
@@ -199,14 +218,14 @@ SJTUClaw/
 
 ### 3.1 `claw/agent/` — Agent 主循环
 
-| 文件 | 行数 | 职责 |
-|------|------|------|
-| `loop.py` | ~1800 | **唯一调用 LLM 的入口**。实现 Think-Act-Observe 循环、skill 选择、审批门、停滞检测、健康告警、Pi 后端短路。 |
-| `turn_context.py` | 95 | `TurnContext` dataclass，打包单轮所需状态（budget、metrics、rejection_tracker）。 |
-| `budget.py` | 87 | 线程安全的 `IterationBudget`，限制单 turn 迭代次数。 |
-| `events.py` | 60 | 5 类事件 dataclass：`ThinkingEvent`、`ToolCallStartEvent`、`ToolCallEndEvent`、`FinalEvent`、`ErrorEvent`，驱动 SSE。 |
-| `metrics.py` | - | `TurnMetrics` + `TurnMetricsAggregator`，聚合诊断指标。 |
-| `health.py` | - | `LoopHealthMonitor`，检测 LLM 失败率、工具异常等健康问题。 |
+| 文件 | 职责 |
+|------|------|
+| `loop.py` | **主对话 turn 的统一入口**。实现 Think-Act-Observe 循环、skill 选择、审批门、停滞检测、健康告警和完整后端分流。 |
+| `turn_context.py` | `TurnContext` dataclass，打包单轮所需状态（budget、metrics、rejection_tracker）。 |
+| `budget.py` | 线程安全的 `IterationBudget`，限制单 turn 迭代次数。 |
+| `events.py` | 5 类事件 dataclass：`ThinkingEvent`、`ToolCallStartEvent`、`ToolCallEndEvent`、`FinalEvent`、`ErrorEvent`，驱动 SSE。 |
+| `metrics.py` | `TurnMetrics` + `TurnMetricsAggregator`，聚合诊断指标。 |
+| `health.py` | `LoopHealthMonitor`，检测 LLM 失败率、工具异常等健康问题。 |
 
 ### 3.2 `claw/session/` — 会话存储
 
@@ -227,9 +246,9 @@ SJTUClaw/
 
 | 文件 | 职责 |
 |------|------|
-| `builder.py` | `ContextBuilder`：**唯一负责组装发往 LLM 的 messages 数组**。装配顺序：identity → soul → memory block → tool contract → skill index → summary → recent messages。 |
-| `compaction.py` | 历史压缩核心：`compact_session`、`compact_session_snapshot`、`maybe_consolidate_by_tokens`、`compact_idle_session`。失败不丢消息。 |
-| `compaction_worker.py` | `CompactionWorker`：后台线程压缩，revision 守卫防止 ABA 问题。 |
+| `builder.py` | `ContextBuilder`：负责组装原生主循环发往 LLM 的 messages 数组。装配顺序：identity → soul → memory block → tool contract → skill index → summary → recent messages；Pi 和辅助 LLM 任务有各自的受控 prompt 路径。 |
+| `compaction.py` | 历史压缩核心：`compact_session`、`compact_session_snapshot`、`maybe_consolidate_by_tokens`。失败不丢消息。 |
+| `compaction_worker.py` | `CompactionWorker`：仅在 token 阈值到达后执行后台压缩，revision 守卫防止 ABA 问题。 |
 | `budget.py` | `ContextBudget`：不可变 token 预算快照，>105% 抛 `ContextOverflowError`。 |
 | `governance.py` | `ContextGovernor`：发送前 8 步修复流水线（去占位、补缺失 tool result、截断、实时压缩）。 |
 | `token_counter.py` | 全代码库 token 估算唯一真相源：tiktoken `o200k_base` + CJK 启发式回退。 |
@@ -254,7 +273,7 @@ SJTUClaw/
 
 | 文件 | 职责 |
 |------|------|
-| `server.py` | 3347 行核心枢纽：FastAPI app、模块级单例、所有 REST 路由、SSE 流、QQ 桥接、审批 HTTP 端点。 |
+| `server.py` | Gateway 核心枢纽：FastAPI app、模块级单例、REST 路由、SSE 流、QQ 桥接、审批 HTTP 端点。 |
 | `middleware.py` | 4 个中间件：Security（Token）、RateLimit（滑动窗口）、RequestSize（chunk 计数）、RequestLogging。 |
 | `uploads.py` | `save_upload_limited`：流式 chunk 写入 + 超限回滚。 |
 | `__main__.py` | Gateway 启动入口，监听非本机地址时强制要求 `GATEWAY_API_TOKEN`。 |
@@ -263,7 +282,7 @@ SJTUClaw/
 
 | 文件 | 职责 |
 |------|------|
-| `service.py` | 2716 行：`CronService` 支持 at/every/cron 三种调度、run_claim at-most-once、依赖注入、输出持久化。 |
+| `service.py` | `CronService` 支持 at/every/cron 三种调度、run_claim at-most-once、依赖注入、输出持久化。 |
 | `dispatcher.py` | `create_cron_dispatcher`：返回 dispatch 闭包，通过 hooks 解耦渠道差异。 |
 | `callbacks.py` | `HeartbeatCallback`：扫描 `workspace/HEARTBEAT.md` 活动任务并触发 agent loop。 |
 | `types.py` | `CronJob` / `CronSchedule` / `CronPayload` / `CronRunRecord` / `CronStore` dataclass。 |
@@ -274,7 +293,7 @@ SJTUClaw/
 | 文件 | 职责 |
 |------|------|
 | `manager.py` | `WorkspaceManager`：per-session 绑定、unlimited 模式、路径解析与越界检测。 |
-| `rollback.py` | 931 行：`WorkspaceRollbackManager` 基于 SHA-256 对象存储 + SQLite 元数据，两阶段提交回退。 |
+| `rollback.py` | `WorkspaceRollbackManager` 基于 SHA-256 对象存储 + SQLite 元数据，两阶段提交回退。 |
 
 ### 3.9 `claw/approval/` — 审批管理
 
@@ -314,9 +333,9 @@ SJTUClaw/
 
 | 文件 | 职责 |
 |------|------|
-| `main.py` | `sjtuclaw` CLI 入口：`setup` / `gateway` / `chat` 子命令。 |
+| `main.py` | `sjtuclaw` CLI 入口：`setup` / `gateway` / `chat` 子命令；setup 以合并写入方式配置 LLM、联网/时区、Gateway、可选 Pi 参数、高级参数和 QQ。 |
 | `repl.py` | `run_repl`：交互式多轮对话主循环，注入所有依赖。 |
-| `commands.py` | 18 种斜杠命令分发，`RuntimeState` dataclass 贯穿全局。 |
+| `commands.py` | 斜杠命令识别与分发，`RuntimeState` dataclass 贯穿全局。 |
 
 ### 3.14 `claw/channels/` — 外部渠道
 
@@ -700,7 +719,7 @@ class LLMClient:
 #### 7.1.2 多轮对话 Loop（Step 1）
 
 - **入口**：[claw/cli/repl.py](file:///c:/Users/GZQ/Desktop/SJTUClaw/SJTUClaw/claw/cli/repl.py) 的 `run_repl()` 持续读取用户输入，识别 `/exit` 退出命令，普通消息调用 `run_agent_turn()`。
-- **历史维护**：每轮把 user 输入和 assistant 回复追加到当前 session，下次请求时通过 `ContextBuilder.build_messages()` 把完整历史发给 LLM。
+- **历史维护**：每轮把 user 输入和 assistant 回复追加到当前 session；下次请求时由 `ContextBuilder.build_messages()` 发送 summary 与当前未压缩窗口，原始历史仍完整保存在 Session 中。
 - **职责分离**：CLI 只负责 IO，LLM 调用逻辑全部在 `agent/loop.py`。
 
 ```python
@@ -768,7 +787,7 @@ class SessionStore:
 
 **核心文件**：[claw/agent/loop.py](file:///c:/Users/GZQ/Desktop/SJTUClaw/SJTUClaw/claw/agent/loop.py)
 
-`run_agent_turn()` 是整个系统**唯一调用 LLM 的入口**。CLI、Gateway、Scheduler、QQ Bot、Heartbeat 都必须路由到这里。
+`run_agent_turn()` 是整个系统**主对话 turn 的统一入口**。CLI、Gateway、Scheduler、QQ Bot、Heartbeat 都必须路由到这里；Compaction、Reflection、自动标题等辅助任务可以调用各自的辅助 LLM 路径，但不能伪造主对话 turn。
 
 #### 7.2.1 Think-Act-Observe 循环
 
@@ -793,8 +812,9 @@ while True:
                 _handle_skill_select(tc.args, ...)
             elif tc.safety_level in {"write", "shell"}:
                 # 写/Shell: 创建 approval → 等待用户决定
-                if auto_mode and not unlimited_mode:
-                    pass  # AUTO 模式自动批准
+                force_approval = unlimited_mode or tc.safety_level == "shell"
+                if auto_mode and not force_approval:
+                    pass  # 仅 workspace 内的结构化 write 自动放行
                 else:
                     req = _make_approval_request(...)
                     decided = approval_handler(req)
@@ -817,7 +837,7 @@ while True:
 
 #### 7.2.3 Pi 后端短路
 
-如果 `llm_client` 暴露了 `run_agent_turn` 方法（即 `PiAgentClient`），直接把整个 turn 委托给它，绕过本循环逻辑（[claw/agent/loop.py](file:///c:/Users/GZQ/Desktop/SJTUClaw/SJTUClaw/claw/agent/loop.py#L499-L512)）。
+如果 `llm_client` 暴露了完整 turn 方法，则先把 turn 委托给它。生产运行时使用 `RuntimeAgentClient` 按 Session 后端分流：Pi 交给 `PiAgentClient`，原生后端则以普通 `LLMClient` 重新进入 Think-Act-Observe 循环。
 
 #### 7.2.4 事件流
 
@@ -841,7 +861,7 @@ class ErrorEvent(TurnEvent):         error: str
 
 **核心文件**：[claw/context/builder.py](file:///c:/Users/GZQ/Desktop/SJTUClaw/SJTUClaw/claw/context/builder.py)
 
-`ContextBuilder` 是**唯一负责组装发往 LLM 的 messages 数组**的模块。CLI 和 LLMClient 都不允许自行构建。
+`ContextBuilder` 是**原生主循环 messages 的统一装配模块**。CLI 和 Gateway 不自行构建主对话 messages；Pi 的 handoff/runtime prompt，以及 Compaction、Reflection、标题等辅助任务，使用各自的专用构建逻辑。
 
 #### 7.3.1 装配顺序
 
@@ -909,7 +929,13 @@ def needs_compaction(session, *, max_message_tokens=None, ...) -> bool:
     都受 KEEP_RECENT_MESSAGES_MIN 下限保护。
     失败冷却：10 分钟内直接返回 False。
     """
+
+def has_compactable_prefix(session, ...) -> bool:
+    """确认保留窗口之外存在可安全归档的完整旧对话轮次。"""
 ```
+
+运行时只保留两种触发方式：每轮完成后的 token 阈值自动压缩，以及用户显式执行
+`/compact` 的手动压缩。会话空闲不会触发压缩。
 
 #### 7.4.2 压缩流程
 
@@ -944,17 +970,14 @@ class CompactionWorker:
         # daemon 线程执行 _do_compact
     
     def _do_compact(self, session, snapshot_messages, ...):
+        # CompactionNotNeeded 是正常跳过，不重试、不输出失败信息
         # revision 守卫：防止 ABA 问题
         # 压缩期间用户回滚后发新消息，旧摘要对应的旧消息已不存在
         # 应用结果前再次加锁，检查 session.revision != snapshot_revision
         # 不一致则丢弃过期结果
 ```
 
-#### 7.4.4 空闲压缩
-
-`start_idle_compaction()` 启动后台线程，2 分钟轮询一次，对超 `idle_ttl_minutes` 的 session 调用 `compact_idle_session` 硬截断（保留最近 8 条消息）。
-
-#### 7.4.5 手动压缩命令
+#### 7.4.4 手动压缩命令
 
 `/compact` 命令立即压缩当前 session，`force=True` 绕过 token 预算检查。
 
@@ -1177,7 +1200,7 @@ def _resolve_public_target(url, address_index=0):
 
 #### 7.7.1 Gateway Server
 
-**核心文件**：[claw/gateway/server.py](file:///c:/Users/GZQ/Desktop/SJTUClaw/SJTUClaw/claw/gateway/server.py)（3347 行）
+**核心文件**：`claw/gateway/server.py`
 
 模块级单例在 import 时初始化所有核心组件：
 
@@ -1271,7 +1294,7 @@ data/sessions/<sessionId>/attachments/
 
 ### 7.8 Cron 定时任务系统（Step 7）
 
-**核心文件**：[claw/scheduler/service.py](file:///c:/Users/GZQ/Desktop/SJTUClaw/SJTUClaw/claw/scheduler/service.py)（2716 行）
+**核心文件**：`claw/scheduler/service.py`
 
 #### 7.8.1 任务类型
 
@@ -1762,7 +1785,7 @@ class PetProcessManager:
 
 ### 8.2 Rollback 工作区回退
 
-**核心文件**：[claw/workspace/rollback.py](file:///c:/Users/GZQ/Desktop/SJTUClaw/SJTUClaw/claw/workspace/rollback.py)（931 行）
+**核心文件**：`claw/workspace/rollback.py`
 
 为 Session 设置 workspace 后，系统自动在每次用户消息执行前创建检查点，支持原子性恢复 workspace 文件和对话状态。
 
@@ -2032,7 +2055,7 @@ if tc.safety_level in _APPROVAL_REQUIRED_LEVELS:  # {"write", "shell"}
 
 ### 8.5 Pi Agent 接入
 
-**核心文件**：[claw/pi/client.py](file:///c:/Users/GZQ/Desktop/SJTUClaw/SJTUClaw/claw/pi/client.py)（~1000 行）+ 3 个 TypeScript 扩展
+**核心文件**：`claw/pi/client.py` + 3 个 TypeScript 扩展
 
 SJTUClaw 通过官方 JSONL RPC 接入 Pi 编码 Agent，保留其模型提供商、工具循环、Skills、Extensions、自动压缩、重试和持久会话，同时沿用 SJTUClaw 的界面、渠道与审批体验。
 
@@ -2168,9 +2191,630 @@ SJTUClaw/
 
 ---
 
-## 九、测试体系
+## 九、核心运行机制与模块关系
 
-### 9.1 后端测试
+本章不再按目录逐个介绍文件，而是从“状态保存在哪里、一次请求如何流动、各模块如何互相约束”三个角度解释运行时。阅读本章时应先区分三类调用：
+
+1. **主对话 turn**：用户消息、Cron、Heartbeat、QQ 等入口最终都进入 `claw.agent.loop.run_agent_turn()`，并由它统一处理回退检查点、会话写入、工具循环、审批、事件和最终回复。
+2. **后端完整 turn**：`RuntimeAgentClient` 可以把主对话 turn 路由给 SJTUClaw 原生循环，也可以交给 Pi 自己完成完整工具循环。
+3. **辅助 LLM 任务**：Compaction、Reflection、自动标题等不属于主对话 turn，可以通过 `chat()` 使用辅助 LLM；它们不能伪造用户 turn，也不能绕过各自的持久化和并发守卫。
+
+### 9.1 状态归属与隔离总表
+
+理解系统关系的关键不是“是否存在全局单例”，而是“单例内部的数据以什么键隔离”。Gateway 确实只创建一套 Store、Registry 和 Service，但其中大多数可变状态都以 `session_id` 为键。
+
+| 状态 | 归属/隔离粒度 | 持久化位置 | 并发与安全边界 |
+|------|---------------|------------|----------------|
+| 对话消息、摘要、后端选择 | 每个 Session | `data/sessions/<encoded-id>.jsonl` | per-session 线程锁 + 文件锁 + 原子替换 |
+| 当前活动 turn | 每个 Session | 仅内存 | 同一 Session 拒绝并发 turn，不同 Session 可并行 |
+| 附件 | 每个 Session | `data/sessions/<session-id>/attachments/` | 解析时校验附件所属 Session |
+| Workspace 绑定 | 每个 Session | `data/workspace/bindings.json` | 合并写入 + 文件锁；路径解析强制边界 |
+| AUTO 状态 | 每个 Session | 仅内存 | Gateway/CLI 分别维护映射，重启后关闭 |
+| UNLIMITED 状态 | 每个 Session | 仅内存 | `WorkspaceManager` 内集合，重启后关闭 |
+| Pi/SJTUClaw 后端 | 每个 Session | Session metadata | 切换到 Pi 时旋转 generation |
+| 回退检查点 | Session + Workspace generation | `data/workspace/rollback/` | Session 锁 + 规范化 workspace 根锁 |
+| Cron 任务 | 每个 Job，payload 引用 Session | `data/cron/jobs.json` 及输出目录 | claim 先持久化，再执行回调 |
+| Skill 定义 | Runtime 全局 | `skills/**/SKILL.md` | 热重载；使用记录另存 |
+| Memory | Runtime 全局、跨 Session 共享 | `data/memory/<category>/<slug>.md` | 原子写；记录 `source_session_id` 来源 |
+| ToolRegistry | Runtime 全局 | 不持久化 | 每次执行通过 ContextVar 绑定当前 turn |
+| CompactionWorker | Runtime 全局单 worker | 结果写回 Session | Session revision 守卫拒绝过期摘要 |
+
+因此，“Session 隔离”并不意味着所有信息都禁止跨 Session：对话、workspace、模式、附件和后端严格按 Session 隔离；Memory 和 Skill 则是有意设计成全局知识层。它们通过来源标记、显式检索和只读索引进入当前上下文，而不是把另一个 Session 的原始对话直接拼入当前 Session。
+
+### 9.2 Session 隔离
+
+#### 9.2.1 数据模型与磁盘布局
+
+`claw/session/models.py` 中的 `Session` 是一个独立会话的状态根，主要包含：
+
+- `session_id`、`title`、创建/更新时间；
+- 完整的 `messages` 原始消息序列；
+- `summary` 与 `last_consolidated` 压缩边界；
+- `skill_usage`；
+- 单调变化的 `revision`；
+- `metadata`，用于保存 `agent_backend`、Pi generation、运行时检查点、待恢复用户 turn 等扩展状态。
+
+`SessionStore` 不把所有会话塞进一个大文件，而是为每个 Session 保存一份 JSONL。第一行是 metadata，后续每行一条消息。这样有三个效果：
+
+1. 一个 Session 的高频写入不会重写其他 Session；
+2. 单条消息损坏时可以跳过该行，不必丢弃整个数据库；
+3. 完全无法解析的文件可以被隔离为损坏备份，而不是静默覆盖。
+
+保存流程使用“写临时文件 → flush/fsync → 原子 replace”。进程内有缓存锁和 per-session `RLock`，进程间还有同路径的 `FileLock`；创建新 Session 使用单独的 creation lock，避免 CLI 与 Gateway 同时分配相同标识。
+
+#### 9.2.2 运行时隔离
+
+一次 turn 的隔离由多层共同完成：
+
+```text
+session_id
+   ├─ SessionStore.get/save                  对话与 metadata
+   ├─ Gateway _active_turns[session_id]      活动 turn 与取消事件
+   ├─ WorkspaceManager binding[session_id]   文件系统根
+   ├─ AUTO / UNLIMITED maps                  模式
+   ├─ RuntimeAgentClient backend metadata    原生/Pi
+   ├─ attachment directory                  附件
+   ├─ Cron payload.session_key              定时任务回到原 Session
+   └─ Rollback binding/checkpoints           工作区与对话回退
+```
+
+Gateway 对同一 `session_id` 的第二个并发请求返回冲突，避免两条 Agent Loop 交错追加消息；不同 Session 可以并行运行。工作线程启动时还会设置 thread-local 当前 Session，Tool 层则通过 `ContextVar` 绑定 RequestContext、WorkspaceScope 和文件读写状态，所以共享的 Registry 不会把 A 会话的工具上下文泄漏给 B。
+
+需要特别注意两种“比 Session 更宽”的锁：
+
+- `CompactionWorker` 当前一次只执行一个后台压缩任务，属于吞吐控制，不改变摘要最终仍按 Session 写回；
+- 两个 Session 若绑定同一个物理 workspace，Rollback 会按规范化 workspace 根串行化 turn，防止各自的文件快照互相覆盖。
+
+#### 9.2.3 压缩、分叉与恢复下的隔离
+
+Compaction 不删除 `messages`，只移动 `last_consolidated` 并更新 `summary`；因此 Session 的原始审计历史仍在同一文件中。`get_history()` 只选择当前需要发送的窗口，并清理孤立 tool result、过大的工具输出和多模态残留，不会改写别的 Session。
+
+`fork_session_before_user_index()` 会复制目标用户消息之前的历史，并重新计算压缩边界。运行时崩溃恢复则依靠 `pending_user_turn` 和 `runtime_checkpoint`：已完成工具结果可以恢复，尚未完成的工具调用会被补成明确失败结果，避免恢复后留下不合法的 tool-call 序列。
+
+### 9.3 Agent Loop
+
+#### 9.3.1 外层事务与后端路由
+
+Agent Loop 有两层职责：
+
+```text
+run_agent_turn
+   ├─ WorkspaceRollbackManager.turn_guard
+   │    └─ 创建“用户消息前”检查点并持有隔离锁
+   └─ _run_agent_turn_unlocked
+        ├─ RuntimeAgentClient.run_agent_turn 可接管完整 turn
+        └─ 普通 LLMClient 进入原生 Think-Act-Observe 循环
+```
+
+Gateway 和 CLI 注入的是 `RuntimeAgentClient`。首次进入时，Loop 发现客户端具有 `run_agent_turn()`，把完整 turn 交给它分流：
+
+- 后端为 `pi`：调用 `PiAgentClient.run_agent_turn()`；
+- 后端为 `sjtuclaw`：`RuntimeAgentClient` 用普通 `LLMClient` 再进入原生循环。普通客户端没有完整-turn 方法，因此不会再次分流，也不会递归死循环。
+
+Rollback 检查点创建在分流之前，所以无论最终走原生还是 Pi，用户看到的“这一轮”都具有相同的回退边界。
+
+#### 9.3.2 原生 Think-Act-Observe 状态机
+
+原生循环的核心状态转移如下：
+
+```text
+[追加 user 消息并 fsync]
+          |
+          v
+   [Build Context] <------------------------------------+
+          |                                             |
+          v                                             |
+   [LLM + tool definitions]                             |
+       /             \                                  |
+  final reply       tool_calls                           |
+      |               |                                 |
+      |        [写 assistant tool_calls]                 |
+      |               |                                 |
+      |        [审批 / Skill 选择 / 执行工具]             |
+      |               |                                 |
+      |        [写 matching tool results] ---------------+
+      v
+[写 assistant final]
+      |
+      +--> FinalEvent --> CompactionWorker.submit_if_needed()
+```
+
+每轮迭代都会重新调用 `ContextBuilder`，因此工具结果、Skill 注入和最新摘要会进入下一次模型判断。模型返回 tool call 时，系统先持久化带原生 `tool_calls` 的 assistant 消息，再为每个 call 写入相同 ID 的 tool 消息，保证 OpenAI 兼容协议中的配对关系。
+
+Loop 还维护四类保护：
+
+- 迭代次数上限与工具调用总数上限；
+- 重复调用/无进展检测；
+- 审批连续拒绝计数；
+- cooperative cancellation：在迭代边界、模型返回后、工具执行前后检查取消事件。
+
+同步 LLM 请求本身不能被强制打断，但 `/stop` 设置取消事件后，迟到的模型结果不会继续触发工具。所有异常、未知工具、参数校验失败和审批拒绝都会转换为明确的观察结果或最终错误，而不是让消息链停在半个 tool call。
+
+#### 9.3.3 Context 装配关系
+
+原生主循环每次调用 `ContextBuilder.build_messages()`，其稳定顺序是：
+
+```text
+identity/system
+→ soul
+→ tool contract/bootstrap/AGENTS.md
+→ Memory 轻量索引
+→ Skill 索引与 always Skill 全文
+→ Session summary
+→ 未压缩对话窗口
+→ 仅附着在最新用户消息上的 runtime context/media
+```
+
+稳定块会按 Memory/Skill version 和 workspace 缓存；易变的时间、当前 Session、workspace 等 runtime context 只放到最新用户消息附近，避免破坏提供商的 prompt cache。发送前 `ContextGovernor` 可以在副本上补齐缺失 tool result、裁剪超大历史或触发紧急压缩，但不修改持久化原文。
+
+### 9.4 Compaction 系统
+
+#### 9.4.1 压缩的真实含义
+
+SJTUClaw 的压缩不是删除消息，而是建立一个逻辑读取边界：
+
+```text
+messages: [旧消息 0 ... N-1][近期消息 N ... end]
+                    ^
+             last_consolidated = N
+
+发送上下文 = summary(旧消息) + messages[N:]
+审计/回退   = messages[0:] 仍完整保留
+```
+
+`compact_session()` 只计算 `CompactionResult`；`apply_compaction_result()` 才更新 `summary`、推进 `last_consolidated` 并增加 `revision`。这种“计算与提交分离”使后台线程可以在不长时间占有 Session 锁的情况下调用 LLM。
+
+#### 9.4.2 触发与安全切分
+
+自动压缩只在完整 turn 结束后提交，并要求未压缩消息超过 token 阈值。当前没有“会话空闲后自动截断”路径。手动 `/compact` 使用 `force=True` 绕过常规预算检查，但仍必须存在可安全归档的旧前缀。
+
+切分点不能落在任意消息之间。`has_compactable_prefix()` 会：
+
+1. 保留一个近期 token/消息窗口；
+2. 向前对齐到完整的 user turn；
+3. 避免把 assistant tool call 与其 tool result 拆开；
+4. 在消息数量过少时拒绝压缩。
+
+送给摘要 LLM 前，旧工具输出会被裁剪，已有 summary 会一起进入提示词，以形成增量摘要。LLM 返回空摘要或报错时抛出 `CompactionError`，原 Session 不发生改变，并进入失败冷却，避免每个 turn 都重复轰炸摘要接口。
+
+#### 9.4.3 后台提交与 ABA 防护
+
+`CompactionWorker` 的关键流程是：
+
+```text
+Session 锁内:
+  snapshot(messages, summary, revision)
+       |
+       v
+锁外调用摘要 LLM
+       |
+       v
+Session 锁内:
+  当前 revision == snapshot revision ?
+       ├─ 否：丢弃过期结果
+       └─ 是：apply + save
+```
+
+revision 检查不仅防止“压缩时又来了新消息”，也防止 ABA：例如用户回退到旧状态后又写入看似相同数量的消息，revision 仍会不同，旧摘要无法覆盖新时间线。Gateway 给 worker 的过滤器还会跳过 Pi Session，因为 Pi 拥有自己的会话压缩机制。
+
+### 9.5 Memory 系统
+
+#### 9.5.1 为什么 Memory 跨 Session
+
+Memory 的目标是保存用户偏好、项目事实和决策，而不是复制聊天记录，因此它是 Runtime 级全局知识库。文件保存在：
+
+```text
+data/memory/
+├─ user_preference/
+├─ project/
+├─ fact/
+├─ decision/
+└─ general/
+```
+
+每条记忆是带 YAML frontmatter 的 Markdown，包含类别、标签、重要度、创建/更新时间、召回统计和 `source_session_id`。来源字段用于追踪“这条事实来自哪里”，但不会限制它只能被原 Session 使用。
+
+#### 9.5.2 写入、索引与召回
+
+`MemoryStore` 启动时扫描文件建立内存索引，写入采用临时文件 + 原子替换；add/update/delete 会增加 `version`，使 `ContextBuilder` 的 Memory 索引缓存失效。
+
+模型不会在每个 turn 获得所有 Memory 正文。ContextBuilder 只注入统计、使用说明和少量近期条目，模型需要时调用 `recall`。召回排序综合：
+
+- 标签精确/部分匹配；
+- 查询词在标题、正文中的完整或分词命中；
+- 中文字符重叠；
+- 用户偏好类别加权；
+- importance、创建时间、历史召回次数和最近召回时间。
+
+这种“轻索引 → 主动 recall → 返回少量正文”的渐进检索，既控制 token，也降低无关旧知识干扰当前 Session。
+
+#### 9.5.3 Memory 与其他模块
+
+- `remember` 是 write 安全级别，经过 Agent Loop 审批；`recall` 是只读工具；
+- Tool 的 RequestContext 提供当前 `session_id`，用于写入来源；
+- ReflectionManager 扫描有变化的 Session 摘要和近期消息，通过辅助 LLM 提取可复用事实，再写入全局 Memory；
+- ContextBuilder 只读取 Memory 索引，不直接修改 Store；
+- Rollback 回退 Session 和 workspace，不回退全局 Memory。用户若已批准写入一条长期记忆，该记忆是独立事实，需要用 Memory 管理命令单独删除。
+
+### 9.6 Tool 系统
+
+#### 9.6.1 定义、注册、展示、执行
+
+每个 `Tool` 包含名称、描述、JSON Schema、handler、`safety_level`、并发标志和结果长度上限。生命周期为：
+
+```text
+register_all_tools()
+   → ToolRegistry.register() 校验名称/schema/重复项
+   → list_definitions() 转成 provider tool schema
+   → LLM 返回 name + arguments
+   → Agent Loop 决定是否审批
+   → execute_by_name()
+        1. 复制参数
+        2. prepare_call 前置检查（若配置）
+        3. 轻量 JSON Schema 校验
+        4. handler 执行
+        5. ToolResult 不变量校验
+        6. 截断过长 content/error
+   → tool result 写回 Session
+```
+
+`ToolResult` 强制“成功只有 content、失败只有 error”，让 Agent Loop 不必猜测半成功状态。未知工具、错误参数、handler 异常都会规范化为失败结果。
+
+#### 9.6.2 安全级别不是唯一防线
+
+安全控制分布在三层：
+
+1. `safety_level` 告诉 Agent Loop 是否需要审批；
+2. Agent Loop 根据 AUTO、UNLIMITED 和工具类型执行 fail-closed 策略；
+3. handler/WorkspaceManager 在真正接触文件系统时再次校验路径。
+
+因此，AUTO 只会跳过结构化 write 的“人工确认”，不会跳过 workspace 边界；Shell 即使在 AUTO 下也必须显式审批。`approval_handler` 缺失时 write/shell 默认拒绝。
+
+#### 9.6.3 共享 Registry 如何保持 turn 隔离
+
+Registry 是全局共享对象，但 turn 特有状态不保存在 Tool 实例的普通字段中。`claw/tools/base.py` 使用 `ContextVar` 传递：
+
+- `RequestContext`：session、channel、chat 等来源；
+- `FileStates`：read-before-write 等文件状态；
+- `WorkspaceScope`：当前工作区范围。
+
+CronTool 也用独立 ContextVar 保存 `session_key`、来源渠道和“当前是否由 Cron 触发”。Gateway 工作线程在执行前绑定这些上下文，结束后 reset，避免线程池复用造成状态串线。Pi 宿主工具桥接最终仍调用同一 `ToolRegistry`，因此参数校验、结果规范化和 workspace handler 不会因换后端而消失。
+
+### 9.7 Workspace 系统
+
+#### 9.7.1 绑定与并发持久化
+
+`WorkspaceManager` 维护 `session_id -> absolute Path`，持久化在 `data/workspace/bindings.json`。更新绑定时不是把进程内旧快照直接覆盖到磁盘，而是在进程锁和文件锁内重新读取最新文件、合并当前 Session 的变化，再原子替换，从而避免 CLI 和 Gateway 同时运行时互相抹掉绑定。
+
+绑定路径必须是存在的目录。目录后来被移走时，绑定信息仍保留，但使用时会返回明确的“workspace 不存在”错误，等待用户修复或重新绑定。
+
+#### 9.7.2 路径解析是强制边界
+
+沙箱模式下的解析规则为：
+
+```text
+输入相对路径
+   → workspace / input
+   → resolve() 消解 .. 和符号链接
+   → relative_to(workspace.resolve())
+       ├─ 成功：允许
+       └─ 失败：拒绝越界
+```
+
+绝对路径默认被拒绝；`../`、符号链接逃逸和指向 workspace 外部的解析结果也会失败。文件读写、下载、附件落盘和 Shell 的路径预检都依赖这条边界，但各 handler 仍负责自己的类型、大小、命令和网络规则。
+
+#### 9.7.3 Workspace 与上下文、回退、Pi
+
+- ContextBuilder 把当前 workspace 和 `AGENTS.md`/bootstrap 信息加入系统上下文；
+- Rollback 以 workspace 为快照范围，两个 Session 共享同一目录时按目录根加锁；
+- Pi Session 若绑定 workspace，会把它作为 Pi 子进程 `cwd`；
+- UNLIMITED 使 `resolve()` 绕过 workspace 边界，但不会自动关闭审批，也不会扩大 Rollback 的快照范围。
+
+### 9.8 Skill 系统
+
+#### 9.8.1 Registry 与可用性
+
+`SkillRegistry` 扫描 `skills/` 及一层分类目录中的 `SKILL.md`，解析 frontmatter、正文、依赖的二进制和环境变量。Skill 可以存在但不可用：例如缺少必需命令或配置时，Registry 会保留其元数据并标记原因，便于 UI 展示，而不是在执行到一半才失败。
+
+Registry 用目录 mtime/version 检测变化并热重载。使用次数、最近使用时间等 telemetry 放在 sidecar 状态中，不回写用户维护的 `SKILL.md`。
+
+#### 9.8.2 三阶段渐进披露
+
+Skill 内容按需进入上下文：
+
+```text
+阶段 1：ContextBuilder 注入 Skill 名称、描述、可用性索引
+阶段 2：模型调用 skills_list / skill_view 查看目标 Skill 或引用文件
+阶段 3：显式 /skill <name> <task> 将完整 Skill 转成注入用户消息
+```
+
+标记为 always 的 Skill 会在阶段 1 直接注入全文。普通 Skill 不会全部展开，避免大量说明长期占用上下文。`skill_view` 只允许读取目标 Skill 目录内的文件，并限制路径、类型和大小。
+
+代码还保留 `safety_level="skill_select"` 的 `use_skill` 特殊分支，供注册该工具的扩展运行时做“模型选择 Skill → 用户确认 → 注入”；默认注册链主要使用 `skills_list`、`skill_view`、`skill_manage` 和显式 `/skill`。
+
+#### 9.8.3 管理与调用关系
+
+`skill_manage` 属于 write 工具，创建、修改、删除或安装包都要经过审批。安装 ZIP/TAR 时会验证归档路径、文件数量、扩展名和大小，并通过 staging + swap 发布，避免半安装状态。
+
+显式 `/skill` 的调用链是：
+
+```text
+CLI/Gateway 解析命令
+   → 校验 Skill 可用
+   → run_agent_turn(skill_source="explicit", skill_name=...)
+   → ContextBuilder.build_skill_injection_message()
+   → Session 记录 skill_usage
+   → SkillRegistry.record_use()
+   → 后端执行用户任务
+```
+
+Pi 后端接到显式 Skill 时会把请求转换为 Pi 可识别的 Skill prompt，同时运行时生成的 Skill/Tool 清单仍用于桥接宿主能力。
+
+### 9.9 Cron 系统
+
+#### 9.9.1 数据模型与调度语义
+
+`CronSchedule` 支持 `at`、`every`、`cron` 三种且必须恰好选择一种。`CronPayload` 保存：
+
+- `agent_turn` 或 `system_event`；
+- `session_key`；
+- 原始 channel、chat id 和 metadata；
+- `depends_on` 依赖任务。
+
+`CronService` 加载持久化任务后计算最近一次 `next_run_at`，定时器只等待最近任务并定期 heartbeat。损坏的 jobs 文件会被隔离，服务不会用空列表直接覆盖可能仍可恢复的数据。
+
+#### 9.9.2 claim、执行与崩溃恢复
+
+任务到期时，Service 先把下一次时间/运行 claim 持久化，再调用回调：
+
+```text
+due job
+  → 写 run_claim 与 next_run_at
+  → 原子保存 jobs
+  → 深拷贝任务
+  → 注入依赖任务最新输出
+  → 调用 dispatcher
+  → 保存结果、历史与 Markdown 输出
+```
+
+先 claim 后执行可防止服务重启后重复抢占同一到期任务。一次性任务使用带 TTL 的 at-most-once 语义；周期任务在执行前推进下一次时间。运行历史和输出有保留上限，失败次数过多或一次性任务完成后会按策略禁用/删除。
+
+#### 9.9.3 回到同一 Agent Runtime
+
+`create_cron_dispatcher()` 不实现第二套 Agent。它恢复 payload 的 Session/渠道上下文，绑定 thread-local 与 Cron ContextVar，然后调用：
+
+```text
+run_agent_turn(
+    session_key,
+    scheduled_prompt,
+    input_event="cron_trigger",
+    ...
+)
+```
+
+因此 Cron turn 与人工消息共享 Session、Workspace、后端、Tool、Approval、Rollback 和 Compaction。`input_event` 让 UI 可以把调度提示标记为系统来源，但该消息仍存在于模型上下文和审计历史中。
+
+CronTool 在普通 turn 中允许 add/list/remove；创建任务时必须有当前 Session 绑定，并拒绝在 Cron 触发的 turn 内再创建 Cron，避免递归任务指数扩散。Heartbeat 是一个特殊系统任务，也通过 dispatcher 进入同一主链。
+
+### 9.10 Gateway
+
+#### 9.10.1 组合根
+
+`claw/gateway/server.py` 是 HTTP/桌面运行方式的 composition root。模块初始化阶段创建一套共享组件：
+
+```text
+SessionStore ─┐
+MemoryStore  ─┤
+SkillRegistry ├─> ContextBuilder ─┐
+WorkspaceMgr ─┘                   │
+ToolRegistry + ApprovalManager ───┼─> run_agent_turn
+RollbackManager ──────────────────┤
+RuntimeAgentClient ────────────────┘
+CronService / Reflection / CompactionWorker / Channels
+```
+
+应用 lifespan 启动 Cron、Reflection、QQ、Pet 等后台服务，关闭时先停止接收新工作，再等待/停止后台组件，避免进程退出时留下半写入状态。
+
+#### 9.10.2 请求与 SSE
+
+普通 `/chat` 在线程池工作线程中运行完整 turn，等待最终文本后返回 JSON。`/chat/stream` 则建立线程安全队列：
+
+```text
+Agent worker --TurnEvent--> queue --SSE encoder--> browser
+```
+
+Thinking、ToolCallStart、ToolCallEnd、Approval 和 FinalEvent 可以逐步到达前端；keepalive 防止代理误判连接空闲。Agent 不占用 FastAPI 事件循环，所以模型运行期间 `/stop` 和审批决定接口仍可响应。
+
+`_active_turns[session_id]` 保存取消事件和任务状态。同一 Session 再次发送消息会冲突，不同 Session 允许并行。斜杠命令先经过白名单解析：已识别命令在本地执行，未知或伪造的控制命令不会混入 LLM 主对话链。
+
+#### 9.10.3 边界防护
+
+Gateway 中间件依次承担来源/API token 检查、滑动窗口限流、按实际流式读取字节数限制请求大小、请求 ID 与日志。上传使用分块写入和超限回滚，附件目录按 Session 分开，读取时再次校验所属关系。静态 WebUI 最后挂载，避免吞掉 API 路由。
+
+审批管理器可以在 Agent 工作线程中等待用户决定，而 HTTP 主循环继续服务。若审批回调异常或不存在，Agent Loop 按 fail-closed 记录拒绝结果。
+
+### 9.11 Rollback
+
+#### 9.11.1 快照内容与存储
+
+`WorkspaceRollbackManager` 使用两类存储：
+
+- SHA-256 内容寻址对象库保存文件内容，相同内容只存一次；
+- SQLite（WAL）保存 binding generation、checkpoint、文件 manifest 和 operation 状态。
+
+启用回退时会创建新的 binding generation 和 baseline。每次用户 turn 开始前，`turn_guard` 生成检查点，内容包括 workspace manifest、压缩的 Session 快照、用户消息 ID 关联以及是否为 partial。
+
+`.git`、`node_modules`、虚拟环境、缓存等目录默认排除，避免快照巨大且难以稳定恢复。UNLIMITED turn 被标记为 partial，因为 workspace 之外的修改无法被当前快照捕获。
+
+#### 9.11.2 锁顺序与共享目录
+
+Rollback 先持有 Session 锁，再持有规范化 workspace 根锁。这个顺序保证：
+
+- 同一 Session 不能同时创建/应用两个检查点；
+- 不同 Session 共用一个目录时，文件修改仍然串行；
+- Session 的对话快照与对应 workspace 文件状态处于同一 turn 边界。
+
+#### 9.11.3 两阶段回退与补偿
+
+预览只比较当前 manifest 与目标 checkpoint，报告将恢复、删除的文件和消息数，不写对象。真正回退采用可恢复状态机：
+
+```text
+创建 safety checkpoint
+   → operation = PREPARED
+   → 应用目标文件 manifest
+   → operation = FILES_APPLIED
+   → 恢复 Session 快照并 fsync
+   → operation = COMMITTED
+```
+
+任一步失败会进入 `COMPENSATING`，用 safety checkpoint 恢复操作前状态。进程重启时会扫描未完成 operation 并幂等恢复。对象垃圾回收采用 mark-and-sweep，只删除没有 checkpoint 引用的对象。
+
+恢复 Session 时会清理 pending/runtime checkpoint、增加 revision，并旋转 `pi_session_generation`。增加 revision 让正在运行的 CompactionWorker 结果失效；旋转 Pi generation 则保证下次进入 Pi 时不会继续使用包含“已被回退对话”的旧 Pi 会话。
+
+### 9.12 AUTO 与 UNLIMITED 模式
+
+两种模式都按 Session 生效，但解决的是完全不同的问题：
+
+| 模式 | 改变什么 | 不改变什么 | 持久化 |
+|------|----------|------------|--------|
+| AUTO | workspace 内结构化 write 可跳过人工审批 | Shell 仍审批；workspace 边界仍有效 | 仅内存 |
+| UNLIMITED | 路径解析可访问 workspace 外 | write/shell 仍强制审批；回退范围仍是绑定 workspace | 仅内存 |
+
+原生 Agent Loop 的决策可以概括为：
+
+```text
+read/network/download
+    → 按工具自身边界执行
+
+write/shell
+    → approval_handler 缺失：拒绝
+    → shell：始终显式审批
+    → unlimited：始终显式审批
+    → auto 且为结构化 write：跳过人工审批
+    → 其他：显式审批
+```
+
+当 AUTO 与 UNLIMITED 同时开启时，UNLIMITED 的强制审批优先，AUTO 不能自动批准越界写入。即使结构化 write 被 AUTO 放行，handler 仍调用 WorkspaceManager 做最终路径检查。
+
+Gateway 用 `_auto_mode[session_id]` 保存 AUTO，WorkspaceManager 用 `_unlimited_sessions` 保存 UNLIMITED；CLI 的 `RuntimeState` 也按 Session 保存 AUTO。两者均不写入 Session metadata，重启后恢复为安全默认值。删除/切换相关 Session 时也会清理内存模式，避免状态错误继承。
+
+### 9.13 Pi 后端切换
+
+#### 9.13.1 选择状态与迁移
+
+后端选择保存在 `session.metadata["agent_backend"]`，合法值为 `sjtuclaw` 或 `pi`。`AGENT_BACKEND` 只决定尚未初始化 Session 的默认值；`initialize_session_backends()` 会把默认值冻结到旧 Session，之后修改环境变量不会把所有现有会话一起切换。
+
+`/pi on` 的顺序是先验证 Pi 配置/命令可用，再调用 `set_session_backend()`；失败时不修改 Session。切换回原生后端前也会确认原生 LLM 配置完整。
+
+#### 9.13.2 generation 与 handoff
+
+Pi 自己维护追加式持久会话。若从原生切回一个旧 Pi 进程，旧进程并不知道中间由原生后端完成的对话。为避免恢复过期分支，切换到 Pi 时会：
+
+1. 生成新的 `pi_session_generation`；
+2. 清除 owner/initialized generation；
+3. 首个 Pi turn 读取 SJTUClaw 的已有 messages 和 summary；
+4. 生成 authoritative handoff prompt；
+5. 标记当前 generation 已初始化。
+
+Pi session token 由 SJTUClaw `session_id + generation` 派生，因此同一 Session 的旧 Pi 文件不会被误续接。Rollback 同样旋转 generation，形成一条新的 Pi 时间线。
+
+#### 9.13.3 完整 turn、工具与事件桥接
+
+Pi 路径不是“用 Pi 只生成一段文本”，而是由 Pi 完成自己的模型、工具循环、重试、上下文压缩和持久化。Python 侧负责：
+
+- 选择绑定 workspace 作为 `cwd`；
+- 生成本轮 prompt、工具清单和桥接 token；
+- 启动 Pi JSONL RPC 子进程；
+- 通过 TypeScript extensions 提供 permission gate、provider 和 host tools；
+- 把 Pi 的 user/tool/assistant 事件记录回 SJTUClaw Session；
+- 把事件转换为与原生 Loop 相同的 TurnEvent，供 SSE/CLI/QQ 消费。
+
+宿主工具桥接最终执行共享 `ToolRegistry`，并把需要变更状态的操作交给审批链。这样换后端只替换“谁拥有 Agent Loop”，不会替换 Session、Workspace、Rollback、Gateway 和渠道层。
+
+#### 9.13.4 Compaction 的分叉
+
+原生 Session 的自动压缩由 `CompactionWorker` 完成；Pi Session 被该 worker 过滤。对 Pi Session 执行 `/compact` 时，`RuntimeAgentClient.compact_session()` 向对应 Pi RPC 发送 `compact` 请求，使用 Pi 的原生摘要和会话文件。
+
+辅助 LLM 仍可能存在：`RuntimeAgentClient.chat()` / `chat_with_tools()` 委托给原生兼容客户端，供 Reflection、标题等非 Pi 主 turn 功能使用。如果只配置 Pi 而未配置辅助 LLM，这些辅助功能会明确报“辅助 LLM 未配置”，不会偷偷改用主 turn。
+
+### 9.14 端到端流程与模块协作
+
+#### 9.14.1 人工消息
+
+```text
+WebUI/CLI/QQ
+  → Gateway/REPL 解析命令与 session_id
+  → 活动 turn 检查
+  → 绑定 RequestContext/CronContext/workspace
+  → Rollback.turn_guard 创建检查点
+  → RuntimeAgentClient 读取 Session backend
+      ├─ sjtuclaw
+      │   → ContextBuilder
+      │   → LLM
+      │   → ToolRegistry ↔ ApprovalManager ↔ WorkspaceManager
+      │   → SessionStore
+      │   → CompactionWorker
+      └─ pi
+          → handoff/runtime files/JSONL RPC
+          → Pi tool loop ↔ host ToolRegistry/Approval
+          → SessionStore
+          → Pi native compaction
+  → TurnEvent
+  → JSON/SSE/CLI/QQ 输出
+```
+
+#### 9.14.2 定时消息
+
+```text
+CronService 到期
+  → claim 先持久化
+  → dispatcher 恢复 session/channel
+  → run_agent_turn(input_event="cron_trigger")
+  → 与人工消息相同的后端、工具、workspace、回退和压缩链
+  → 结果返回来源渠道
+  → CronService 保存输出与历史
+```
+
+#### 9.14.3 写文件并回退
+
+```text
+turn 开始
+  → Rollback checkpoint(旧文件 + 旧 Session)
+  → Tool write 请求
+  → AUTO/UNLIMITED/类型共同决定审批
+  → WorkspaceManager 校验最终路径
+  → handler 写文件
+  → tool result + final reply 写入 Session
+
+/rollback
+  → preview 差异
+  → safety checkpoint
+  → 恢复文件 manifest
+  → 恢复 Session
+  → revision 变化使旧 compaction 失效
+  → Pi generation 变化使旧 Pi 分支失效
+```
+
+#### 9.14.4 最重要的模块边界
+
+维护代码时应保持以下关系：
+
+1. 入口层可以解析命令和转换事件，但完整对话必须进入 `run_agent_turn()`。
+2. SessionStore 是对话真相源；ContextBuilder 只构建发送视图，ContextGovernor 只修改临时副本。
+3. Compaction 改变摘要读取边界，不删除原始历史。
+4. Memory 是全局知识层，Session 是隔离对话层；二者不能互相代替。
+5. ToolRegistry 负责能力协议，Agent Loop 负责审批编排，WorkspaceManager/handler 负责最终资源边界。
+6. Cron 是入口和调度器，不是另一套 Agent Runtime。
+7. Gateway 是组合根和传输层，不应复制业务状态机。
+8. Rollback 同时恢复 workspace 与 Session；revision 和 Pi generation 把恢复动作传播给异步压缩与外部后端。
+9. AUTO 只缩短审批流程，UNLIMITED 只放宽路径范围；两者都不能绕开其余安全层。
+10. Pi 替换完整 Agent 后端，但复用 Session、Gateway、Workspace、Rollback、渠道和宿主工具边界。
+
+---
+
+## 十、测试体系
+
+### 10.1 后端测试
 
 测试文件位于 [tests/](file:///c:/Users/GZQ/Desktop/SJTUClaw/SJTUClaw/tests/)，使用 pytest：
 
@@ -2195,10 +2839,12 @@ python -m pytest tests/ -v
 | `test_session_store_concurrency.py` | Session 存储并发 |
 | `test_gateway_fixes.py` / `test_gateway_rollback.py` | Gateway |
 | `test_cli_rollback_integration.py` | CLI 回退集成 |
+| `test_cli_setup.py` / `test_cli_repl_cleanup.py` | CLI 配置向导与退出清理 |
+| `test_commands_hardening.py` / `test_skill_cron_hardening.py` | 命令、Skill 与 Cron 安全回归 |
 | `test_explicit_skill_entrypoints.py` | Skill 显式调用 |
 | `test_encoding.py` | 编码处理 |
 
-### 9.2 前端测试
+### 10.2 前端测试
 
 ```bash
 cd webui
@@ -2213,8 +2859,8 @@ npx vitest run
 
 整个 SJTUClaw 代码库遵循以下不变量：
 
-1. **`run_agent_turn` 是唯一调用 LLM 的入口**——CLI/Gateway/Scheduler/QQ/Heartbeat 都必须路由到这里。
-2. **`ContextBuilder` 是唯一装配 messages 的模块**——CLI 和 LLMClient 都不允许自行构建。
+1. **`run_agent_turn` 是主对话 turn 的统一入口**——CLI/Gateway/Scheduler/QQ/Heartbeat 都必须路由到这里；辅助 LLM 任务不冒充对话 turn。
+2. **`ContextBuilder` 统一装配原生主循环 messages**——入口层不自行拼主对话上下文；Pi 与辅助任务使用各自明确的 prompt 路径。
 3. **`token_counter` 是唯一 token 估算源**——所有模块都走这里，避免散落的字符数估算。
 4. **compaction 只处理 `session.summary` 和 `session.messages` 边界**——绝不触碰 system prompt/soul/memory store。
 5. **`ContextGovernor` 永不修改持久化历史**——只准备一份副本用于发送。
@@ -2223,7 +2869,7 @@ npx vitest run
 8. **`approval_handler is None` 时 write/shell fail-closed**——永远拒绝，无法通过省略回调绕过。
 9. **workspace 边界强制**——写入/shell/下载/附件工具全部通过 `workspace_manager.resolve` 或路径预扫描防止越界。
 10. **原子写入**——SessionStore、MemoryStore、SkillManager、CronService 等均采用 tmp + replace 原子写入策略。
-11. **JSONL 增量持久化**——Session 采用一行 metadata + 每行一消息的 JSONL，单行损坏只丢一条消息。
+11. **JSONL 独立持久化**——每个 Session 采用一行 metadata + 每行一消息的 JSONL，并通过整文件原子替换保存；单行损坏只跳过一条消息。
 12. **ContextVar per-turn 绑定**——RequestContext、FileStates、WorkspaceScope 通过 contextvars 实现异步安全的 per-turn 上下文传递。
 
 ---

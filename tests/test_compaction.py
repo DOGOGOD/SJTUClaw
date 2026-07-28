@@ -295,7 +295,10 @@ class TestCompactionV2:
         worker = CompactionWorker(
             NoopLLM(),
             ss,
-            config=CompactionConfig(max_message_tokens=5),
+            config=CompactionConfig(
+                max_message_tokens=5,
+                keep_recent_tokens=5,
+            ),
         )
         submitted = []
         monkeypatch.setattr(
@@ -321,37 +324,73 @@ class TestCompactionV2:
         assert worker.submit_if_needed(long)
         assert submitted == ["above-token-threshold"]
 
-    def test_idle_worker_still_compacts_inactive_session(self, ss):
-        from datetime import datetime, timedelta, timezone
-
+    def test_worker_skips_threshold_tail_without_safe_prefix(self, ss):
+        from claw.config import CompactionConfig
         from claw.context.compaction_worker import CompactionWorker
 
-        class SummaryLLM:
+        class UnexpectedLLM:
             def chat(self, _messages):
-                return "IDLE_SUMMARY"
-
-        session = ss.create_session(session_id="idle-compact")
-        for index in range(12):
-            session.append_message(
-                "user" if index % 2 == 0 else "assistant",
-                f"idle-message-{index}",
-            )
-        session.updated_at = (
-            datetime.now(timezone.utc) - timedelta(minutes=10)
-        ).isoformat()
-        ss.save(session)
+                raise AssertionError("no-op compaction must not call the LLM")
 
         worker = CompactionWorker(
-            SummaryLLM(),
+            UnexpectedLLM(),
             ss,
-            idle_ttl_minutes=1,
+            config=CompactionConfig(
+                max_message_tokens=5,
+                keep_recent_tokens=1000,
+                keep_recent_messages_min=4,
+            ),
         )
-        worker._idle_tick()
+        session = ss.create_session(session_id="no-safe-prefix")
+        session.append_message("user", "oldest message " * 500)
+        session.append_message("assistant", "a")
+        session.append_message("user", "b")
+        session.append_message("assistant", "c")
+        session.append_message("user", "d")
 
-        loaded = ss.get(session.session_id)
-        assert loaded.summary == "IDLE_SUMMARY"
-        assert loaded.last_consolidated == 4
-        assert len(loaded.messages) == 12
+        assert not worker.submit_if_needed(session)
+        assert not worker.is_running()
+
+    def test_background_noop_is_silent_and_not_retried(self, ss, capsys):
+        from claw.config import CompactionConfig
+        from claw.context.compaction_worker import CompactionWorker
+
+        class CountingLLM:
+            def __init__(self):
+                self.calls = 0
+
+            def chat(self, _messages):
+                self.calls += 1
+                return "UNEXPECTED"
+
+        llm = CountingLLM()
+        worker = CompactionWorker(
+            llm,
+            ss,
+            config=CompactionConfig(
+                keep_recent_tokens=1000,
+                keep_recent_messages_min=4,
+            ),
+        )
+        session = ss.create_session(session_id="silent-noop")
+        for index in range(6):
+            session.append_message(
+                "user" if index % 2 == 0 else "assistant",
+                f"short-{index}",
+            )
+
+        worker._do_compact(
+            session,
+            list(session.messages),
+            session.summary,
+            session.revision,
+        )
+
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err == ""
+        assert llm.calls == 0
+        assert session.last_consolidated == 0
 
     def test_split_by_tokens(self):
         from claw.context.compaction import _find_split_index

@@ -277,11 +277,22 @@ def run_repl(
         )
 
     # -- Cleanup -----------------------------------------------------------
-    if state.compaction_worker is not None:
-        print("[compaction] 等待后台压缩任务完成...")
-        if not state.compaction_worker.wait(timeout=5.0):
-            print("[compaction] 警告：后台压缩未在 5 秒内完成，已放弃等待")
+    _wait_for_compaction_on_exit(state.compaction_worker)
     _print_goodbye()
+
+
+def _wait_for_compaction_on_exit(compaction_worker) -> None:
+    """Wait only when a threshold-triggered compaction is actually running."""
+    if compaction_worker is None:
+        return
+
+    is_running = getattr(compaction_worker, "is_running", None)
+    if not callable(is_running) or not is_running():
+        return
+
+    print("[compaction] 等待后台压缩任务完成...")
+    if not compaction_worker.wait(timeout=5.0):
+        print("[compaction] 警告：后台压缩未在 5 秒内完成，已放弃等待")
 
 
 def _handle_chat_turn(

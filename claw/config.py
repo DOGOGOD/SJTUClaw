@@ -40,10 +40,6 @@ _DEFAULT_KEEP_RECENT_MESSAGES_MIN = 4
 _DEFAULT_CONSOLIDATION_RATIO = 0.5
 _DEFAULT_MAX_OUTPUT_TOKENS = 4096
 
-# Idle compaction TTL: only compact sessions idle longer than this
-# (minutes).  Default 60 min (1 hour).  Set to 0 to disable.
-_DEFAULT_IDLE_TTL_MINUTES = 60
-
 # History log
 _DEFAULT_MAX_HISTORY_ENTRIES = 2000
 
@@ -122,7 +118,6 @@ class CompactionConfig:
     max_message_tokens: int = _DEFAULT_MAX_MESSAGE_TOKENS
     keep_recent_tokens: int = _DEFAULT_KEEP_RECENT_TOKENS
     keep_recent_messages_min: int = _DEFAULT_KEEP_RECENT_MESSAGES_MIN
-    idle_ttl_minutes: int = _DEFAULT_IDLE_TTL_MINUTES
     max_history_entries: int = _DEFAULT_MAX_HISTORY_ENTRIES
 
 
@@ -213,7 +208,6 @@ def load_compaction_config() -> CompactionConfig:
         max_message_tokens=_int_env("COMPACT_MAX_MESSAGE_TOKENS", _DEFAULT_MAX_MESSAGE_TOKENS),
         keep_recent_tokens=_int_env("COMPACT_KEEP_RECENT_TOKENS", _DEFAULT_KEEP_RECENT_TOKENS),
         keep_recent_messages_min=_int_env("COMPACT_KEEP_RECENT_MESSAGES_MIN", _DEFAULT_KEEP_RECENT_MESSAGES_MIN),
-        idle_ttl_minutes=_int_env("COMPACT_IDLE_TTL_MINUTES", _DEFAULT_IDLE_TTL_MINUTES),
         max_history_entries=_int_env("HISTORY_MAX_ENTRIES", _DEFAULT_MAX_HISTORY_ENTRIES),
     )
 

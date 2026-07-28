@@ -6,15 +6,13 @@ dedicated LLM request and never touches the app's system prompt, soul
 or memory store --- those are wired in independently by
 `claw.context.builder.ContextBuilder`.
 
-v3 changes (optimization):
+Current behavior:
 
 - Multi-round token-budget consolidation: compacts in up to 5 rounds
   until the session fits within the context budget.
 - User-turn boundary detection: never splits mid-turn — always
   compacts at user-message boundaries.
-- Summary persistence in session metadata for idle-session archival
-  and process restart recovery.
-- Idle-session hard-truncation (``compact_idle_session``).
+- Summary persistence for process restart recovery.
 - Proper token estimation including system prompt, tool definitions,
   and summary overhead — not just raw message content.
 """
@@ -110,6 +108,15 @@ class CompactionError(RuntimeError):
     Whenever this is raised, `session` has not been modified: old
     messages are always preserved unless a valid new summary was
     successfully computed.
+    """
+
+
+class CompactionNotNeeded(CompactionError):
+    """Raised when there is currently no safe message prefix to compact.
+
+    This is an expected no-op, not a summarization failure. Interactive
+    callers may show the reason, while automatic workers should skip it
+    silently and reassess after a later turn.
     """
 
 
@@ -251,6 +258,36 @@ def needs_compaction(
     return False
 
 
+def has_compactable_prefix(
+    session: Session,
+    *,
+    keep_recent_tokens: int | None = None,
+    keep_recent_messages_min: int | None = None,
+) -> bool:
+    """Return whether automatic compaction has a safe old-turn prefix.
+
+    Crossing the automatic token threshold alone is insufficient: the
+    recent-token window and minimum-message floor can temporarily leave no
+    complete old user turn to summarize. Checking this before submission
+    prevents a background retry loop for an expected no-op.
+    """
+    messages = session.get_unconsolidated_messages()
+    keep_min = (
+        keep_recent_messages_min
+        if keep_recent_messages_min is not None
+        else KEEP_RECENT_MESSAGES_MIN
+    )
+    if len(messages) <= keep_min:
+        return False
+
+    max_old = len(messages) - keep_min
+    keep_tok = (
+        keep_recent_tokens if keep_recent_tokens is not None else KEEP_RECENT_TOKENS
+    )
+    split_index = min(_find_split_index(messages, keep_tok), max_old)
+    return _align_split_to_user_boundary(messages, split_index) > 0
+
+
 # ---------------------------------------------------------------------------
 # Compaction logic
 # ---------------------------------------------------------------------------
@@ -291,7 +328,7 @@ def compact_session(
     )
 
     if len(messages) <= keep_min:
-        raise CompactionError(
+        raise CompactionNotNeeded(
             f"当前 session 只有 {len(messages)} 条消息，"
             f"不超过保留窗口（{keep_min}），无需压缩。"
         )
@@ -308,10 +345,10 @@ def compact_session(
 
     if split_index <= 0:
         if force:
-            raise CompactionError(
+            raise CompactionNotNeeded(
                 "当前 session 没有可安全压缩的完整旧对话轮次，无需压缩。"
             )
-        raise CompactionError(
+        raise CompactionNotNeeded(
             f"当前 session 的消息 token 数未超过保留预算"
             f"（{keep_tok} token），无需压缩。"
         )
@@ -503,7 +540,7 @@ def maybe_consolidate_by_tokens(
         if session.summary:
             estimated += count_tokens(session.summary)
 
-    # Persist the last summary to session metadata for idle-session archival
+    # Persist the last summary for process restart recovery.
     if last_summary and last_summary != "(nothing)":
         session.metadata["_last_summary"] = {
             "text": last_summary,
@@ -511,111 +548,6 @@ def maybe_consolidate_by_tokens(
         }
 
     return last_summary
-
-
-# ---------------------------------------------------------------------------
-# Idle session compaction (AutoCompact-inspired)
-# ---------------------------------------------------------------------------
-
-
-def compact_idle_session(
-    session_key: str,
-    session_store: SessionStore,
-    llm_client: LLMClient,
-    *,
-    max_suffix: int = 8,
-) -> str | None:
-    """Hard-truncate an idle session: archive everything except the
-    *max_suffix* most recent messages (extended to nearest user turn).
-
-    Returns the summary text on success, or None if nothing was archived.
-    """
-    session = session_store.get(session_key)
-    messages = session.get_unconsolidated_messages()
-    if not messages:
-        return ""
-
-    # Determine what to keep: recent suffix extended to user turn
-    keep_count = min(max_suffix, len(messages))
-    # Walk backwards from max_suffix to find the nearest user turn
-    split_point = len(messages) - keep_count
-    for i in range(split_point, -1, -1):
-        if messages[i].role == "user":
-            split_point = i
-            break
-
-    messages_to_keep = messages[split_point:]
-    messages_to_remove = messages[:split_point]
-
-    if not messages_to_remove:
-        return ""
-
-    last_active = session.updated_at
-    summary: str | None = ""
-
-    try:
-        summary = _llm_archive(messages_to_remove, session.summary, llm_client)
-    except CompactionError:
-        _raw_archive(messages_to_remove, session_key)
-        summary = None
-
-    # Preserve the raw transcript and advance the compacted prefix boundary.
-    session.last_consolidated += len(messages_to_remove)
-    if summary and summary != "(nothing)":
-        session.summary = _merge_summaries(session.summary, summary)
-        session.metadata["_last_summary"] = {
-            "text": summary,
-            "last_active": last_active,
-        }
-
-    session.touch()
-
-    try:
-        session_store.save(session)
-    except SessionStoreError:
-        pass
-
-    return summary
-
-
-# ---------------------------------------------------------------------------
-# Idle check helper
-# ---------------------------------------------------------------------------
-
-
-def has_compactable_idle_tail(
-    session: Session,
-    ttl_minutes: int = 0,
-    max_suffix: int = 8,
-) -> bool:
-    """Return True if *session* has enough unconsolidated messages
-    beyond *max_suffix* to warrant idle compaction.
-
-    If *ttl_minutes* > 0, also checks that the session has been idle
-    for at least that many minutes.
-    """
-    from datetime import datetime, timezone
-
-    messages = session.get_unconsolidated_messages()
-    if len(messages) <= max_suffix:
-        return False
-
-    # Check TTL
-    if ttl_minutes > 0:
-        try:
-            updated = datetime.fromisoformat(session.updated_at)
-            age = (datetime.now(timezone.utc) - updated).total_seconds()
-            if age < ttl_minutes * 60:
-                return False
-        except (ValueError, TypeError):
-            pass
-
-    # Check if there are compactable messages
-    split_point = len(messages) - max_suffix
-    for i in range(split_point, -1, -1):
-        if messages[i].role == "user":
-            return i > 0
-    return split_point > 0
 
 
 # ---------------------------------------------------------------------------

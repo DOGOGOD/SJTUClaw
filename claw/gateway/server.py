@@ -437,7 +437,7 @@ _reflection_mgr = ReflectionManager(
     DATA_DIR / "memory", _memory_store, _session_store, _llm_client
 )
 
-# -- Compaction worker (v3: with idle auto-compaction) --------------------
+# -- Token-threshold compaction worker -----------------------------------
 _compact_llm: LLMClient | None = None
 if _compact_cfg.model and (_compact_cfg.api_key or _config.api_key):
     from claw.config import LLMConfig as LC
@@ -454,7 +454,6 @@ _compaction_worker = CompactionWorker(
     _session_store,
     compact_llm=_compact_llm,
     config=_compact_cfg,
-    idle_ttl_minutes=_compact_cfg.idle_ttl_minutes,
     session_filter=lambda session: _session_backend(session.session_id) != "pi",
 )
 
@@ -487,8 +486,6 @@ async def _lifespan(_app: FastAPI):
     loop = asyncio.get_running_loop()
     _cron_service.start(loop=loop)
     _reflection_mgr.start()
-    if _config.api_key and _config.model:
-        _compaction_worker.start_idle_compaction()
 
     pet_settings = _pet_catalog.load_settings()
     can_show_desktop = os.name == "nt" or bool(os.getenv("DISPLAY"))
@@ -536,7 +533,6 @@ async def _lifespan(_app: FastAPI):
             await _qq_task
         _qq_task = None
 
-    _compaction_worker.stop_idle_compaction()
     _compaction_worker.wait(timeout=5.0)
     _reflection_mgr.stop()
     _cron_service.stop()
@@ -1384,7 +1380,9 @@ def _mutating_command_session(command: str, current_session_id: str) -> str | No
         "on", "off", "enable", "disable", "1", "0", "toggle",
     }:
         return current_session_id
-    if root == "/pi" and sub not in {"status"}:
+    if root == "/pi" and sub in {
+        "on", "off", "enable", "disable", "pi", "sjtuclaw",
+    }:
         return current_session_id
     if root == "/rollback" and sub not in {"status", "show", "list"}:
         return current_session_id
@@ -1656,7 +1654,9 @@ async def handle_command(req: CommandRequest):
         actions = []
     elif root == "/unlimited":
         actions = ["reload_unlimited_mode"]
-    elif root == "/pi":
+    elif root == "/pi" and args_lower and args_lower[0] in (
+        "on", "off", "enable", "disable", "pi", "sjtuclaw",
+    ):
         actions = ["reload_sessions"]
 
     mode_sid = switch_to or sid
@@ -2994,10 +2994,6 @@ def _apply_llm_runtime_config() -> None:
         consolidation_ratio=settings["consolidationRatio"],
     )
     _llm_client.set_config(_config)
-    if api_key and settings["model"]:
-        _compaction_worker.start_idle_compaction()
-    else:
-        _compaction_worker.stop_idle_compaction()
 
 
 async def _apply_qq_runtime_config() -> None:

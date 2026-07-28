@@ -56,6 +56,12 @@ def main() -> int:
         format="%(message)s",
         stream=sys.stderr,
     )
+    # Keep the CLI focused on application events. Third-party clients log
+    # every successful request at INFO, which is useful for debugging but
+    # noisy during normal interactive use.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("openai").setLevel(logging.WARNING)
 
     try:
         system_prompt = load_system_prompt()
@@ -91,7 +97,7 @@ def main() -> int:
         workspace_manager=workspace_manager,
     )
 
-    # -- Compaction worker (v3: with idle auto-compaction) ------------------
+    # -- Token-threshold compaction worker ---------------------------------
     compact_llm: LLMClient | None = None
     if compact_cfg.model and (compact_cfg.api_key or config.api_key):
         from claw.config import LLMConfig as LC
@@ -109,13 +115,10 @@ def main() -> int:
         session_store,
         compact_llm=compact_llm,
         config=compact_cfg,
-        idle_ttl_minutes=compact_cfg.idle_ttl_minutes,
         session_filter=lambda session: (
             get_session_backend(session_store, session.session_id) != "pi"
         ),
     )
-    if config.api_key and config.model:
-        compaction_worker.start_idle_compaction()
 
     approval_manager = ApprovalManager()
 
@@ -205,7 +208,6 @@ def main() -> int:
         )
     finally:
         cron_service.stop()
-        compaction_worker.stop_idle_compaction()
         reflection_mgr.stop()
     return 0
 

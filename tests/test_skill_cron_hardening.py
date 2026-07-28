@@ -289,6 +289,24 @@ def test_cli_cron_list_displays_next_run_in_default_timezone(tmp_path: Path):
     assert f"({default_timezone_name()})" in output
 
 
+def test_cli_bare_cron_displays_usage_without_listing_jobs():
+    from types import SimpleNamespace
+
+    from claw.cli.commands import _handle_cron_command
+
+    class CronService:
+        def list_jobs(self, **_kwargs):
+            raise AssertionError("bare /cron must not list jobs")
+
+    output = _handle_cron_command([], SimpleNamespace(cron_service=CronService()))
+
+    assert "/cron list" in output
+    assert "/cron status" in output
+    assert "/cron disable <jobId>" in output
+    assert "/cron enable <jobId>" in output
+    assert "/cron delete <jobId>" in output
+
+
 def test_cron_dispatcher_binds_context_inside_worker_thread(tmp_path: Path, monkeypatch):
     import claw.scheduler.dispatcher as dispatcher_module
     from claw.scheduler.dispatcher import create_cron_dispatcher

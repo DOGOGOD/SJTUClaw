@@ -22,6 +22,7 @@ SJTUClaw 将多轮对话、工具调用、长期记忆、Skill、定时任务和
 - **Workspace 回退**：设置 workspace 后自动创建逐回合检查点，同时恢复文件和对话；未设置 workspace 时保持关闭。
 - **Skill 系统**：通过 `SKILL.md` 组织可复用工作流，支持发现、加载和管理。
 - **多入口与实时反馈**：Web UI 通过 SSE 展示 Agent 事件，QQ Bot 支持私聊、群聊和内联审批。
+- **多模态会话**：Web UI 支持粘贴或上传图片，每条消息最多 4 张、单张最多 20 MB；附件按 Session 隔离保存。
 - **本地化时间与定时任务**：自动识别系统时区，支持 `CLAW_TIMEZONE` 显式覆盖，识别失败时回退到上海时区。
 - **Windows 桌面应用**：使用 pywebview 承载完整 Web UI，通过 PyInstaller 打包后无需单独安装 Python 或 Node.js。
 - **标准安装与卸载体验**：使用 Inno Setup 7 生成安装向导，支持自选安装路径、开始菜单、桌面快捷方式、覆盖升级和系统卸载入口。
@@ -134,7 +135,9 @@ python -m pip install -e .
 sjtuclaw setup
 ```
 
-也可以复制 `.env.example` 为 `.env` 手动配置模型服务。
+也可以复制 `.env.example` 为 `.env` 手动配置。`sjtuclaw setup` 会引导配置主模型、
+联网与时区、Gateway、本地可选 Pi 参数、常用高级参数和 QQ Bot；它不会修改默认
+Agent 后端，后端切换仍由各会话中的 `/pi on`、`/pi off` 控制。
 
 需要使用 Pi 时，先构建同级目录中的 `pi` 仓库，或在系统中安装可执行的 `pi`。Web UI 的“设置 → LLM”可配置新会话的默认 Agent backend；已有会话可用 `/pi on`、`/pi off` 独立切换，互不影响，标题栏会显示 Pi 状态徽标。Pi 可以直接复用已有的 OpenAI-compatible 模型配置，也可以通过 `PI_PROVIDER`、`PI_MODEL` 使用 Pi 自身的模型与认证配置。
 
@@ -217,7 +220,9 @@ shin-chan.zip
 | v1 | 8 列 × 9 行 | 1536 × 1872 | 9 行基础动画；保留用于兼容现有宠物 |
 | v2 | 8 列 × 11 行 | 1536 × 2288 | 包含全部基础动画，并增加两行共 16 个观察方向 |
 
-目前内置的“月薪喵”和“线条小狗”均为 v1。新制作的宠物建议使用 v2；`spriteVersionNumber` 必须写成 JSON 数字，例如 `2`，不能写成字符串 `"2"`。
+目前内置“月薪喵”“线条小狗”“蜡笔小新”和“黄油小熊”：前三者为 v1，
+“黄油小熊”为 v2。新制作的宠物建议使用 v2；`spriteVersionNumber` 必须写成
+JSON 数字，例如 `2`，不能写成字符串 `"2"`。
 
 导入时，Gateway 会在写入用户宠物目录前检查 ZIP 完整性、路径安全、重复或额外文件、加密与异常压缩比、压缩包大小、`pet.json` 字段、图片真实格式、透明通道、图集尺寸、必用动画帧以及未使用格子的透明性。校验失败时，具体原因会直接显示在添加宠物弹窗中。相同 ID 的宠物不能重复安装，自定义宠物也不能覆盖内置宠物。
 
@@ -298,7 +303,7 @@ dist\installer\SJTUClaw-Setup-<version>.exe
 ```text
 /session new|list|switch|rename|delete
 /workspace set|show|unset
-/rollback [n|checkpointId]|list|status|undo
+/rollback [n|checkpointId]|list|status|undo|help
 /compact
 /memory add|list|search|update|delete|status
 /reflect status|enable|disable|time|now
@@ -311,10 +316,12 @@ dist\installer\SJTUClaw-Setup-<version>.exe
 /pet status|list|open|close|select|autostart
 /stop
 /help
+/exit
 ```
 
 `/compact` 会立即压缩当前会话中可安全归档的完整旧轮次，不需要等待
-`COMPACT_MAX_MESSAGE_TOKENS` 自动阈值或空闲压缩触发；最近消息保留窗口仍会保留。
+`COMPACT_MAX_MESSAGE_TOKENS` 自动阈值；最近消息保留窗口仍会保留。系统不会因
+会话空闲而自动压缩。
 
 也可以直接用自然语言创建定时任务、保存记忆或请求使用 Skill。
 
@@ -336,8 +343,11 @@ dist\installer\SJTUClaw-Setup-<version>.exe
 ## 文档
 
 - [配置说明](docs/configuration.md)
+- [运行数据目录说明](docs/data-directory-guide.md)
 - [测试与开发](docs/testing.md)
 - [Windows 安装包构建](docs/windows-packaging.md)
+- [代码 Wiki](docs/CODE_WIKI.md)
+- [功能验收任务测试集](doc/SJTUClaw功能验收任务测试集.md)
 - [前端源码](webui/)
 - [Skill 目录](skills/)
 

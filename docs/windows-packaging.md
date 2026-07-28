@@ -18,6 +18,10 @@
 .\packaging\windows\build.ps1
 ```
 
+脚本会安装/校验依赖、构建 Web UI、检查 Tkinter、运行 PyInstaller，并在可用时
+调用 Inno Setup。修改 Python、前端、Prompt、Skill 或内置宠物资源后，都需要
+重新执行构建；`dist/` 中已有产物不会自动更新。
+
 如果只想生成 PyInstaller 目录版，不生成安装向导：
 
 ```powershell
@@ -39,3 +43,6 @@
 
 其中包括会话、记忆、运行时设置、定时任务、用户宠物和用户技能。
 安装版首次启动时也会把内置 `prompts/` 和 `skills/` 复制到该目录，之后 WebUI 中的提示词和 Skill 管理都会写入用户目录，而不是安装目录。
+
+安装包不会内置外部 Pi/Node 运行时。需要 Pi 后端时，应另外安装可执行的 `pi`，
+或配置 `PI_COMMAND` / `PI_CLI_PATH`（必要时再配置 `PI_NODE_PATH`）。

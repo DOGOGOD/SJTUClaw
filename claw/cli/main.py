@@ -11,7 +11,14 @@ Follows the CLI structure: ``sjtuclaw gateway``, ``sjtuclaw setup``, etc.
 from __future__ import annotations
 
 import argparse
+import getpass
+import ipaddress
+import math
+import secrets
+import socket
 import sys
+from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo
 
 from claw.config import ENV_EXAMPLE_PATH, ENV_PATH, PROJECT_ROOT
 from claw.utils import force_utf8_stdio
@@ -86,6 +93,133 @@ def _prompt_str(prompt: str, default: str = "") -> str:
     return raw if raw else default
 
 
+def _prompt_secret(prompt: str, current: str = "") -> str:
+    """Ask for a secret without echoing or exposing its current value."""
+    hint = " [回车保留现有值]: " if current else ": "
+    raw = getpass.getpass(prompt + hint).strip()
+    return raw if raw else current
+
+
+def _prompt_int(
+    prompt: str,
+    default: int,
+    *,
+    minimum: int,
+    maximum: int | None = None,
+) -> int:
+    """Ask for an integer and keep prompting until it is in range."""
+    while True:
+        raw = input(f"{prompt} [{default}]: ").strip()
+        if not raw:
+            return default
+        try:
+            value = int(raw)
+        except ValueError:
+            value = minimum - 1
+        if value >= minimum and (maximum is None or value <= maximum):
+            return value
+        if maximum is None:
+            print(f"  请输入不小于 {minimum} 的整数。")
+        else:
+            print(f"  请输入 {minimum}～{maximum} 之间的整数。")
+
+
+def _prompt_float(prompt: str, default: float, *, minimum: float) -> float:
+    """Ask for a finite float greater than or equal to *minimum*."""
+    while True:
+        raw = input(f"{prompt} [{default:g}]: ").strip()
+        if not raw:
+            return default
+        try:
+            value = float(raw)
+        except ValueError:
+            value = minimum - 1
+        if math.isfinite(value) and value >= minimum:
+            return value
+        print(f"  请输入不小于 {minimum:g} 的数字。")
+
+
+def _env_bool(env: dict[str, str], name: str, default: bool) -> bool:
+    raw = env.get(name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _mask_secret(value: str) -> str:
+    if len(value) <= 12:
+        return "****"
+    return f"{value[:8]}****{value[-4:]}"
+
+
+def _prompt_timezone(current: str) -> str:
+    """Ask for an IANA timezone, accepting ``auto`` to clear an override."""
+    default = current or "auto"
+    while True:
+        raw = _prompt_str("  时区（IANA 名称，auto = 自动识别）", default).strip()
+        if raw.lower() == "auto":
+            return ""
+        try:
+            ZoneInfo(raw)
+        except Exception:
+            print("  无法识别该时区，例如可填写 Asia/Shanghai 或 America/New_York。")
+            continue
+        return raw
+
+
+def _suggest_lan_origin(port: int) -> str:
+    """Best-effort suggestion for the browser origin used on the local LAN."""
+    candidates: set[str] = set()
+    try:
+        for item in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            address = item[4][0]
+            parsed = ipaddress.ip_address(address)
+            if parsed.is_private and not parsed.is_loopback and not parsed.is_link_local:
+                candidates.add(address)
+    except (OSError, ValueError):
+        return ""
+
+    def _rank(address: str) -> tuple[int, str]:
+        if address.startswith("192.168."):
+            return 0, address
+        if address.startswith("10."):
+            return 1, address
+        return 2, address
+
+    if not candidates:
+        return ""
+    return f"http://{sorted(candidates, key=_rank)[0]}:{port}"
+
+
+def _valid_origins(value: str) -> bool:
+    """Validate a comma-separated list of exact HTTP(S) browser origins."""
+    if not value.strip():
+        return False
+    for item in value.split(","):
+        parsed = urlsplit(item.strip())
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.netloc
+            or parsed.path not in {"", "/"}
+            or parsed.query
+            or parsed.fragment
+        ):
+            return False
+    return True
+
+
+def _prompt_origins(current: str, port: int) -> str:
+    default = current or _suggest_lan_origin(port)
+    while True:
+        value = _prompt_str(
+            "  允许的 Web 来源（逗号分隔，如 http://192.168.1.10:8000）",
+            default,
+        )
+        if _valid_origins(value):
+            return ",".join(item.strip().rstrip("/") for item in value.split(","))
+        print("  局域网 Web UI 至少需要一个完整的 http:// 或 https:// 来源地址。")
+
+
 # ---------------------------------------------------------------------------
 # Setup steps
 # ---------------------------------------------------------------------------
@@ -104,16 +238,15 @@ def _setup_llm() -> dict[str, str]:
     current_model = env.get("LLM_MODEL", "")
 
     if current_key and current_url and current_model:
-        masked = current_key[:8] + "****" + current_key[-4:] if len(current_key) > 12 else "****"
-        print(f"  当前配置:")
-        print(f"    LLM_API_KEY  = {masked}")
+        print("  当前配置:")
+        print(f"    LLM_API_KEY  = {_mask_secret(current_key)}")
         print(f"    LLM_BASE_URL = {current_url}")
         print(f"    LLM_MODEL    = {current_model}")
         print()
         if not _prompt_yn("  是否修改?", default=False):
             return {}
 
-    api_key = _prompt_str("  API Key", current_key)
+    api_key = _prompt_secret("  API Key", current_key)
     base_url = _prompt_str("  Base URL", current_url or "https://api.openai.com/v1")
     model = _prompt_str("  Model", current_model or "gpt-4o")
 
@@ -122,6 +255,227 @@ def _setup_llm() -> dict[str, str]:
         "LLM_BASE_URL": base_url,
         "LLM_MODEL": model,
     }
+
+
+def _setup_preferences() -> dict[str, str]:
+    """Configure common user-facing behaviour."""
+    env = _read_env()
+
+    print()
+    print("─" * 48)
+    print("  常用偏好")
+    print("─" * 48)
+    print("  联网工具用于 web_search / web_fetch；时区影响时间显示和定时任务。")
+
+    web_enabled = _prompt_yn(
+        "  启用原生联网工具?",
+        default=_env_bool(env, "WEB_TOOL_ENABLED", True),
+    )
+    timezone = _prompt_timezone(env.get("CLAW_TIMEZONE", ""))
+    return {
+        "WEB_TOOL_ENABLED": "true" if web_enabled else "false",
+        "CLAW_TIMEZONE": timezone,
+    }
+
+
+def _setup_gateway() -> dict[str, str]:
+    """Configure local or LAN Gateway access safely."""
+    env = _read_env()
+    current_host = env.get("GATEWAY_HOST", "127.0.0.1").strip() or "127.0.0.1"
+    current_port_raw = env.get("GATEWAY_PORT", "8000").strip()
+    try:
+        current_port = int(current_port_raw)
+    except ValueError:
+        current_port = 8000
+    if not 1 <= current_port <= 65535:
+        current_port = 8000
+    current_is_lan = current_host not in {"127.0.0.1", "::1", "localhost"}
+
+    print()
+    print("─" * 48)
+    print("  Gateway 配置")
+    print("─" * 48)
+    print("  1. 仅本机访问（推荐，更安全）")
+    print("  2. 局域网访问（需要访问令牌和受信任来源）")
+    while True:
+        mode = _prompt_str("  访问方式", "2" if current_is_lan else "1")
+        if mode in {"1", "2"}:
+            break
+        print("  请输入 1 或 2。")
+
+    port = _prompt_int("  监听端口", current_port, minimum=1, maximum=65535)
+    open_browser = _prompt_yn(
+        "  启动 Gateway 时自动打开浏览器?",
+        default=_env_bool(env, "GATEWAY_OPEN_BROWSER", False),
+    )
+    updates = {
+        "GATEWAY_HOST": "127.0.0.1" if mode == "1" else "0.0.0.0",
+        "GATEWAY_PORT": str(port),
+        "GATEWAY_OPEN_BROWSER": "true" if open_browser else "false",
+    }
+    if mode == "1":
+        print("  已选择仅本机访问；现有远程令牌和来源配置将原样保留。")
+        return updates
+
+    current_token = env.get("GATEWAY_API_TOKEN", "").strip()
+    if current_token:
+        print(f"  当前访问令牌: {_mask_secret(current_token)}")
+        if _prompt_yn("  重新生成访问令牌?", default=False):
+            current_token = secrets.token_urlsafe(32)
+            print("  已生成新的随机访问令牌。")
+    else:
+        current_token = secrets.token_urlsafe(32)
+        print("  已自动生成随机访问令牌。")
+
+    origins = _prompt_origins(env.get("GATEWAY_ALLOWED_ORIGINS", ""), port)
+    updates.update({
+        "GATEWAY_API_TOKEN": current_token,
+        "GATEWAY_ALLOWED_ORIGINS": origins,
+    })
+    return updates
+
+
+def _setup_pi() -> dict[str, str]:
+    """Configure optional Pi parameters without changing the Agent backend."""
+    env = _read_env()
+
+    print()
+    print("─" * 48)
+    print("  Pi 可选配置")
+    print("─" * 48)
+    print("  此处只准备 Pi 参数，不会切换 Agent 后端；请在会话中使用 /pi on。")
+
+    provider = _prompt_str("  Provider（留空使用 Pi 或主 LLM 配置）", env.get("PI_PROVIDER", ""))
+    model = _prompt_str("  Model（留空使用 Pi 或主 LLM 配置）", env.get("PI_MODEL", ""))
+    valid_thinking = {"", "off", "minimal", "low", "medium", "high", "xhigh", "max"}
+    default_thinking = env.get("PI_THINKING", "").strip().lower()
+    if default_thinking not in valid_thinking:
+        default_thinking = ""
+    while True:
+        thinking = _prompt_str(
+            "  Thinking（留空/off/minimal/low/medium/high/xhigh/max）",
+            default_thinking,
+        ).strip().lower()
+        if thinking in valid_thinking:
+            break
+        print("  Thinking 等级无效，请重新输入。")
+
+    trust_tools = _prompt_yn(
+        "  信任 Pi 的写入工具并跳过审批?（仅限可信环境）",
+        default=_env_bool(env, "PI_TRUST_TOOLS", False),
+    )
+    updates = {
+        "PI_PROVIDER": provider,
+        "PI_MODEL": model,
+        "PI_THINKING": thinking,
+        "PI_TRUST_TOOLS": "true" if trust_tools else "false",
+    }
+    if trust_tools:
+        print("  注意：Pi 的文件写入和 Shell 操作将不再逐次请求审批。")
+
+    try:
+        from claw.config import _ensure_dotenv_loaded
+        from claw.pi.client import _resolve_pi_command
+
+        _ensure_dotenv_loaded()
+        resolved = _resolve_pi_command()
+    except Exception:
+        resolved = ()
+    if resolved:
+        print(f"  已检测到 Pi: {' '.join(resolved)}")
+        return updates
+
+    print("  当前未检测到可运行的 Pi；仍可先保存模型参数，稍后安装 Pi。")
+    if not _prompt_yn("  现在填写 Pi 运行路径?", default=False):
+        return updates
+
+    print("  1. 填写完整启动命令")
+    print("  2. 填写 Pi cli.js 路径")
+    while True:
+        mode = _prompt_str("  路径方式", "1")
+        if mode in {"1", "2"}:
+            break
+        print("  请输入 1 或 2。")
+    if mode == "1":
+        command = _prompt_str("  Pi 启动命令", env.get("PI_COMMAND", ""))
+        if command:
+            updates["PI_COMMAND"] = command
+    else:
+        cli_path = _prompt_str("  Pi cli.js 路径", env.get("PI_CLI_PATH", ""))
+        node_path = _prompt_str(
+            "  Node.js 路径（留空则从 PATH 查找）",
+            env.get("PI_NODE_PATH", ""),
+        )
+        if cli_path:
+            updates["PI_CLI_PATH"] = cli_path
+        if node_path:
+            updates["PI_NODE_PATH"] = node_path
+    return updates
+
+
+def _setup_advanced() -> dict[str, str]:
+    """Configure the small set of advanced options useful during onboarding."""
+    env = _read_env()
+
+    def _current_int(name: str, default: int, minimum: int) -> int:
+        try:
+            value = int(env.get(name, str(default)))
+        except ValueError:
+            return default
+        return value if value >= minimum else default
+
+    def _current_float(name: str, default: float, minimum: float) -> float:
+        try:
+            value = float(env.get(name, str(default)))
+        except ValueError:
+            return default
+        return value if math.isfinite(value) and value >= minimum else default
+
+    print()
+    print("─" * 48)
+    print("  高级模型与搜索配置")
+    print("─" * 48)
+    print("  不确定时直接回车使用当前值或推荐默认值。")
+
+    context_window = _prompt_int(
+        "  模型上下文窗口（token）",
+        _current_int("LLM_CONTEXT_WINDOW", 32000, 1024),
+        minimum=1024,
+    )
+    max_output = _prompt_int(
+        "  最大输出 token",
+        _current_int("LLM_MAX_OUTPUT_TOKENS", 4096, 1),
+        minimum=1,
+    )
+    retries = _prompt_int(
+        "  API 最大重试次数",
+        _current_int("LLM_MAX_RETRIES", 2, 0),
+        minimum=0,
+    )
+    timeout = _prompt_float(
+        "  单次 API 请求超时（秒）",
+        _current_float("LLM_REQUEST_TIMEOUT", 120.0, 1.0),
+        minimum=1.0,
+    )
+
+    current_tavily = env.get("TAVILY_API_KEY", "").strip()
+    tavily_update: str | None = None
+    if current_tavily:
+        print(f"  当前 Tavily API Key: {_mask_secret(current_tavily)}")
+        if _prompt_yn("  修改 Tavily API Key?", default=False):
+            tavily_update = _prompt_secret("  Tavily API Key", current_tavily)
+    elif _prompt_yn("  配置 Tavily API Key?（可跳过，联网搜索仍可使用）", default=False):
+        tavily_update = _prompt_secret("  Tavily API Key")
+
+    updates = {
+        "LLM_CONTEXT_WINDOW": str(context_window),
+        "LLM_MAX_OUTPUT_TOKENS": str(max_output),
+        "LLM_MAX_RETRIES": str(retries),
+        "LLM_REQUEST_TIMEOUT": f"{timeout:g}",
+    }
+    if tavily_update is not None:
+        updates["TAVILY_API_KEY"] = tavily_update
+    return updates
 
 
 def _setup_qq() -> dict[str, str]:
@@ -135,49 +489,76 @@ def _setup_qq() -> dict[str, str]:
 
     current_app_id = env.get("QQ_APP_ID", "")
     current_secret = env.get("QQ_CLIENT_SECRET", "")
-    current_enabled = env.get("QQ_ENABLED", "false").lower() == "true"
+    current_allow = env.get("QQ_ALLOW_FROM", "")
+    current_format = env.get("QQ_MSG_FORMAT", "markdown").strip().lower()
+    if current_format == "plain":
+        current_format = "text"
+    if current_format not in {"markdown", "text"}:
+        current_format = "markdown"
+    current_ack = env.get("QQ_ACK_MESSAGE", "")
 
-    if current_enabled and current_app_id and current_secret:
-        print(f"  QQ 已配置:")
+    enabled = _prompt_yn("  启用 QQ Bot?", default=True)
+    if not enabled:
+        print("  QQ Bot 将被禁用；现有凭证会保留，之后可再次启用。")
+        return {"QQ_ENABLED": "false"}
+
+    updates: dict[str, str] = {"QQ_ENABLED": "true"}
+    configure_credentials = True
+    if current_app_id and current_secret:
+        print("  QQ 凭证已配置:")
         print(f"    QQ_APP_ID        = {current_app_id}")
         print(f"    QQ_CLIENT_SECRET = ****")
         print()
-        if not _prompt_yn("  是否重新配置?", default=False):
-            return {}
+        configure_credentials = _prompt_yn("  是否重新配置凭证?", default=False)
 
-    print()
-    print("  方式 1: 扫码自动获取 (需先在另一终端运行 sjtuclaw gateway)")
-    print("  方式 2: 手动输入 AppID 和 AppSecret")
-    choice = _prompt_str("  选择方式", "1")
-
-    if choice == "1":
-        from claw.channels.qq_onboard import qr_register
-
+    qr_allow = ""
+    if configure_credentials:
         print()
-        result = qr_register()
-        if result is None:
-            print("  扫码失败，请手动输入。")
-            choice = "2"
-        else:
-            return {
-                "QQ_ENABLED": "true",
-                "QQ_APP_ID": result["app_id"],
-                "QQ_CLIENT_SECRET": result["client_secret"],
-                "QQ_ALLOW_FROM": result.get("user_openid", "*"),
-            }
+        print("  方式 1: 扫码自动获取（需先在另一终端运行 sjtuclaw gateway）")
+        print("  方式 2: 手动输入 AppID 和 AppSecret")
+        while True:
+            choice = _prompt_str("  选择方式", "1")
+            if choice in {"1", "2"}:
+                break
+            print("  请输入 1 或 2。")
 
-    if choice == "2":
-        app_id = _prompt_str("  AppID", current_app_id)
-        secret = _prompt_str("  AppSecret", current_secret)
-        allow = _prompt_str("  AllowFrom (用户openid, * = 全部)", "*")
-        return {
-            "QQ_ENABLED": "true",
-            "QQ_APP_ID": app_id,
-            "QQ_CLIENT_SECRET": secret,
-            "QQ_ALLOW_FROM": allow,
-        }
+        if choice == "1":
+            from claw.channels.qq_onboard import qr_register
 
-    return {}
+            print()
+            result = qr_register()
+            if result is None:
+                print("  扫码失败，请手动输入。")
+                choice = "2"
+            else:
+                updates.update({
+                    "QQ_APP_ID": result["app_id"],
+                    "QQ_CLIENT_SECRET": result["client_secret"],
+                })
+                qr_allow = result.get("user_openid", "")
+
+        if choice == "2":
+            updates.update({
+                "QQ_APP_ID": _prompt_str("  AppID", current_app_id),
+                "QQ_CLIENT_SECRET": _prompt_secret("  AppSecret", current_secret),
+            })
+
+    allow = _prompt_str(
+        "  允许的 QQ OpenID（逗号分隔；* = 所有人，留空 = 拒绝所有人）",
+        current_allow or qr_allow,
+    )
+    while True:
+        msg_format = _prompt_str("  消息格式（markdown/text）", current_format).lower()
+        if msg_format in {"markdown", "text"}:
+            break
+        print("  消息格式只能是 markdown 或 text。")
+    ack = _prompt_str("  收到消息时的确认回复（可留空）", current_ack)
+    updates.update({
+        "QQ_ALLOW_FROM": allow,
+        "QQ_MSG_FORMAT": msg_format,
+        "QQ_ACK_MESSAGE": ack,
+    })
+    return updates
 
 
 def _setup_channels() -> dict[str, str]:
@@ -202,23 +583,14 @@ def _setup_channels() -> dict[str, str]:
         print("  当前未配置任何通道。")
 
     print()
-    if not _prompt_yn("  是否配置通道?", default=not bool(configured)):
+    if not _prompt_yn("  是否配置 QQ Bot?", default=False):
         return updates
 
-    # For now, only QQ is supported
-    print()
-    print("  可用通道:")
-    status = " [已配置]" if qq_configured else ""
-    print(f"    1. QQ Bot (官方 QQ Bot API v2){status}")
+    updates.update(_setup_qq())
 
-    choice = _prompt_str("  选择通道", "1")
-    if choice == "1":
-        updates.update(_setup_qq())
-
-    # Check if more channels to configure
     if updates:
         print()
-        print(f"  通道配置完成。")
+        print("  通道配置完成。")
     return updates
 
 
@@ -232,6 +604,7 @@ def _cmd_setup() -> int:
     print("=" * 56)
     print("  SJTUClaw 配置向导")
     print("=" * 56)
+    print("  欢迎使用 SJTUClaw，让我们一起完成首次配置！")
 
     all_updates: dict[str, str] = {}
 
@@ -239,7 +612,24 @@ def _cmd_setup() -> int:
     if _prompt_yn("\n  是否配置 LLM?", default=True):
         all_updates.update(_setup_llm())
 
-    # Step 2: Channels
+    # Step 2: Common preferences
+    if _prompt_yn("\n  是否配置联网工具和时区?", default=True):
+        all_updates.update(_setup_preferences())
+
+    # Step 3: Gateway
+    if _prompt_yn("\n  是否配置 Gateway 访问方式?", default=True):
+        all_updates.update(_setup_gateway())
+
+    # Step 4: Optional Pi runtime/model parameters. Backend changes remain
+    # session-scoped commands and are intentionally not part of setup.
+    if _prompt_yn("\n  是否配置可选的 Pi 参数?", default=False):
+        all_updates.update(_setup_pi())
+
+    # Step 5: Advanced LLM/search controls
+    if _prompt_yn("\n  是否配置高级模型与搜索参数?", default=False):
+        all_updates.update(_setup_advanced())
+
+    # Step 6: Channels
     all_updates.update(_setup_channels())
 
     # Write
@@ -249,7 +639,12 @@ def _cmd_setup() -> int:
         print("=" * 56)
         print("  配置已保存到 .env")
         print()
-        masked_keys = {"LLM_API_KEY", "QQ_CLIENT_SECRET"}
+        masked_keys = {
+            "LLM_API_KEY",
+            "QQ_CLIENT_SECRET",
+            "GATEWAY_API_TOKEN",
+            "TAVILY_API_KEY",
+        }
         for k, v in all_updates.items():
             if k in masked_keys:
                 print(f"  {k} = ****")

@@ -51,6 +51,58 @@ def test_empty_command_is_handled_without_exception(tmp_path):
     assert "输入为空" in result
 
 
+@pytest.mark.parametrize(
+    ("command", "expected_commands"),
+    [
+        ("/session", ("/session new", "/session delete <sessionId>")),
+        ("/memory", ("/memory add", "/memory status")),
+        ("/workspace", ("/workspace set <路径>", "/workspace unset")),
+        ("/skill", ("/skill list", "/skill <skill-name> <任务描述>")),
+        ("/reflect", ("/reflect status", "/reflect now")),
+        ("/cron", ("/cron list", "/cron delete <jobId>")),
+        ("/rollback help", ("/rollback", "/rollback undo")),
+    ],
+)
+def test_command_namespaces_show_descriptive_help(
+    tmp_path, command, expected_commands
+):
+    result = handle_command(command, _state(tmp_path))
+
+    assert result.startswith("用法:")
+    for expected in expected_commands:
+        assert expected in result
+    assert len(result.splitlines()) >= 3
+
+
+def test_namespace_help_is_formatted_for_webui_markdown(tmp_path):
+    result = handle_command("/skill", _state(tmp_path), markdown=True)
+
+    assert result.startswith("### 可用指令")
+    assert "- `/skill list`：列出可用 Skills 及其简介" in result
+    assert "- `/skill show <skill-name>`：查看指定 Skill 的详细说明" in result
+    assert "**用法：** ``" not in result
+
+
+def test_unknown_namespace_subcommand_includes_available_commands(tmp_path):
+    result = handle_command("/memory unknown", _state(tmp_path))
+
+    assert result.startswith("未知 /memory 子命令")
+    assert "/memory add" in result
+    assert "/memory status" in result
+
+
+def test_empty_approval_list_explains_followup_commands(tmp_path):
+    approvals = MagicMock()
+    approvals.get_pending.return_value = []
+    state = _state(tmp_path, approval_manager=approvals)
+
+    result = handle_command("/approvals", state)
+
+    assert "当前没有待审批" in result
+    assert "/approve [approvalId]" in result
+    assert "/reject [approvalId] [原因]" in result
+
+
 def test_removed_mode_toggles_are_local_errors_and_do_not_change_state(tmp_path):
     workspace = MagicMock()
     workspace.is_unlimited.return_value = False
@@ -221,7 +273,9 @@ def test_active_turn_guard_covers_mutating_commands():
     assert _mutating_command_session("/rollback undo", "s1") == "s1"
     assert _mutating_command_session("/session delete s2", "s1") == "s2"
     assert _mutating_command_session("/workspace show", "s1") is None
+    assert _mutating_command_session("/pi", "s1") is None
     assert _mutating_command_session("/pi status", "s1") is None
+    assert _mutating_command_session("/pi on", "s1") == "s1"
 
 
 class _ShellWorkspace:

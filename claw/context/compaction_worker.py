@@ -1,28 +1,27 @@
-"""Async compaction worker: runs session compaction in a background thread.
+"""Threshold-triggered session compaction in a background thread.
 
-v3 changes:
-- Idle session auto-compaction: periodically checks for sessions that
-  haven't been touched in a configurable TTL and hard-truncates them.
 - Only one compaction runs at a time; concurrent submissions are
   silently skipped.
-- Takes a snapshot of ``session.messages`` under a brief lock before
-  the LLM call, so new messages appended during compaction are never
-  lost.
-- Retries once on LLM failure.
+- Takes a snapshot of the unconsolidated messages under a brief lock
+  before the LLM call, so new messages appended during compaction are
+  never lost.
+- Retries once on an actual summarization failure.
+- Treats "nothing can be compacted yet" as a normal no-op.
 """
 
 from __future__ import annotations
 
+import logging
 import threading
-import time
-import traceback
-from datetime import datetime, timezone
 from typing import Callable
 
 from claw.config import CompactionConfig
 from claw.llm.client import LLMClient
 from claw.session.models import Session
 from claw.session.store import SessionStore, SessionStoreError
+
+
+logger = logging.getLogger(__name__)
 
 
 class CompactionWorker:
@@ -32,9 +31,6 @@ class CompactionWorker:
     brief lock, then releases the lock before calling the LLM.  This
     means new messages appended during compaction are never lost.
 
-    When ``idle_ttl_minutes`` is set, the worker also periodically
-    scans for sessions that have been idle longer than the TTL and
-    hard-truncates them.
     """
 
     def __init__(
@@ -43,21 +39,17 @@ class CompactionWorker:
         session_store: SessionStore,
         compact_llm: LLMClient | None = None,
         config: CompactionConfig | None = None,
-        idle_ttl_minutes: int = 0,
         session_filter: Callable[[Session], bool] | None = None,
     ):
         self._main_llm = main_llm
         self._session_store = session_store
         self._compact_llm = compact_llm or main_llm
         self._config = config or CompactionConfig()
-        self._idle_ttl_minutes = idle_ttl_minutes
         self._session_filter = session_filter
 
         self._lock = threading.Lock()
         self._running = False
-        self._idle_running = False
         self._thread: threading.Thread | None = None
-        self._idle_thread: threading.Thread | None = None
 
     # -- public API --------------------------------------------------------
 
@@ -88,38 +80,24 @@ class CompactionWorker:
         return True
 
     def submit_if_needed(self, session: Session) -> bool:
-        """Submit when the unconsolidated tail crosses the token threshold."""
-        from claw.context.compaction import needs_compaction
+        """Submit after the token threshold and a safe split are both present."""
+        from claw.context.compaction import (
+            has_compactable_prefix,
+            needs_compaction,
+        )
 
         if not needs_compaction(
             session,
             max_message_tokens=self._config.max_message_tokens,
         ):
             return False
+        if not has_compactable_prefix(
+            session,
+            keep_recent_tokens=self._config.keep_recent_tokens,
+            keep_recent_messages_min=self._config.keep_recent_messages_min,
+        ):
+            return False
         return self.submit(session)
-
-    def start_idle_compaction(self) -> None:
-        """Start the idle-session compaction background loop.
-
-        Only active when ``idle_ttl_minutes > 0``.
-        """
-        if self._idle_ttl_minutes <= 0:
-            return
-        if self._idle_running:
-            return
-        self._idle_running = True
-        self._idle_thread = threading.Thread(
-            target=self._idle_loop,
-            daemon=True,
-            name="claw-idle-compaction",
-        )
-        self._idle_thread.start()
-
-    def stop_idle_compaction(self) -> None:
-        """Stop the idle-session compaction background loop."""
-        self._idle_running = False
-        if self._idle_thread is not None:
-            self._idle_thread.join(timeout=5)
 
     def wait(self, timeout: float | None = None) -> bool:
         """Wait for the current compaction to finish.
@@ -154,7 +132,7 @@ class CompactionWorker:
         try:
             self._do_compact(session, snapshot_messages, snapshot_summary, snapshot_revision)
         except Exception:
-            traceback.print_exc()
+            logger.exception("[compaction] 后台压缩发生未预期错误")
         finally:
             with self._lock:
                 self._running = False
@@ -169,6 +147,7 @@ class CompactionWorker:
     ) -> None:
         from claw.context.compaction import (
             CompactionError,
+            CompactionNotNeeded,
             apply_compaction_result,
             compact_session_snapshot,
         )
@@ -181,8 +160,10 @@ class CompactionWorker:
                 keep_recent_tokens=self._config.keep_recent_tokens,
                 keep_recent_messages_min=self._config.keep_recent_messages_min,
             )
+        except CompactionNotNeeded:
+            return
         except CompactionError:
-            # First attempt failed — retry once
+            # A real summarization failure may be transient, so retry once.
             try:
                 result = compact_session_snapshot(
                     snapshot_messages,
@@ -191,8 +172,10 @@ class CompactionWorker:
                     keep_recent_tokens=self._config.keep_recent_tokens,
                     keep_recent_messages_min=self._config.keep_recent_messages_min,
                 )
+            except CompactionNotNeeded:
+                return
             except CompactionError as exc:
-                print(f"[compaction] 后台压缩失败（已重试）: {exc}")
+                logger.error("[compaction] 后台压缩失败（已重试）: %s", exc)
                 return
 
         # Apply result to the live session (brief lock)
@@ -203,83 +186,17 @@ class CompactionWorker:
             # producing this summary.  Applying it would resurrect context
             # from the wrong history branch, so discard it.
             if session.revision != snapshot_revision:
-                print("[compaction] session 已变化，丢弃过期的后台压缩结果")
+                logger.info("[compaction] session 已变化，丢弃过期的后台压缩结果")
                 return
             apply_compaction_result(session, result)
 
         # Persist
         try:
             self._session_store.save(session)
-            print(
-                f"[compaction] 后台压缩完成: "
-                f"old_messages={result.old_message_count}, "
-                f"recent_messages={result.recent_message_count}"
+            logger.info(
+                "[compaction] 后台压缩完成: old_messages=%s, recent_messages=%s",
+                result.old_message_count,
+                result.recent_message_count,
             )
         except SessionStoreError as exc:
-            print(f"[compaction] 压缩完成但保存失败: {exc}")
-
-    # -- idle compaction loop ----------------------------------------------
-
-    def _idle_loop(self) -> None:
-        """Periodically scan for idle sessions and hard-truncate them.
-
-        This loop handles the idle trigger.  Per-turn token-threshold checks
-        are submitted separately by the shared agent loop.
-        """
-        # Check every 2 minutes (more responsive than an event-driven model)
-        poll_interval = 120
-
-        while self._idle_running:
-            try:
-                self._idle_tick()
-            except Exception:
-                traceback.print_exc()
-            time.sleep(poll_interval)
-
-    def _idle_tick(self) -> None:
-        """Scan for sessions idle longer than TTL and compact them."""
-        if self._idle_ttl_minutes <= 0:
-            return
-
-        now = datetime.now(timezone.utc)
-        summaries = self._session_store.list_summaries()
-
-        for s in summaries:
-            try:
-                updated = datetime.fromisoformat(s.updated_at)
-                age_minutes = (now - updated).total_seconds() / 60
-            except (ValueError, TypeError):
-                continue
-
-            if age_minutes < self._idle_ttl_minutes:
-                continue
-
-            # Load and check
-            try:
-                session = self._session_store.get(s.session_id)
-            except SessionStoreError:
-                continue
-            if self._session_filter is not None and not self._session_filter(session):
-                continue
-
-            from claw.context.compaction import has_compactable_idle_tail
-
-            if not has_compactable_idle_tail(session, max_suffix=8):
-                continue
-
-            # Hard-truncate this idle session
-            try:
-                from claw.context.compaction import compact_idle_session
-                summary = compact_idle_session(
-                    s.session_id,
-                    self._session_store,
-                    self._compact_llm,
-                    max_suffix=8,
-                )
-                if summary:
-                    print(
-                        f"[idle-compaction] 已压缩空闲 session "
-                        f"{s.session_id} (idle {age_minutes:.0f}min)"
-                    )
-            except Exception:
-                traceback.print_exc()
+            logger.error("[compaction] 压缩完成但保存失败: %s", exc)

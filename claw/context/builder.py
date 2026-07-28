@@ -457,10 +457,14 @@ class ContextBuilder:
             sections.append(memory)
         sections.append(
             "## Pi 与 SJTUClaw 集成规则\n\n"
-            "Pi 原生 system prompt 中列出的 Available tools、工具参数 schema "
-            "和工具专属 guidelines 是工具调用的权威说明。SJTUClaw 通过宿主工具桥接"
-            "补充长期记忆、Web、Cron 等能力；工具结果均来自实际执行，不得伪造。"
-            "会改变状态的操作仍受 SJTUClaw 审批与 workspace 边界约束。"
+            "Pi 原生工具只有四个：`read`（读取文件）、`bash`（执行命令）、"
+            "`edit`（编辑文件）、`write`（创建/覆盖文件）。这四个工具的定义和调用规则 "
+            "以 Pi 原生 system prompt 为准。\n\n"
+            "SJTUClaw 通过宿主工具桥接补充了以下能力：长期记忆（`recall`/`remember`）、"
+            "定时任务（`cron`）、时间查询（`current_time`）、Web 访问（`web_search`/`web_fetch`）、"
+            "附件管理（`copy_attachment_to_workspace`）和文件下载（`create_download`）。\n\n"
+            "所有工具的结果均来自实际执行，不得伪造。会改变状态的操作仍受 SJTUClaw "
+            "审批与 workspace 边界约束。"
             + (
                 "\n\n当前宿主是 Windows。Pi 的 bash 已经在当前工作区启动；执行工作区内"
                 "命令时优先使用 `.` 和相对路径，不要把带反斜杠的 Windows 绝对路径"

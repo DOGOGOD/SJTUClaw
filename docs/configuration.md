@@ -16,14 +16,19 @@ cp .env.example .env
 | `LLM_BASE_URL` | OpenAI 兼容 API 地址 |
 | `LLM_MODEL` | 模型名称 |
 
+可直接运行 `sjtuclaw setup` 使用交互式向导。源码运行时读取项目根目录的
+`.env`；安装版读取 `%USERPROFILE%\.sjtuclaw\.env`。系统环境变量优先于
+`.env`，Web UI 保存的运行时设置又优先于二者。
+
 ## Pi Agent 后端
 
 设置 `AGENT_BACKEND=pi` 后，新建会话默认由 Pi coding agent 的官方 RPC 模式执行；
 标题生成、反思等辅助服务仍复用现有 LLM 配置。Pi 的模型提供商、工具循环、
 Skills、Extensions、自动压缩、重试和持久会话均保留，WebUI、QQ 与桌宠接口不变。
-也可以在 CLI、WebUI 或 QQ 对话中输入 `/pi`，系统会先检查 Pi 运行环境并仅为
-当前 session 切换后端；`/pi status` 查看当前 session 后端，`/pi off` 仅将当前
-session 切回 SJTUClaw 原生后端。每个 session 的选择独立持久化。
+也可以在 CLI、WebUI 或 QQ 对话中输入 `/pi`，查看当前 session 的 Agent 后端和
+可用指令；只有显式输入 `/pi on` 时，系统才会检查 Pi 运行环境并为当前 session
+启用 Pi。`/pi off` 仅将当前 session 切回 SJTUClaw 原生后端。每个 session 的
+选择独立持久化。
 
 SJTUClaw 不替换 Pi 的默认 system prompt。Pi 会根据实际启用的工具自动生成
 `Available tools`、每个工具的 `promptSnippet` 与 `promptGuidelines`；SJTUClaw
@@ -78,7 +83,9 @@ Pi 本身不提供宿主权限沙箱。SJTUClaw 默认加载一个薄 Extension�
 `sjtuclaw` OpenAI-compatible provider。密钥不会写入 Pi 配置文件或命令行。
 显式设置 `PI_PROVIDER`/`PI_MODEL` 时则完全使用 Pi 自身的 auth 与 models 配置。
 
-也可以运行 `sjtuclaw setup` 使用交互式配置向导。
+配置向导可配置主模型、联网工具、
+时区、Gateway 本机/局域网访问、可选 Pi 参数、常用高级模型参数和 QQ Bot。
+它不会修改默认 Agent 后端；需要 Pi 时请在具体会话中显式使用 `/pi on`。
 
 ## 时区
 
@@ -96,17 +103,26 @@ CLAW_TIMEZONE=Asia/Shanghai
 |------|------|--------|
 | `GATEWAY_HOST` / `GATEWAY_PORT` | Gateway 监听地址和端口 | `127.0.0.1` / `8000` |
 | `GATEWAY_API_TOKEN` | Gateway API 认证令牌 | 空 |
+| `GATEWAY_ALLOWED_ORIGINS` | 非本机访问允许的浏览器来源，逗号分隔 | 空 |
+| `GATEWAY_OPEN_BROWSER` | 启动 Gateway 后自动打开浏览器 | `false` |
 | `CLAW_MAX_AGENT_ITERATIONS` | 单轮 Agent 最大迭代次数 | `15` |
 | `CLAW_MAX_TOOL_CALLS_PER_TURN` | 单轮工具调用上限 | `20` |
-| `COMPACT_IDLE_TTL_MINUTES` | 空闲会话压缩阈值 | `60` |
+| `COMPACT_MAX_MESSAGE_TOKENS` | 原生后端自动压缩的消息 token 阈值 | `2000` |
+| `COMPACT_KEEP_RECENT_TOKENS` | 压缩时保留的最近消息 token 预算 | `1000` |
 | `HEARTBEAT_INTERVAL_S` | Heartbeat 检查间隔 | `1800` |
+| `SJTUCLAW_USER_DIR` | 安装版用户根目录覆盖值 | `%USERPROFILE%\.sjtuclaw` |
+| `SJTUCLAW_DATA_DIR` | 运行数据目录覆盖值 | 源码版 `data/`；安装版用户根目录下的 `data/` |
 
 所有可用变量及注释见 [`.env.example`](../.env.example)。
+
+原生后端只会在消息 token 达到阈值后自动压缩；也可以使用 `/compact` 手动触发。
+会话空闲本身不会触发压缩。Pi 后端优先使用 Pi 自身的原生压缩。
 
 ## 安全建议
 
 - 不要提交 `.env` 或真实 API Key。
 - 为会话设置 workspace 后再执行文件写入和 Shell 操作。
 - 设置 workspace 会自动启用逐回合回退；快照默认存放在 `data/workspace/rollback/`，不要手动编辑其中的 SQLite 数据库或对象文件。
-- 非本机监听 Gateway 时设置 `GATEWAY_API_TOKEN`。
+- 非本机监听 Gateway 时必须设置 `GATEWAY_API_TOKEN`，并建议将
+  `GATEWAY_ALLOWED_ORIGINS` 限定为实际使用的完整 `http://` 或 `https://` 来源。
 - QQ Bot 凭证和允许来源应按需配置。

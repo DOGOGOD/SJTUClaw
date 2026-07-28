@@ -32,7 +32,22 @@ from claw.utils import now_iso
 from claw.workspace.manager import WorkspaceError, WorkspaceManager
 
 
-_EXCLUDED_DIRS = frozenset({".git", ".hg", ".svn", ".sjtuclaw-rollback-tmp"})
+_EXCLUDED_DIRS = frozenset(
+    {
+        ".git",
+        ".hg",
+        ".svn",
+        ".sjtuclaw-rollback-tmp",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".tox",
+        ".venv",
+        ".venv-build",
+        "__pycache__",
+        "node_modules",
+    }
+)
 
 
 class RollbackError(RuntimeError):

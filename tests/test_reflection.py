@@ -9,6 +9,8 @@ output).
 import json
 import shutil
 import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -326,10 +328,47 @@ class TestConfigPersistence:
         """Bad time format is silently ignored."""
         mgr.update_config(time="not-a-time")
         assert mgr.get_config()["time"] == "23:00"  # unchanged
+        mgr.update_config(time="99:99")
+        assert mgr.get_config()["time"] == "23:00"
 
     def test_update_config_accepts_valid_time(self, mgr):
         mgr.update_config(time="06:30")
         assert mgr.get_config()["time"] == "06:30"
+
+    def test_disable_then_enable_replaces_and_stops_worker(self, mgr):
+        mgr.start()
+        first = mgr._thread
+        assert first is not None and first.is_alive()
+
+        mgr.update_config(enabled=False)
+        assert not first.is_alive()
+
+        mgr.update_config(enabled=True)
+        second = mgr._thread
+        assert second is not None and second is not first and second.is_alive()
+
+        mgr.stop()
+        assert not second.is_alive()
+
+    def test_concurrent_run_now_is_rejected(self, mgr, monkeypatch):
+        entered = threading.Event()
+        release = threading.Event()
+
+        def blocked_gather():
+            entered.set()
+            release.wait(timeout=2)
+            return []
+
+        monkeypatch.setattr(mgr, "_gather_sessions", blocked_gather)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            first = pool.submit(mgr.run_now)
+            assert entered.wait(timeout=1)
+            second = mgr.run_now()
+            release.set()
+            first_result = first.result()
+
+        assert second == {"ok": False, "error": "反思任务正在运行，请稍后重试"}
+        assert first_result["ok"] is True
 
 
 # =============================================================================

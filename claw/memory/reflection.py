@@ -20,6 +20,7 @@ import re
 import threading
 import time
 import traceback
+import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -99,11 +100,17 @@ class ReflectionConfig:
         history = data.get("runHistory", [])
         if not isinstance(history, list):
             history = []
+        enabled = data.get("enabled", True)
+        if not isinstance(enabled, bool):
+            enabled = True
+        configured_time = str(data.get("time", _DEFAULT_TIME)).strip()
+        if not is_valid_reflection_time(configured_time):
+            configured_time = _DEFAULT_TIME
         return cls(
-            enabled=data.get("enabled", True),
-            time=data.get("time", _DEFAULT_TIME),
+            enabled=enabled,
+            time=configured_time,
             last_run_at=data.get("lastRunAt") or "",
-            run_history=history,
+            run_history=[item for item in history if isinstance(item, dict)],
         )
 
 
@@ -113,6 +120,14 @@ class ReflectionConfig:
 
 
 from claw.utils import default_timezone_name, now_iso as _now_iso
+
+
+def is_valid_reflection_time(value: str) -> bool:
+    """Return whether *value* is a real 24-hour ``HH:MM`` time."""
+    if re.fullmatch(r"\d{2}:\d{2}", value) is None:
+        return False
+    hour, minute = (int(part) for part in value.split(":", 1))
+    return 0 <= hour <= 23 and 0 <= minute <= 59
 
 
 def _time_matches(configured_time: str) -> bool:
@@ -221,7 +236,9 @@ class ReflectionManager:
         self._llm_client = llm_client
 
         self._config: ReflectionConfig = self._load_config()
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
+        self._run_lock = threading.Lock()
+        self._stop_event = threading.Event()
         self._running = False
         self._thread: threading.Thread | None = None
         self._ran_today: str = ""  # ISO date string of the last trigger today
@@ -231,20 +248,38 @@ class ReflectionManager:
     # ------------------------------------------------------------------
 
     def start(self) -> None:
-        if self._running:
-            return
-        if not self._config.enabled:
-            return
-        self._running = True
-        self._thread = threading.Thread(
-            target=self._loop, daemon=True, name="claw-reflection"
-        )
-        self._thread.start()
+        with self._lock:
+            self._start_locked()
 
     def stop(self) -> None:
+        with self._lock:
+            thread = self._request_stop_locked()
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=5)
+
+    def _start_locked(self) -> None:
+        if not self._config.enabled:
+            return
+        if self._thread is not None and self._thread.is_alive():
+            return
+        stop_event = threading.Event()
+        thread = threading.Thread(
+            target=self._loop,
+            args=(stop_event,),
+            daemon=True,
+            name="claw-reflection",
+        )
+        self._stop_event = stop_event
+        self._thread = thread
+        self._running = True
+        thread.start()
+
+    def _request_stop_locked(self) -> threading.Thread | None:
+        thread = self._thread
+        self._stop_event.set()
+        self._thread = None
         self._running = False
-        if self._thread is not None:
-            self._thread.join(timeout=5)
+        return thread
 
     # ------------------------------------------------------------------
     # Config accessors (thread-safe)
@@ -258,27 +293,28 @@ class ReflectionManager:
         """Update reflection config fields. Accepted keys:
         ``enabled`` (bool), ``time`` (str "HH:MM").
         """
+        thread_to_join: threading.Thread | None = None
         with self._lock:
             if "enabled" in kwargs:
                 self._config.enabled = bool(kwargs["enabled"])
             if "time" in kwargs:
                 raw = str(kwargs["time"]).strip()
-                # Validate HH:MM format
-                if re.match(r"^\d{2}:\d{2}$", raw):
+                if is_valid_reflection_time(raw):
                     self._config.time = raw
             self._save_config()
 
-            # Start / stop background thread as needed
-            if self._config.enabled and not self._running:
-                self._running = True
-                self._thread = threading.Thread(
-                    target=self._loop, daemon=True, name="claw-reflection"
-                )
-                self._thread.start()
-            elif not self._config.enabled and self._running:
-                self._running = False
+            if self._config.enabled:
+                self._start_locked()
+            elif self._thread is not None:
+                thread_to_join = self._request_stop_locked()
 
-            return self._config.to_dict()
+            result = self._config.to_dict()
+        if (
+            thread_to_join is not None
+            and thread_to_join is not threading.current_thread()
+        ):
+            thread_to_join.join(timeout=5)
+        return result
 
     # ------------------------------------------------------------------
     # Manual trigger
@@ -288,6 +324,15 @@ class ReflectionManager:
         """Execute reflection immediately. Returns a result dict."""
         if self._llm_client is None:
             return {"ok": False, "error": "LLM 客户端未初始化"}
+        if not self._run_lock.acquire(blocking=False):
+            return {"ok": False, "error": "反思任务正在运行，请稍后重试"}
+        try:
+            return self._run_now_unlocked()
+        finally:
+            self._run_lock.release()
+
+    def _run_now_unlocked(self) -> dict[str, Any]:
+        """Run one reflection cycle while ``_run_lock`` is held."""
 
         sessions_reviewed = 0
         facts_extracted = 0
@@ -348,14 +393,20 @@ class ReflectionManager:
     # Background loop
     # ------------------------------------------------------------------
 
-    def _loop(self) -> None:
+    def _loop(self, stop_event: threading.Event) -> None:
         """Polling loop — checks every minute whether the daily time has arrived."""
-        while self._running:
-            try:
-                self._tick()
-            except Exception:
-                traceback.print_exc()
-            time.sleep(_POLL_INTERVAL_SECONDS)
+        try:
+            while not stop_event.is_set():
+                try:
+                    self._tick()
+                except Exception:
+                    traceback.print_exc()
+                stop_event.wait(_POLL_INTERVAL_SECONDS)
+        finally:
+            with self._lock:
+                if self._thread is threading.current_thread():
+                    self._thread = None
+                    self._running = False
 
     def _tick(self) -> None:
         with self._lock:
@@ -515,11 +566,20 @@ class ReflectionManager:
     def _save_config(self) -> None:
         try:
             self._config_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self._config_path.with_suffix(".tmp")
-            tmp.write_text(
-                json.dumps(self._config.to_dict(), ensure_ascii=False, indent=2),
-                encoding="utf-8",
+            tmp = self._config_path.with_name(
+                f".{self._config_path.name}.{uuid.uuid4().hex}.tmp"
             )
-            tmp.replace(self._config_path)
+            try:
+                tmp.write_text(
+                    json.dumps(
+                        self._config.to_dict(),
+                        ensure_ascii=False,
+                        indent=2,
+                    ),
+                    encoding="utf-8",
+                )
+                tmp.replace(self._config_path)
+            finally:
+                tmp.unlink(missing_ok=True)
         except OSError:
             pass  # Non-fatal — config is readable from memory

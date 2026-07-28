@@ -17,7 +17,6 @@ Reliability features:
 from __future__ import annotations
 
 import logging
-import os
 import re
 import time
 from typing import Any, Iterable, Mapping, TYPE_CHECKING
@@ -26,6 +25,7 @@ import openai
 from openai import OpenAI
 
 from claw.config import LLMConfig
+from claw.env_utils import env_float, env_int
 from claw.llm.protocol import AgentResponse, ProtocolParseError, parse_agent_response
 
 if TYPE_CHECKING:
@@ -54,13 +54,13 @@ def _scrub_secrets(text: str) -> str:
     return redacted
 
 # -- Retry configuration (env-overridable) ----------------------------------
-_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "2"))
+_MAX_RETRIES = env_int("LLM_MAX_RETRIES", 2, minimum=0)
 """Number of automatic retries for transient failures (0 = no retry)."""
 
-_RETRY_BASE_DELAY = float(os.getenv("LLM_RETRY_BASE_DELAY", "1.0"))
+_RETRY_BASE_DELAY = env_float("LLM_RETRY_BASE_DELAY", 1.0, minimum=0.0)
 """Base delay in seconds for exponential backoff."""
 
-_REQUEST_TIMEOUT = float(os.getenv("LLM_REQUEST_TIMEOUT", "120"))
+_REQUEST_TIMEOUT = env_float("LLM_REQUEST_TIMEOUT", 120.0, minimum=1.0)
 """Per-request timeout in seconds (prevents indefinite hangs)."""
 
 

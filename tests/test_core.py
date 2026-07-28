@@ -377,6 +377,48 @@ class TestToolRegistry:
 # ═════════════════════════════════════════════════════════════════════
 
 class TestWorkspace:
+    def test_multiple_managers_preserve_each_others_bindings(
+        self, monkeypatch, tmp
+    ):
+        import claw.workspace.manager as workspace_module
+        from claw.workspace.manager import WorkspaceManager
+
+        bindings_path = tmp / "workspace-state" / "bindings.json"
+        first_root = tmp / "first"
+        second_root = tmp / "second"
+        first_root.mkdir()
+        second_root.mkdir()
+        monkeypatch.setattr(workspace_module, "_BINDINGS_PATH", bindings_path)
+
+        first = WorkspaceManager()
+        second = WorkspaceManager()
+        first.set("session-first", str(first_root))
+        second.set("session-second", str(second_root))
+
+        persisted = json.loads(bindings_path.read_text(encoding="utf-8"))
+        assert persisted == {
+            "session-first": str(first_root.resolve()),
+            "session-second": str(second_root.resolve()),
+        }
+
+    def test_corrupt_bindings_file_is_not_overwritten(self, monkeypatch, tmp):
+        import claw.workspace.manager as workspace_module
+        from claw.workspace.manager import WorkspaceError, WorkspaceManager
+
+        bindings_path = tmp / "workspace-state" / "bindings.json"
+        bindings_path.parent.mkdir(parents=True)
+        bindings_path.write_text("{broken", encoding="utf-8")
+        workspace = tmp / "project"
+        workspace.mkdir()
+        monkeypatch.setattr(workspace_module, "_BINDINGS_PATH", bindings_path)
+        manager = WorkspaceManager()
+
+        with pytest.raises(WorkspaceError, match="避免覆盖"):
+            manager.set("session", str(workspace))
+
+        assert bindings_path.read_text(encoding="utf-8") == "{broken"
+        assert manager.get("session") is None
+
     def test_load_tolerates_inaccessible_persisted_directory(
         self, monkeypatch, tmp
     ):

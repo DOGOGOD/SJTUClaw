@@ -81,6 +81,36 @@ def _store(tmp_path, session_id="reply-test"):
     return store
 
 
+def test_completed_turn_checks_token_threshold_compaction(tmp_path):
+    store = _store(tmp_path, "token-compact-hook")
+    client = _SequenceLLM(AgentResponse(final="完成"))
+
+    class RecordingCompactionWorker:
+        def __init__(self):
+            self.sessions = []
+
+        def submit_if_needed(self, session):
+            self.sessions.append(session.session_id)
+            return True
+
+    worker = RecordingCompactionWorker()
+    reply = run_agent_turn(
+        "token-compact-hook",
+        "请完成任务",
+        session_store=store,
+        context_builder=_Context(),
+        tool_registry=_registry(),
+        llm_client=client,
+        compaction_worker=worker,
+    )
+
+    assert reply == "完成"
+    assert worker.sessions == ["token-compact-hook"]
+    assert get_session_metrics_summary("token-compact-hook")[
+        "compaction_triggered_turns"
+    ] == 1
+
+
 def test_llm_failure_after_tool_produces_persisted_final_reply(tmp_path):
     store = _store(tmp_path)
     events = []

@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import asyncio
 
+import copy
+
 import errno
 
 import json
@@ -33,6 +35,8 @@ from contextlib import suppress
 from dataclasses import asdict
 
 from datetime import datetime
+
+from functools import wraps
 
 from pathlib import Path
 
@@ -69,6 +73,22 @@ from claw.scheduler.types import (
 logger = logging.getLogger(__name__)
 
 
+
+
+
+def _state_synchronized(method):
+
+    """Serialize in-process scheduler reads and mutations."""
+
+    @wraps(method)
+
+    def wrapper(self, *args, **kwargs):
+
+        with self._state_lock:
+
+            return method(self, *args, **kwargs)
+
+    return wrapper
 
 
 
@@ -393,6 +413,8 @@ class CronService:
         self._run_records_dir = self.store_path.parent / "runs"
 
         self._lock = FileLock(str(self._action_path.parent) + ".lock")
+
+        self._state_lock = threading.RLock()
 
         self.on_job = on_job
 
@@ -1204,7 +1226,9 @@ class CronService:
 
         path.parent.mkdir(parents=True, exist_ok=True)
 
-        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        tmp_path = path.with_name(
+            f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+        )
 
         try:
 
@@ -1416,7 +1440,15 @@ class CronService:
 
         """Handle timer tick - run due jobs."""
 
-        self._load_store()
+        with self._state_lock:
+
+            self._load_store()
+
+            store_available = self._store is not None
+
+            if store_available:
+
+                self._timer_active = True
 
         # If a hot reload found a corrupt store on disk, ``self._store`` may
 
@@ -1424,33 +1456,28 @@ class CronService:
 
         # it rather than crashing the timer or wiping live jobs.
 
-        if not self._store:
+        if not store_available:
 
             self._arm_timer()
 
             return
-
-
-
-        self._timer_active = True
-
         try:
 
             # v2: record heartbeat at the start of each tick
 
-            self._record_heartbeat(success=False)
+            with self._state_lock:
 
+                self._record_heartbeat(success=False)
 
+                now = _now_ms()
 
-            now = _now_ms()
+                due_jobs = [
 
-            due_jobs = [
+                    j for j in self._store.jobs
 
-                j for j in self._store.jobs
+                    if j.enabled and j.state.next_run_at_ms and now >= j.state.next_run_at_ms
 
-                if j.enabled and j.state.next_run_at_ms and now >= j.state.next_run_at_ms
-
-            ]
+                ]
 
 
 
@@ -1474,21 +1501,17 @@ class CronService:
 
                         continue
 
-                # v2: advance recurring job next_run before execution (crash safety)
-
-                if job.schedule.kind in ("cron", "every"):
-
-                    self._advance_next_run(job)
-
                 await self._execute_job(job)
 
 
 
             # v2: heartbeat with success=True if we got here without raising
 
-            self._record_heartbeat(success=True)
+            with self._state_lock:
 
-            self._save_store()
+                self._record_heartbeat(success=True)
+
+                self._save_store()
 
         except asyncio.CancelledError:
 
@@ -1502,9 +1525,11 @@ class CronService:
 
         finally:
 
-            self._timer_active = False
+            with self._state_lock:
 
-            self._arm_timer()
+                self._timer_active = False
+
+                self._arm_timer()
 
 
 
@@ -1532,37 +1557,47 @@ class CronService:
 
 
 
+        # Persist the claim/next run before invoking user code.  This keeps a
+
+        # process crash from redispatching a one-shot job or immediately
+
+        # replaying a recurring job.
+
+        with self._state_lock:
+
+            if job.schedule.kind in ("cron", "every"):
+
+                self._advance_next_run(job)
+
+            elif job.schedule.kind == "at":
+
+                job.state.run_claim = {"at_ms": start_ms, "by": self._machine_id()}
+
+            self._save_store()
+
+
+
         # v2: inject dependency context
 
-        original_message = job.payload.message
+        execution_job = copy.deepcopy(job)
 
         dep_context = self._build_dependency_context(job)
 
         if dep_context:
 
-            job.payload.message = (
+            execution_job.payload.message = (
 
-                f"{original_message}\n\n"
+                f"{job.payload.message}\n\n"
 
                 f"[依赖任务上下文]\n{dep_context}"
 
             )
 
-
-
-        # v2: stamp run_claim for one-shot jobs (at-most-once dispatch)
-
-        if job.schedule.kind == "at":
-
-            job.state.run_claim = {"at_ms": start_ms, "by": self._machine_id()}
-
-
-
         try:
 
             if self.on_job:
 
-                result_text = await self.on_job(job)
+                result_text = await self.on_job(execution_job)
 
             else:
 
@@ -1613,12 +1648,6 @@ class CronService:
             result_text = None
 
             logger.exception("Cron: job '%s' failed", job.name)
-
-
-
-        # v2: restore original message (don't persist the injected context)
-
-        job.payload.message = original_message
 
 
 
@@ -1724,6 +1753,8 @@ class CronService:
 
 
 
+    @_state_synchronized
+
     def list_jobs(self, include_disabled: bool = False) -> list[CronJob]:
 
         """List all jobs."""
@@ -1735,6 +1766,8 @@ class CronService:
         return sorted(jobs, key=lambda j: j.state.next_run_at_ms or float('inf'))
 
 
+
+    @_state_synchronized
 
     def list_bound_cron_jobs_for_session(
 
@@ -1763,6 +1796,8 @@ class CronService:
         ]
 
 
+
+    @_state_synchronized
 
     def add_job(
 
@@ -1896,6 +1931,8 @@ class CronService:
 
 
 
+    @_state_synchronized
+
     def register_system_job(self, job: CronJob) -> CronJob:
 
         """Register an internal system job (idempotent on restart)."""
@@ -1923,6 +1960,8 @@ class CronService:
         return job
 
 
+
+    @_state_synchronized
 
     def remove_job(self, job_id: str) -> Literal["removed", "protected", "not_found"]:
 
@@ -1974,6 +2013,8 @@ class CronService:
 
 
 
+    @_state_synchronized
+
     def enable_job(self, job_id: str, enabled: bool = True) -> CronJob | None:
 
         """Enable or disable a job."""
@@ -2013,6 +2054,8 @@ class CronService:
         return None
 
 
+
+    @_state_synchronized
 
     def update_job(
 
@@ -2132,47 +2175,57 @@ class CronService:
 
         """Manually run a job without disturbing the service's running state."""
 
-        was_running = self._running
+        with self._state_lock:
 
-        self._running = True
+            was_running = self._running
+
+            self._running = True
 
         try:
 
-            store = self._require_store()
+            with self._state_lock:
 
-            for job in store.jobs:
+                store = self._require_store()
 
-                if job.id == job_id:
+                job = next((item for item in store.jobs if item.id == job_id), None)
 
-                    if self._is_unbound_agent_job(job):
+                if job is None:
 
-                        self._enforce_agent_binding(job)
+                    return False
 
-                        self._save_store()
+                if self._is_unbound_agent_job(job):
 
-                        return False
-
-                    if not force and not job.enabled:
-
-                        return False
-
-                    await self._execute_job(job)
+                    self._enforce_agent_binding(job)
 
                     self._save_store()
 
-                    return True
+                    return False
 
-            return False
+                if not force and not job.enabled:
+
+                    return False
+
+            await self._execute_job(job)
+
+            with self._state_lock:
+
+                self._save_store()
+
+            return True
 
         finally:
 
-            self._running = was_running
+            with self._state_lock:
 
-            if was_running:
+                self._running = was_running
 
-                self._arm_timer()
+                if was_running:
+
+                    self._arm_timer()
 
 
+
+    @_state_synchronized
 
     def get_job(self, job_id: str) -> CronJob | None:
 
@@ -2183,6 +2236,8 @@ class CronService:
         return next((j for j in store.jobs if j.id == job_id), None)
 
 
+
+    @_state_synchronized
 
     def status(self) -> dict:
 
@@ -2213,6 +2268,8 @@ class CronService:
     # ==================================================================
 
 
+
+    @_state_synchronized
 
     def pause_job(self, job_id: str, reason: str = "") -> CronJob | None:
 
@@ -2260,6 +2317,8 @@ class CronService:
 
 
 
+    @_state_synchronized
+
     def resume_job(self, job_id: str) -> CronJob | None:
 
         """Resume a paused job and recompute the next future run."""
@@ -2299,6 +2358,8 @@ class CronService:
         return None
 
 
+
+    @_state_synchronized
 
     def trigger_job(self, job_id: str) -> CronJob | None:
 
@@ -2394,6 +2455,8 @@ class CronService:
 
 
 
+    @_state_synchronized
+
     def get_heartbeat_age_seconds(self) -> float | None:
 
         """Seconds since the ticker last iterated, or None if unknown.
@@ -2415,6 +2478,8 @@ class CronService:
         return max(0.0, (_now_ms() - store.heartbeat_at_ms) / 1000.0)
 
 
+
+    @_state_synchronized
 
     def get_success_age_seconds(self) -> float | None:
 
@@ -2666,6 +2731,8 @@ class CronService:
             job.state.next_run_at_ms = new_next
 
 
+
+    @_state_synchronized
 
     def claim_dispatch(self, job_id: str) -> bool:
 

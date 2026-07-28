@@ -13,7 +13,7 @@ import logging
 import os
 import time
 import uuid
-from collections import defaultdict, deque
+from collections import deque
 from threading import Lock
 from typing import Any
 
@@ -127,11 +127,13 @@ class RateLimiter:
         max_requests: int = RATE_LIMIT_MAX_REQUESTS,
         window_s: float = RATE_LIMIT_WINDOW_S,
         burst: int = RATE_LIMIT_BURST,
+        max_clients: int = 10_000,
     ):
         self._max_requests = max_requests
         self._window_s = window_s
         self._burst = burst
-        self._buckets: dict[str, deque[float]] = defaultdict(deque)
+        self._max_clients = max(1, max_clients)
+        self._buckets: dict[str, deque[float]] = {}
         self._lock = Lock()
 
     def check(self, client_id: str) -> tuple[bool, int]:
@@ -143,7 +145,21 @@ class RateLimiter:
         now = time.monotonic()
         cutoff = now - self._window_s
         with self._lock:
-            bucket = self._buckets[client_id]
+            bucket = self._buckets.get(client_id)
+            if bucket is None:
+                self._evict_stale_locked(cutoff)
+                if len(self._buckets) >= self._max_clients:
+                    oldest_client = min(
+                        self._buckets,
+                        key=lambda key: (
+                            self._buckets[key][-1]
+                            if self._buckets[key]
+                            else float("-inf")
+                        ),
+                    )
+                    del self._buckets[oldest_client]
+                bucket = deque()
+                self._buckets[client_id] = bucket
             # Evict expired entries
             while bucket and bucket[0] < cutoff:
                 bucket.popleft()
@@ -159,14 +175,27 @@ class RateLimiter:
         now = time.monotonic()
         cutoff = now - self._window_s
         with self._lock:
-            if len(self._buckets) > max_clients:
-                # Too many clients — evict all empty/expired buckets
-                stale = [
-                    cid for cid, bucket in self._buckets.items()
-                    if not bucket or bucket[-1] < cutoff
-                ]
-                for cid in stale:
-                    del self._buckets[cid]
+            self._evict_stale_locked(cutoff)
+            limit = max(1, min(max_clients, self._max_clients))
+            while len(self._buckets) > limit:
+                oldest_client = min(
+                    self._buckets,
+                    key=lambda key: (
+                        self._buckets[key][-1]
+                        if self._buckets[key]
+                        else float("-inf")
+                    ),
+                )
+                del self._buckets[oldest_client]
+
+    def _evict_stale_locked(self, cutoff: float) -> None:
+        stale = [
+            client_id
+            for client_id, bucket in self._buckets.items()
+            if not bucket or bucket[-1] < cutoff
+        ]
+        for client_id in stale:
+            del self._buckets[client_id]
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):

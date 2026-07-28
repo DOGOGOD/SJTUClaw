@@ -78,6 +78,63 @@ class PetCatalogTests(unittest.TestCase):
         self.catalog.remove("test-pet")
         self.assertEqual(self.catalog.load_settings().selected_pet_id, "yuexinmiao")
 
+    def test_install_failure_does_not_expose_partial_pet(self):
+        buffer = io.BytesIO()
+        Image.new("RGBA", (1536, 2288), (0, 0, 0, 0)).save(buffer, "WEBP")
+        buffer.seek(0)
+        target = self.catalog._user_pets / "atomic-pet"
+        real_replace = __import__("os").replace
+
+        def fail_final_swap(source, destination):
+            if Path(destination) == target:
+                raise PermissionError(13, "simulated failure")
+            return real_replace(source, destination)
+
+        with patch("claw.pet.catalog.os.replace", side_effect=fail_final_swap):
+            with self.assertRaisesRegex(PetCatalogError, "安装失败"):
+                self.catalog.install(
+                    pet_id="atomic-pet",
+                    display_name="Atomic",
+                    description="",
+                    spritesheet=buffer,
+                    filename="pet.webp",
+                    sprite_version_number=2,
+                )
+
+        self.assertFalse(target.exists())
+        self.assertFalse(list(self.catalog._user_pets.glob(".install-*")))
+
+    def test_remove_restores_pet_when_settings_write_fails(self):
+        buffer = io.BytesIO()
+        Image.new("RGBA", (1536, 2288), (0, 0, 0, 0)).save(buffer, "WEBP")
+        buffer.seek(0)
+        self.catalog.install(
+            pet_id="selected-pet",
+            display_name="Selected",
+            description="",
+            spritesheet=buffer,
+            filename="pet.webp",
+            sprite_version_number=2,
+        )
+        self.catalog.update_settings(selected_pet_id="selected-pet")
+        settings_path = self.catalog._settings_path
+        real_replace = __import__("os").replace
+
+        def fail_settings_swap(source, destination):
+            if Path(destination) == settings_path:
+                raise PermissionError(13, "simulated settings failure")
+            return real_replace(source, destination)
+
+        with patch("claw.pet.catalog.os.replace", side_effect=fail_settings_swap):
+            with self.assertRaises(PermissionError):
+                self.catalog.remove("selected-pet")
+
+        self.assertTrue((self.catalog._user_pets / "selected-pet").is_dir())
+        self.assertEqual(
+            self.catalog.load_settings().selected_pet_id,
+            "selected-pet",
+        )
+
     def test_list_pets_deduplicates_identical_spritesheets(self):
         bundled_asset = self.catalog._bundled / "yuexinmiao" / "spritesheet.webp"
         duplicate_dir = self.catalog._user_pets / "duplicate-cat"

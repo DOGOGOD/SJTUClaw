@@ -198,6 +198,77 @@ def _default_pi_repo() -> Path:
     return Path(raw).expanduser().resolve() if raw else (PROJECT_ROOT.parent / "pi").resolve()
 
 
+def _is_legacy_wsl_bash(path: str | Path) -> bool:
+    """Return whether *path* is Windows' legacy WSL bash launcher."""
+    normalized = str(path).replace("/", "\\").lower()
+    return normalized.endswith(("\\windows\\system32\\bash.exe", "\\windows\\sysnative\\bash.exe"))
+
+
+def _is_usable_native_bash(path: Path) -> bool:
+    """Probe a Bash candidate and reject wrappers that actually launch WSL."""
+    marker = "__SJTUCLAW_NATIVE_BASH__"
+    probe = (
+        'case "$(uname -r 2>/dev/null)" in *icrosoft*|*Microsoft*|*WSL*) exit 42;; esac; '
+        f"printf {marker}"
+    )
+    env = os.environ.copy()
+    env["WSL_UTF8"] = "1"
+    try:
+        completed = subprocess.run(
+            [str(path), "-c", probe],
+            cwd=str(MAIN_DIR),
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=3,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return completed.returncode == 0 and completed.stdout == marker.encode()
+
+
+def _preferred_windows_bash() -> Path | None:
+    """Find a native Windows Bash before Pi falls back to the WSL launcher."""
+    if os.name != "nt":
+        return None
+
+    configured = setting_value("PI_SHELL_PATH", "").strip()
+    if configured:
+        candidate = Path(configured).expanduser()
+        try:
+            return candidate.resolve() if candidate.is_file() and _is_usable_native_bash(candidate) else None
+        except OSError:
+            return None
+
+    candidates: list[Path] = []
+    for variable in ("ProgramFiles", "ProgramFiles(x86)"):
+        root = os.environ.get(variable)
+        if root:
+            candidates.append(Path(root) / "Git" / "bin" / "bash.exe")
+    path_value = os.environ.get("PATH", "")
+    candidates.extend(Path(entry) / "bash.exe" for entry in path_value.split(os.pathsep) if entry)
+
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            if (
+                candidate.is_file()
+                and not _is_legacy_wsl_bash(candidate)
+                and _is_usable_native_bash(candidate)
+            ):
+                return candidate.resolve()
+        except OSError:
+            # WindowsApps can expose inaccessible App Execution Aliases.
+            continue
+    return None
+
+
 def _resolve_pi_command() -> tuple[str, ...]:
     raw = setting_value("PI_COMMAND", "").strip()
     if raw:
@@ -638,6 +709,21 @@ class PiAgentClient(LLMClient):
 
     def _child_env(self, config: PiRuntimeConfig) -> dict[str, str]:
         env = os.environ.copy()
+        if os.name == "nt":
+            # WSL's launcher emits localized diagnostics as UTF-16LE unless
+            # WSL_UTF8 is enabled. Pi's output accumulator expects UTF-8.
+            env["WSL_UTF8"] = "1"
+
+            # Pi accepts the first bash.exe on PATH after checking Git Bash.
+            # Avoid selecting the legacy WSL launcher exposed by System32.
+            shell = _preferred_windows_bash()
+            if shell is not None:
+                path_key = next((key for key in env if key.lower() == "path"), "PATH")
+                current_path = env.get(path_key, "")
+                shell_dir = str(shell.parent)
+                entries = current_path.split(os.pathsep) if current_path else []
+                if not entries or os.path.normcase(entries[0]) != os.path.normcase(shell_dir):
+                    env[path_key] = os.pathsep.join([shell_dir, *entries])
         if config.agent_dir:
             env["PI_CODING_AGENT_DIR"] = str(config.agent_dir)
         if config.tool_manifest_file:

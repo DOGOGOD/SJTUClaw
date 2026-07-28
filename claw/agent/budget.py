@@ -12,13 +12,14 @@ parallel tool executors without races.
 
 from __future__ import annotations
 
-import os
 import threading
+
+from claw.env_utils import env_int
 
 
 def _default_max_iterations() -> int:
     """Read the iteration cap from the environment (matches loop.py)."""
-    return int(os.getenv("CLAW_MAX_AGENT_ITERATIONS", "15"))
+    return env_int("CLAW_MAX_AGENT_ITERATIONS", 15, minimum=1)
 
 
 class IterationBudget:

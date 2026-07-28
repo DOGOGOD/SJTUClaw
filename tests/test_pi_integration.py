@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import threading
 import time
+from pathlib import Path
 
 import pytest
 from fastapi import HTTPException
@@ -17,6 +19,7 @@ from claw.pi.client import (
     PiAgentClient,
     PiRuntimeConfig,
     RuntimeAgentClient,
+    _is_legacy_wsl_bash,
     get_session_backend,
     set_session_backend,
 )
@@ -254,6 +257,27 @@ def test_pi_uses_session_bound_workspace_as_process_cwd(tmp_path, monkeypatch):
     assert observed == [workspace.resolve()]
 
 
+def test_pi_windows_child_env_prefers_native_bash_and_enables_utf8(tmp_path, monkeypatch):
+    client, _store = _client_and_store(tmp_path)
+    native_bash = tmp_path / "tools" / "bash.exe"
+    native_bash.parent.mkdir()
+    native_bash.touch()
+    monkeypatch.setattr("claw.pi.client._preferred_windows_bash", lambda: native_bash)
+    monkeypatch.setenv("PATH", str(tmp_path / "other"))
+
+    env = client._child_env(_runtime(tmp_path, _ERROR_PI))
+    path_key = next(key for key in env if key.lower() == "path")
+
+    assert env["WSL_UTF8"] == "1"
+    assert env[path_key].split(os.pathsep)[0] == str(native_bash.parent)
+
+
+def test_pi_recognizes_only_windows_legacy_wsl_bash_launchers():
+    assert _is_legacy_wsl_bash(Path("C:/Windows/System32/bash.exe"))
+    assert _is_legacy_wsl_bash(Path("C:/Windows/Sysnative/bash.exe"))
+    assert not _is_legacy_wsl_bash(Path("C:/Program Files/Git/bin/bash.exe"))
+
+
 def test_new_pi_branch_receives_existing_sjtuclaw_history_once(tmp_path, monkeypatch):
     configured = _runtime(tmp_path, _ERROR_PI)
     monkeypatch.setattr("claw.pi.client.load_pi_config", lambda: configured)
@@ -425,7 +449,7 @@ def test_pi_command_uses_native_prompt_and_only_appends_sjtu_context(tmp_path):
     assert any(value.endswith("sjtuclaw_tools.ts") for value in command)
 
 
-def test_pi_append_prompt_keeps_identity_memory_but_not_legacy_tool_contract(tmp_path):
+def test_pi_append_prompt_keeps_identity_memory_but_not_legacy_tool_contract(tmp_path, monkeypatch):
     from claw.context.builder import ContextBuilder
     from claw.memory.store import MemoryStore
 
@@ -437,6 +461,7 @@ def test_pi_append_prompt_keeps_identity_memory_but_not_legacy_tool_contract(tmp
         importance=4,
     )
     builder = ContextBuilder("SJTU system", "SJTU soul", memory, workspace_path=str(tmp_path))
+    monkeypatch.setattr("platform.system", lambda: "Windows")
 
     prompt = builder.build_pi_append_prompt("session-a")
 
@@ -445,6 +470,8 @@ def test_pi_append_prompt_keeps_identity_memory_but_not_legacy_tool_contract(tmp
     assert "Pi 原生 system prompt" in prompt
     assert "find_files" not in prompt
     assert "edit_file" not in prompt
+    assert "不要把带反斜杠的 Windows 绝对路径" in prompt
+    assert "先执行 `pwd`" in prompt
 
 
 def test_pi_runtime_manifest_bridges_sjtu_tools_but_not_native_equivalents(tmp_path):
@@ -671,3 +698,44 @@ def test_compact_command_routes_to_pi_native_compaction(tmp_path):
     )
 
     assert handle_command("/compact", state) == "native compact ok"
+
+
+def test_compact_command_falls_back_when_pi_session_is_too_small(tmp_path):
+    from claw.cli.commands import RuntimeState, handle_command
+    from claw.memory.store import MemoryStore
+
+    class PiLike:
+        def backend_for_session(self, session_id, session_store):
+            assert session_id == "s"
+            assert session_store is store
+            return "pi"
+
+        def compact_session(self, session_id, *, session_store):
+            raise RuntimeError("Nothing to compact (session too small)")
+
+        def chat(self, _messages):
+            return "SJTUCLAW_FALLBACK_SUMMARY"
+
+    store = SessionStore(tmp_path / "sessions")
+    session = store.create_session(session_id="s")
+    for index in range(6):
+        session.append_message(
+            "user" if index % 2 == 0 else "assistant",
+            f"short-{index}",
+        )
+    store.save(session)
+    state = RuntimeState(
+        session_store=store,
+        memory_store=MemoryStore(tmp_path / "memory"),
+        llm_client=PiLike(),
+        current_session_id="s",
+    )
+
+    result = handle_command("/compact", state)
+
+    assert "Nothing to compact (session too small)" in result
+    assert "已回退到 SJTUClaw 统一会话压缩" in result
+    assert "Compacted session s." in result
+    loaded = store.get("s")
+    assert loaded.summary == "SJTUCLAW_FALLBACK_SUMMARY"
+    assert loaded.last_consolidated == 2

@@ -87,6 +87,17 @@ class CompactionWorker:
         self._thread.start()
         return True
 
+    def submit_if_needed(self, session: Session) -> bool:
+        """Submit when the unconsolidated tail crosses the token threshold."""
+        from claw.context.compaction import needs_compaction
+
+        if not needs_compaction(
+            session,
+            max_message_tokens=self._config.max_message_tokens,
+        ):
+            return False
+        return self.submit(session)
+
     def start_idle_compaction(self) -> None:
         """Start the idle-session compaction background loop.
 
@@ -212,8 +223,8 @@ class CompactionWorker:
     def _idle_loop(self) -> None:
         """Periodically scan for idle sessions and hard-truncate them.
 
-        Only compaction trigger is idle-session scanning.
-        No per-turn proactive compaction or token-threshold checks.
+        This loop handles the idle trigger.  Per-turn token-threshold checks
+        are submitted separately by the shared agent loop.
         """
         # Check every 2 minutes (more responsive than an event-driven model)
         poll_interval = 120

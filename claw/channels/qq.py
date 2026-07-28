@@ -352,9 +352,13 @@ class QQChannel(BaseChannel):
 
     async def _connect_and_listen(self) -> None:
         """Authenticate, get gateway URL, open WebSocket, listen."""
-        await self._ensure_token()
-        gateway_url = await self._get_gateway_url()
-        await self._open_ws(gateway_url)
+        # ``_reconnect`` already opens a fresh socket after its backoff.
+        # Reusing it here avoids immediately closing that successful
+        # connection and issuing a second gateway request.
+        if self._ws is None or self._ws.closed:
+            await self._ensure_token()
+            gateway_url = await self._get_gateway_url()
+            await self._open_ws(gateway_url)
 
         # Start persistent tasks (survive across reconnects in _listen_loop)
         if self._listen_task is None or self._listen_task.done():
@@ -539,7 +543,13 @@ class QQChannel(BaseChannel):
         # op 10 = Hello
         if op == 10:
             d_data = d if isinstance(d, dict) else {}
-            interval_ms = d_data.get("heartbeat_interval", 30000)
+            try:
+                interval_ms = float(d_data.get("heartbeat_interval", 30000))
+            except (TypeError, ValueError, OverflowError):
+                interval_ms = 30000.0
+            # Treat the remote interval as untrusted input.  A zero/negative
+            # value would otherwise create a busy heartbeat loop.
+            interval_ms = min(300_000.0, max(1_000.0, interval_ms))
             self._heartbeat_interval = interval_ms / 1000.0 * 0.8
             if self._session_id and self._last_seq is not None:
                 asyncio.create_task(self._send_resume())
@@ -615,7 +625,8 @@ class QQChannel(BaseChannel):
         if msg_id in self._seen_messages:
             return True
         if len(self._seen_messages) >= DEDUP_MAX_SIZE:
-            return False
+            oldest = min(self._seen_messages, key=self._seen_messages.get)
+            self._seen_messages.pop(oldest, None)
         self._seen_messages[msg_id] = now
         return False
 

@@ -18,10 +18,11 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import re
 from dataclasses import dataclass, field
 from typing import Any
+
+from claw.env_utils import env_int
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +38,11 @@ logger = logging.getLogger(__name__)
 # When the limit is exceeded the parser now **truncates** to the first
 # ``MAX_TOOL_CALLS_PER_TURN`` calls (with a warning) instead of raising
 # an error, so the agent can continue making progress.
-MAX_TOOL_CALLS_PER_TURN = int(os.getenv("CLAW_MAX_TOOL_CALLS_PER_TURN", "20"))
+MAX_TOOL_CALLS_PER_TURN = env_int(
+    "CLAW_MAX_TOOL_CALLS_PER_TURN",
+    20,
+    minimum=1,
+)
 
 
 # ---------------------------------------------------------------------------

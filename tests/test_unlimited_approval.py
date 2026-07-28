@@ -290,6 +290,44 @@ class TestApprovalGateEnforcement:
         assert len(tracker.calls) == 1
         assert tracker.calls[0].tool_name == "run_command"
 
+    def test_sandboxed_auto_mode_shell_tool_requires_approval(
+        self, store, context_builder
+    ):
+        """AUTO must not bypass approval for arbitrary shell interpreters."""
+        session = store.create_session(session_id="auto-shell")
+        store.save(session)
+
+        tools = {"run_command": _FakeTool("run_command", safety_level="shell")}
+        registry = _FakeToolRegistry(tools)
+        tool_call = MagicMock()
+        tool_call.name = "run_command"
+        tool_call.args = {
+            "command": (
+                "powershell -Command "
+                "\"Get-Content $env:USERPROFILE\\private.txt\""
+            )
+        }
+        client = _FakeLLMClient([
+            _FakeLLMResponse(is_tool_call=True, tool_calls=[tool_call]),
+            _FakeLLMResponse(final="done"),
+        ])
+        tracker = _ApprovalCallTracker(decision="approved")
+
+        run_agent_turn(
+            "auto-shell",
+            "test",
+            session_store=store,
+            context_builder=context_builder,
+            tool_registry=registry,
+            llm_client=client,
+            approval_handler=tracker,
+            auto_mode=True,
+            unlimited_mode=False,
+        )
+
+        assert len(tracker.calls) == 1
+        assert tracker.calls[0].tool_name == "run_command"
+
     def test_unlimited_auto_mode_relative_path_requires_approval(
         self, store, context_builder
     ):
@@ -565,7 +603,7 @@ class TestUnlimitedCommandRegistration:
         from claw.cli.commands import _COMMAND_PREFIXES
         assert "/unlimited" in _COMMAND_PREFIXES
 
-    def test_unlimited_is_command(self):
+    def test_removed_unlimited_toggle_is_intercepted_locally(self):
         from claw.cli.commands import is_command
         assert is_command("/unlimited") is True
         assert is_command("/unlimited on") is True
@@ -662,7 +700,7 @@ class TestUnlimitedCommandBehavior:
         assert "已关闭" in result
         assert wm.is_unlimited("test_ul_off") is False
 
-    def test_unlimited_toggle(self):
+    def test_removed_unlimited_toggle_does_not_change_state(self):
         from claw.cli.commands import RuntimeState, handle_command
         from claw.workspace.manager import WorkspaceManager
 
@@ -677,12 +715,9 @@ class TestUnlimitedCommandBehavior:
             workspace_manager=wm,
         )
 
-        # Toggle on
-        result1 = handle_command("/unlimited toggle", state)
-        assert wm.is_unlimited("test_ul_tog") is True
+        result = handle_command("/unlimited toggle", state)
 
-        # Toggle off
-        result2 = handle_command("/unlimited toggle", state)
+        assert "未知" in result
         assert wm.is_unlimited("test_ul_tog") is False
 
     def test_unlimited_no_args_shows_help_without_toggling(self):
@@ -766,7 +801,7 @@ class TestAutoCommandBehavior:
         assert state.auto_mode is True
         assert "当前已开启" in result
 
-    def test_auto_requires_explicit_toggle(self):
+    def test_auto_requires_explicit_on_or_off(self):
         from claw.cli.commands import handle_command
 
         state = self._state()
@@ -774,8 +809,9 @@ class TestAutoCommandBehavior:
         assert state.auto_mode is True
         handle_command("/auto off", state)
         assert state.auto_mode is False
-        handle_command("/auto toggle", state)
-        assert state.auto_mode is True
+        result = handle_command("/auto toggle", state)
+        assert "未知" in result
+        assert state.auto_mode is False
 
     def test_gateway_persists_auto_mode(self, monkeypatch):
         from claw.gateway import server

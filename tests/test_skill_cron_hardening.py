@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import threading
 import time
+import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -47,6 +50,71 @@ def test_skill_manager_rejects_category_path_traversal(tmp_path: Path, monkeypat
     assert not (tmp_path.parent / "escape").exists()
 
 
+def test_skill_replacement_failure_restores_previous_version(
+    tmp_path: Path, monkeypatch
+):
+    import claw.skills.management as management
+
+    skills_dir = tmp_path / "skills"
+    existing = skills_dir / "safe-skill"
+    existing.mkdir(parents=True)
+    old_doc = _skill_doc("safe-skill", "old version")
+    (existing / "SKILL.md").write_text(old_doc, encoding="utf-8")
+    monkeypatch.setattr(management, "SKILLS_DIR", skills_dir)
+
+    payload = io.BytesIO()
+    with zipfile.ZipFile(payload, "w") as archive:
+        archive.writestr(
+            "safe-skill/SKILL.md",
+            _skill_doc("safe-skill", "new version"),
+        )
+
+    real_replace = management.os.replace
+
+    def fail_final_swap(source, destination):
+        if destination == skills_dir / "safe-skill" and source.name.startswith(
+            ".install-"
+        ):
+            raise PermissionError(13, "simulated install failure")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(management.os, "replace", fail_final_swap)
+
+    with pytest.raises(management.SkillPackageError, match="旧版本已保留"):
+        management.install_skill_package_bytes(
+            payload.getvalue(),
+            "safe-skill.zip",
+            replace=True,
+        )
+
+    assert (existing / "SKILL.md").read_text(encoding="utf-8") == old_doc
+    assert not list(skills_dir.glob(".install-*"))
+    assert not list(skills_dir.glob(".*.backup-*"))
+
+
+def test_skill_remove_failure_keeps_original_directory(tmp_path: Path, monkeypatch):
+    import claw.skills.management as management
+
+    skills_dir = tmp_path / "skills"
+    skill_dir = skills_dir / "safe-skill"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        _skill_doc("safe-skill"),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(management, "SKILLS_DIR", skills_dir)
+
+    def fail_rename(_source, _destination):
+        raise PermissionError(13, "locked")
+
+    monkeypatch.setattr(management.os, "replace", fail_rename)
+
+    with pytest.raises(management.SkillPackageError, match="原目录已保留"):
+        management.remove_skill_completely("safe-skill")
+
+    assert (skill_dir / "SKILL.md").is_file()
+
+
 def test_context_builder_exposes_index_and_loads_selected_skill(tmp_path: Path):
     from claw.context.builder import ContextBuilder
     from claw.memory.store import MemoryStore
@@ -87,6 +155,32 @@ def test_cron_service_rejects_ambiguous_or_non_runnable_schedules(tmp_path: Path
         )
     with pytest.raises(ValueError, match="invalid cron expression"):
         service.add_job("bad-cron", CronSchedule(kind="cron", expr="not cron"), "x")
+
+
+def test_running_cron_service_preserves_concurrent_job_additions(tmp_path: Path):
+    from claw.scheduler.service import CronService
+    from claw.scheduler.types import CronSchedule
+
+    service = CronService(tmp_path / "jobs.json")
+    service._running = True
+    service._arm_timer = lambda: None
+
+    def add(index: int):
+        return service.add_job(
+            f"job-{index}",
+            CronSchedule(kind="every", every_ms=60_000),
+            f"message-{index}",
+            session_key="session",
+            origin_channel="cli",
+            origin_chat_id="session",
+        )
+
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        jobs = [future.result() for future in [pool.submit(add, i) for i in range(40)]]
+
+    assert len({job.id for job in jobs}) == 40
+    assert len(service.list_jobs()) == 40
+    assert len(CronService(tmp_path / "jobs.json").list_jobs()) == 40
 
 
 def test_cron_service_missing_timezone_uses_default_timezone():

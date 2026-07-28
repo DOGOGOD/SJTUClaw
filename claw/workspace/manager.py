@@ -19,6 +19,8 @@ import time
 import uuid
 from pathlib import Path
 
+from filelock import FileLock, Timeout as FileLockTimeout
+
 from claw.config import DATA_DIR
 
 
@@ -147,30 +149,66 @@ class WorkspaceManager:
                 detail += f"，其中 {missing} 个目录当前不存在"
             print(f"[workspace] {detail}")
 
-    def _save(self) -> None:
-        """Persist current bindings to disk. Caller must hold ``self._lock``."""
-        data = {
-            sid: str(ws)
-            for sid, ws in self._workspaces.items()
+    @staticmethod
+    def _read_persisted_bindings() -> dict[str, str]:
+        """Read the latest valid on-disk bindings snapshot."""
+        if not _BINDINGS_PATH.exists():
+            return {}
+        try:
+            loaded = json.loads(_BINDINGS_PATH.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+        except json.JSONDecodeError as exc:
+            raise WorkspaceError(
+                "workspace 绑定文件已损坏；为避免覆盖现有绑定，已拒绝保存"
+            ) from exc
+        except OSError as exc:
+            raise WorkspaceError(f"无法读取 workspace 绑定文件: {exc}") from exc
+        if not isinstance(loaded, dict):
+            raise WorkspaceError(
+                "workspace 绑定文件格式无效；为避免覆盖现有绑定，已拒绝保存"
+            )
+        return {
+            sid: ws
+            for sid, ws in loaded.items()
+            if isinstance(sid, str) and isinstance(ws, str)
         }
+
+    def _persist_change(self, session_id: str, workspace: Path | None) -> None:
+        """Atomically apply one binding change without losing other writers.
+
+        A CLI and Gateway can have separate ``WorkspaceManager`` instances
+        backed by the same file.  Persisting an instance's stale full mapping
+        would erase bindings created by the other process, so every write
+        reloads the latest snapshot and changes only the requested session.
+        """
         with _PERSIST_LOCK:
             _BINDINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
-            # A unique source prevents one manager from replacing another
-            # manager's shared ``bindings.tmp`` before it can be committed.
-            tmp = _BINDINGS_PATH.with_name(
-                f".{_BINDINGS_PATH.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
-            )
             try:
-                tmp.write_text(
-                    json.dumps(data, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
-                _atomic_replace_with_retry(tmp, _BINDINGS_PATH)
-            finally:
-                try:
-                    tmp.unlink(missing_ok=True)
-                except OSError:
-                    pass
+                with FileLock(str(_BINDINGS_PATH) + ".lock", timeout=10):
+                    data = self._read_persisted_bindings()
+                    if workspace is None:
+                        data.pop(session_id, None)
+                    else:
+                        data[session_id] = str(workspace)
+                    tmp = _BINDINGS_PATH.with_name(
+                        f".{_BINDINGS_PATH.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+                    )
+                    try:
+                        tmp.write_text(
+                            json.dumps(data, ensure_ascii=False, indent=2),
+                            encoding="utf-8",
+                        )
+                        _atomic_replace_with_retry(tmp, _BINDINGS_PATH)
+                    finally:
+                        try:
+                            tmp.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+            except FileLockTimeout as exc:
+                raise WorkspaceError(
+                    "保存 workspace 绑定失败：等待持久化锁超时"
+                ) from exc
 
     # -- binding --------------------------------------------------------------
 
@@ -187,8 +225,8 @@ class WorkspaceManager:
         if not resolved.is_dir():
             raise WorkspaceError(f"路径不是目录: \"{path_str}\"")
         with self._lock:
+            self._persist_change(session_id, resolved)
             self._workspaces[session_id] = resolved
-            self._save()
         return resolved
 
     def get(self, session_id: str) -> Path | None:
@@ -199,8 +237,8 @@ class WorkspaceManager:
     def unset(self, session_id: str) -> None:
         """Remove the workspace binding for *session_id*."""
         with self._lock:
+            self._persist_change(session_id, None)
             self._workspaces.pop(session_id, None)
-            self._save()
 
     def require(self, session_id: str) -> Path:
         """Return the workspace root for *session_id*.
@@ -246,7 +284,7 @@ class WorkspaceManager:
         checks are bypassed and the path is resolved as-is.
         """
         # Atomically read both unlimited and workspace state to avoid
-        # TOCTOU races with concurrent /unlimited toggles.
+        # TOCTOU races with concurrent /unlimited mode changes.
         with self._lock:
             unlimited = session_id in self._unlimited_sessions
             ws = self._workspaces.get(session_id)

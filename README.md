@@ -232,7 +232,7 @@ SJTUClaw 默认对写入和 Shell 等高风险工具进行审批，并将文件�
 | 模式 | 作用 | 审批行为 | 文件系统边界 |
 |------|------|----------|--------------|
 | 默认模式 | 使用完整安全保护 | 写入和 Shell 操作逐次审批 | 仅允许访问当前 workspace |
-| AUTO | 减少 workspace 内操作的人工确认 | 自动批准写入和 Shell 操作；Skill 加载确认仍保留 | 仍严格限制在当前 workspace，越界操作由工具拒绝 |
+| AUTO | 减少 workspace 内操作的人工确认 | 自动批准结构化文件写入；Shell 和 Skill 加载确认仍保留 | 仍严格限制在当前 workspace，越界操作由工具拒绝 |
 | UNLIMITED | 解除 workspace 路径限制 | 写入、覆盖、删除和 Shell 操作始终逐次审批，AUTO 无法跳过 | 可访问 workspace 外路径 |
 
 启用或查看 AUTO 模式：
@@ -240,7 +240,6 @@ SJTUClaw 默认对写入和 Shell 等高风险工具进行审批，并将文件�
 ```text
 /auto on       # 开启
 /auto off      # 关闭
-/auto toggle   # 切换
 /auto status   # 查看当前 Session 的状态
 ```
 
@@ -249,11 +248,10 @@ SJTUClaw 默认对写入和 Shell 等高风险工具进行审批，并将文件�
 ```text
 /unlimited on       # 允许访问 workspace 外路径
 /unlimited off      # 恢复 workspace 边界
-/unlimited toggle   # 切换
 /unlimited status   # 查看当前 Session 的状态
 ```
 
-> AUTO 不等于取消安全边界：它只省略 workspace 沙箱内写入和 Shell 操作的逐次审批。UNLIMITED 才会解除路径边界，但不会取消危险操作审批。两个模式同时开启时，UNLIMITED 的强制审批规则优先。
+> AUTO 不等于取消安全边界：它只省略 workspace 沙箱内结构化文件写入的逐次审批，Shell 命令始终需要明确审批。UNLIMITED 才会解除路径边界，但不会取消危险操作审批。
 
 ### Workspace 回退
 
@@ -302,11 +300,11 @@ dist\installer\SJTUClaw-Setup-<version>.exe
 /workspace set|show|unset
 /rollback [n|checkpointId]|list|status|undo
 /compact
-/memory add|list|search|update|delete|stats
+/memory add|list|search|update|delete|status
 /reflect status|enable|disable|time|now
 /skill list|show|usage|<name>
-/auto on|off|toggle|status
-/unlimited on|off|toggle|status
+/auto on|off|status
+/unlimited on|off|status
 /pi [on|off|status]
 /cron list|status|disable|enable|delete
 /approvals|approve|reject
@@ -314,6 +312,9 @@ dist\installer\SJTUClaw-Setup-<version>.exe
 /stop
 /help
 ```
+
+`/compact` 会立即压缩当前会话中可安全归档的完整旧轮次，不需要等待
+`COMPACT_MAX_MESSAGE_TOKENS` 自动阈值或空闲压缩触发；最近消息保留窗口仍会保留。
 
 也可以直接用自然语言创建定时任务、保存记忆或请求使用 Skill。
 

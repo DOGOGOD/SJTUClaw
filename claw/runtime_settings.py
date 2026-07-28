@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import json
 import os
+import threading
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -26,18 +28,21 @@ SECRET_KEYS = {
     "QQ_CLIENT_SECRET",
 }
 
+_settings_lock = threading.RLock()
+
 
 def _fernet() -> Fernet:
-    SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
-    if KEY_PATH.exists():
-        key = KEY_PATH.read_bytes().strip()
-    else:
-        key = Fernet.generate_key()
-        KEY_PATH.write_bytes(key)
-        try:
-            os.chmod(KEY_PATH, 0o600)
-        except OSError:
-            pass
+    with _settings_lock:
+        SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
+        if KEY_PATH.exists():
+            key = KEY_PATH.read_bytes().strip()
+        else:
+            key = Fernet.generate_key()
+            KEY_PATH.write_bytes(key)
+            try:
+                os.chmod(KEY_PATH, 0o600)
+            except OSError:
+                pass
     return Fernet(key)
 
 
@@ -59,62 +64,64 @@ def _decrypt(value: Any) -> str:
 
 def load_runtime_settings(decrypt_secrets: bool = True) -> dict[str, str]:
     """Return all persisted WebUI settings as flat environment-style keys."""
-    if not SETTINGS_PATH.exists():
-        return {}
-    try:
-        raw = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-    if not isinstance(raw, dict):
-        return {}
-
-    result: dict[str, str] = {}
-    for key, value in raw.items():
-        if key in SECRET_KEYS:
-            result[key] = _decrypt(value) if decrypt_secrets else ("********" if _decrypt(value) else "")
-        elif value is None:
-            result[key] = ""
-        else:
-            result[key] = str(value)
-    return result
+    with _settings_lock:
+        raw = load_runtime_settings_raw()
+        result: dict[str, str] = {}
+        for key, value in raw.items():
+            if key in SECRET_KEYS:
+                result[key] = _decrypt(value) if decrypt_secrets else ("********" if _decrypt(value) else "")
+            elif value is None:
+                result[key] = ""
+            else:
+                result[key] = str(value)
+        return result
 
 
 def update_runtime_settings(updates: dict[str, Any]) -> dict[str, str]:
     """Merge settings into the encrypted runtime settings file."""
-    SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
-    current = load_runtime_settings_raw()
+    with _settings_lock:
+        SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
+        current = load_runtime_settings_raw()
 
-    for key, value in updates.items():
-        normalized = "" if value is None else str(value).strip()
-        if key in SECRET_KEYS:
-            if normalized:
-                current[key] = _encrypt(normalized)
-        else:
-            current[key] = normalized
+        for key, value in updates.items():
+            normalized = "" if value is None else str(value).strip()
+            if key in SECRET_KEYS:
+                if normalized:
+                    current[key] = _encrypt(normalized)
+            else:
+                current[key] = normalized
 
-    tmp = SETTINGS_PATH.with_suffix(".tmp")
-    tmp.write_text(json.dumps(current, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(SETTINGS_PATH)
-    return load_runtime_settings(decrypt_secrets=True)
+        _write_runtime_settings_raw(current)
+        return load_runtime_settings(decrypt_secrets=True)
 
 
 def load_runtime_settings_raw() -> dict[str, Any]:
     """Read the encrypted settings payload without decrypting it."""
-    if not SETTINGS_PATH.exists():
-        return {}
-    try:
-        loaded = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-    return loaded if isinstance(loaded, dict) else {}
+    with _settings_lock:
+        if not SETTINGS_PATH.exists():
+            return {}
+        try:
+            loaded = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return loaded if isinstance(loaded, dict) else {}
 
 
 def replace_runtime_settings_raw(payload: dict[str, Any]) -> None:
     """Replace the encrypted settings payload exactly, for rollback."""
-    SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = SETTINGS_PATH.with_suffix(".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(SETTINGS_PATH)
+    with _settings_lock:
+        SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
+        _write_runtime_settings_raw(payload)
+
+
+def _write_runtime_settings_raw(payload: dict[str, Any]) -> None:
+    """Atomically write settings without sharing a temporary filename."""
+    tmp = SETTINGS_PATH.with_name(f".{SETTINGS_PATH.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(SETTINGS_PATH)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def setting_value(name: str, default: str = "") -> str:

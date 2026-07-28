@@ -726,6 +726,25 @@ class TestRateLimiter:
 
         assert ok_b
 
+    def test_client_buckets_are_bounded(self):
+        from claw.gateway.middleware import RateLimiter
+
+        rl = RateLimiter(
+            max_requests=1,
+            window_s=60.0,
+            burst=1,
+            max_clients=3,
+        )
+
+        for index in range(20):
+            allowed, _remaining = rl.check(f"client-{index}")
+            assert allowed
+
+        assert len(rl._buckets) == 3
+        # The oldest client was evicted, so it can start a fresh bucket.
+        allowed, _remaining = rl.check("client-0")
+        assert allowed
+
     def test_only_marked_loopback_pet_runtime_requests_are_internal(self):
         from starlette.requests import Request
         from claw.gateway.middleware import _is_internal_pet_request

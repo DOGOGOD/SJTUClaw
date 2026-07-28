@@ -14,6 +14,7 @@ from pathlib import Path
 
 import uvicorn
 
+from claw.env_utils import env_int
 from claw.paths import resource_root, user_root
 from claw.utils import force_utf8_stdio
 
@@ -25,7 +26,7 @@ def _port_available(port: int) -> bool:
 
 
 def _choose_port() -> int:
-    requested = int(os.getenv("GATEWAY_PORT", "8000"))
+    requested = env_int("GATEWAY_PORT", 8000, minimum=1, maximum=65535)
     if _port_available(requested):
         return requested
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:

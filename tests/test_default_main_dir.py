@@ -39,3 +39,28 @@ def test_readonly_relative_path_uses_main_dir_for_unbound_session(monkeypatch, t
     )
 
     assert target == main.resolve()
+
+
+def test_readonly_unbound_session_rejects_absolute_path_outside_main_dir(
+    monkeypatch, tmp_path
+):
+    main = tmp_path / "project-root"
+    outside = tmp_path / "private.txt"
+    main.mkdir()
+    outside.write_text("secret", encoding="utf-8")
+    monkeypatch.setattr(readonly, "main_dir", lambda: main)
+
+    class UnboundWorkspaceManager:
+        def is_unlimited(self, _session_id: str) -> bool:
+            return False
+
+        def get(self, _session_id: str) -> Path | None:
+            return None
+
+    handler = readonly._make_read_file_handler(
+        UnboundWorkspaceManager(), lambda: "session_001"
+    )
+    result = handler({"path": str(outside)})
+
+    assert not result.ok
+    assert "outside workspace" in (result.error or "")

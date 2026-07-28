@@ -24,8 +24,11 @@ from __future__ import annotations
 import json
 import re
 import shutil
-from dataclasses import dataclass, field
+import threading
+import uuid
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
+from functools import wraps
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -185,6 +188,17 @@ class MemoryStoreError(RuntimeError):
     """User-facing memory storage error."""
 
 
+def _synchronized(method):
+    """Serialize access to one ``MemoryStore`` instance."""
+
+    @wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return wrapper
+
+
 @dataclass
 class MemoryEntry:
     """A single structured memory — metadata + rich Markdown body."""
@@ -204,15 +218,29 @@ class MemoryEntry:
     _file_path: Path | None = field(default=None, repr=False)
 
     def __post_init__(self):
+        if not isinstance(self.memory_id, str) or not self.memory_id.strip():
+            raise MemoryStoreError("memory id 不能为空")
+        if not isinstance(self.content, str):
+            raise MemoryStoreError("记忆内容必须是字符串")
+        if not isinstance(self.category, str):
+            raise MemoryStoreError("记忆类别必须是字符串")
         if self.category not in MEMORY_CATEGORIES:
             raise MemoryStoreError(
                 f"无效的记忆类别: \"{self.category}\"，"
                 f"可选: {', '.join(sorted(MEMORY_CATEGORIES))}"
             )
+        if not isinstance(self.importance, int):
+            raise MemoryStoreError("importance 必须是整数")
         if not 1 <= self.importance <= 5:
             raise MemoryStoreError(
                 f"importance 必须在 1-5 之间，实际为 {self.importance}"
             )
+        if not isinstance(self.recall_count, int) or self.recall_count < 0:
+            raise MemoryStoreError("recall_count 必须是非负整数")
+        if not isinstance(self.tags, list) or any(
+            not isinstance(tag, str) for tag in self.tags
+        ):
+            raise MemoryStoreError("tags 必须是字符串列表")
         # Normalise tags
         seen: set[str] = set()
         norm: list[str] = []
@@ -264,18 +292,25 @@ class MemoryEntry:
             raise MemoryStoreError(f"frontmatter 缺少 id 字段: {file_path}")
 
         created_at = meta.get("created_at") or _now_iso()
+        try:
+            importance = int(meta.get("importance", 3))
+            recall_count = int(meta.get("recall_count", 0))
+        except (TypeError, ValueError) as exc:
+            raise MemoryStoreError(
+                f"frontmatter 数字字段格式错误: {file_path}"
+            ) from exc
 
         return cls(
             memory_id=memory_id,
             content=body,
             category=meta.get("category", "general"),
             tags=meta.get("tags") if isinstance(meta.get("tags"), list) else [],
-            importance=int(meta.get("importance", 3)),
+            importance=importance,
             source_session_id=str(meta.get("source_session_id", "")),
             created_at=str(created_at),
             updated_at=str(meta.get("updated_at") or created_at),
             last_recalled_at=str(meta.get("last_recalled_at", "")),
-            recall_count=int(meta.get("recall_count", 0)),
+            recall_count=recall_count,
             _file_path=file_path,
         )
 
@@ -301,17 +336,22 @@ class MemoryEntry:
         memory_id = data.get("id", "")
         content = data.get("content", "")
         created_at = data.get("createdAt") or _now_iso()
+        try:
+            importance = int(data.get("importance", 3))
+            recall_count = int(data.get("recallCount", 0))
+        except (TypeError, ValueError) as exc:
+            raise MemoryStoreError("旧记忆数字字段格式错误") from exc
         return cls(
             memory_id=memory_id,
             content=content,
             category=data.get("category", "general"),
             tags=data.get("tags") if isinstance(data.get("tags"), list) else [],
-            importance=data.get("importance", 3),
+            importance=importance,
             source_session_id=data.get("sourceSessionId", ""),
             created_at=str(created_at),
             updated_at=str(data.get("updatedAt") or created_at),
             last_recalled_at=str(data.get("lastRecalledAt", "")),
-            recall_count=data.get("recallCount", 0),
+            recall_count=recall_count,
         )
 
 
@@ -344,6 +384,7 @@ class MemoryStore:
     def __init__(self, memory_dir: Path):
         self._memory_dir = Path(memory_dir)
         self._entries: list[MemoryEntry] = []
+        self._lock = threading.RLock()
         self.load_warning: str | None = None
         # Bumped on every mutation (add/update/delete) so that
         # ContextBuilder can invalidate its memory-block cache.
@@ -358,7 +399,8 @@ class MemoryStore:
         (add/update/delete).  Consumers can use this to detect
         whether their cached snapshot is stale.
         """
-        return self._version
+        with self._lock:
+            return self._version
 
     # ------------------------------------------------------------------
     # Startup: scan .md files + optional legacy migration
@@ -458,19 +500,19 @@ class MemoryStore:
         """Write *entry* to its .md file (atomic tmp+replace)."""
         file_path = self._make_file_path(entry)
         file_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = file_path.with_suffix(".tmp")
-        tmp.write_text(entry.to_markdown(), encoding="utf-8")
-        tmp.replace(file_path)
+        tmp = file_path.with_name(f".{file_path.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            tmp.write_text(entry.to_markdown(), encoding="utf-8")
+            tmp.replace(file_path)
+        finally:
+            tmp.unlink(missing_ok=True)
         entry._file_path = file_path
         return file_path
 
     def _delete_md_file(self, entry: MemoryEntry) -> None:
         """Remove the backing .md file, if it exists."""
         if entry._file_path and entry._file_path.exists():
-            try:
-                entry._file_path.unlink()
-            except OSError:
-                pass
+            entry._file_path.unlink()
         # Clean up empty category dir
         if entry._file_path:
             parent = entry._file_path.parent
@@ -484,9 +526,11 @@ class MemoryStore:
     # CRUD — basic
     # ------------------------------------------------------------------
 
+    @_synchronized
     def list(self) -> list[MemoryEntry]:
         return list(self._entries)
 
+    @_synchronized
     def add(
         self,
         content: str,
@@ -516,6 +560,7 @@ class MemoryStore:
         self._version += 1
         return entry
 
+    @_synchronized
     def update(self, memory_id: str, content: str) -> MemoryEntry:
         content = content.strip()
         if not content:
@@ -523,25 +568,47 @@ class MemoryStore:
 
         for entry in self._entries:
             if entry.memory_id == memory_id:
-                # Remove old file if the slug changed
                 old_path = entry._file_path
-                entry.content = content
-                entry.updated_at = _now_iso()
-                new_path = self._write_md_file(entry)
+                candidate = replace(
+                    entry,
+                    content=content,
+                    updated_at=_now_iso(),
+                )
+                try:
+                    new_path = self._write_md_file(candidate)
+                except OSError as exc:
+                    raise MemoryStoreError(
+                        f"更新 memory {memory_id} 失败: {exc}"
+                    ) from exc
                 if old_path and old_path.exists() and old_path != new_path:
                     try:
                         old_path.unlink()
-                    except OSError:
-                        pass
+                    except OSError as exc:
+                        try:
+                            new_path.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                        raise MemoryStoreError(
+                            f"更新 memory {memory_id} 失败，旧文件未删除: {exc}"
+                        ) from exc
+                entry.content = candidate.content
+                entry.updated_at = candidate.updated_at
+                entry._file_path = candidate._file_path
                 self._version += 1
                 return entry
 
         raise MemoryStoreError(f"未找到 memory: {memory_id}")
 
+    @_synchronized
     def delete(self, memory_id: str) -> None:
         for i, entry in enumerate(self._entries):
             if entry.memory_id == memory_id:
-                self._delete_md_file(entry)
+                try:
+                    self._delete_md_file(entry)
+                except OSError as exc:
+                    raise MemoryStoreError(
+                        f"删除 memory {memory_id} 失败: {exc}"
+                    ) from exc
                 self._entries.pop(i)
                 self._version += 1
                 return
@@ -551,11 +618,13 @@ class MemoryStore:
     # Structured operations
     # ------------------------------------------------------------------
 
+    @_synchronized
     def list_by_category(self, category: str | None = None) -> list[MemoryEntry]:
         if category is None:
             return self.list()
         return [e for e in self._entries if e.category == category]
 
+    @_synchronized
     def stats(self) -> dict[str, int]:
         counts: dict[str, int] = {}
         for entry in self._entries:
@@ -567,6 +636,7 @@ class MemoryStore:
     # Retrieval (keyword + tag + CJK char scoring)
     # ------------------------------------------------------------------
 
+    @_synchronized
     def recall(
         self,
         query: str,
@@ -658,14 +728,19 @@ class MemoryStore:
         if results:
             now = _now_iso()
             for entry in results:
-                entry.last_recalled_at = now
-                entry.recall_count += 1
-                # Write updated frontmatter back to disk
+                candidate = replace(
+                    entry,
+                    last_recalled_at=now,
+                    recall_count=entry.recall_count + 1,
+                )
                 try:
                     if entry._file_path:
-                        self._write_md_file(entry)
+                        self._write_md_file(candidate)
                 except Exception:
-                    pass  # Non-fatal — tracking lost but data safe
+                    continue  # Non-fatal — tracking lost but data stays in sync
+                entry.last_recalled_at = candidate.last_recalled_at
+                entry.recall_count = candidate.recall_count
+                entry._file_path = candidate._file_path
 
         return results
 

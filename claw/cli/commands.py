@@ -7,7 +7,7 @@ forwarded to the LLM as ordinary chat messages.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from contextlib import nullcontext
 from typing import Callable
 from zoneinfo import ZoneInfo
@@ -19,6 +19,7 @@ from claw.context.compaction import (
     compact_and_persist,
 )
 from claw.llm.client import LLMClient
+from claw.memory.reflection import is_valid_reflection_time
 from claw.memory.store import MemoryStore, MemoryStoreError
 from claw.session.store import SessionNotFoundError, SessionStore, SessionStoreError
 from claw.tools.base import ToolRegistry
@@ -47,7 +48,7 @@ _HELP_TEXT = (
     "    search <关键词>          搜索记忆\n"
     "    update <id> <新内容>     更新记忆\n"
     "    delete <id>              删除记忆\n"
-    "    stats                    记忆统计\n"
+    "    status                   记忆统计\n"
     "  /reflect <sub> ...       每日记忆反思\n"
     "    status                   查看反思状态\n"
     "    enable / disable         启用/禁用\n"
@@ -88,11 +89,9 @@ _HELP_TEXT = (
     "  /auto                    查看 AUTO 状态和可用指令\n"
     "    status                  查看当前状态\n"
     "    on / off                开启 / 关闭 AUTO 模式\n"
-    "    toggle                  切换 AUTO 模式\n"
     "  /unlimited               查看 UNLIMITED 状态和可用指令\n"
     "    status                   查看当前状态\n"
     "    on / off                 开启 / 关闭 UNLIMITED 模式\n"
-    "    toggle                   切换 UNLIMITED 模式\n"
     "  /pi                      为当前 session 启用 Pi Agent 后端\n"
     "    status                   查看当前 Agent 后端\n"
     "    off                      切回 SJTUClaw 原生后端\n"
@@ -124,7 +123,7 @@ _HELP_MARKDOWN = """# SJTUClaw 可用指令
 - `/memory search <关键词>`：搜索记忆
 - `/memory update <id> <新内容>`：更新记忆
 - `/memory delete <id>`：删除记忆
-- `/memory stats`：查看记忆统计
+- `/memory status`：查看记忆统计
 - `/reflect status`：查看每日记忆反思状态
 - `/reflect enable` / `/reflect disable`：启用或禁用反思
 - `/reflect time <HH:MM>`：设置执行时间
@@ -158,16 +157,14 @@ _HELP_MARKDOWN = """# SJTUClaw 可用指令
 - `/auto`：查看 AUTO 状态和可用指令
   - `/auto status`：查看当前状态
   - `/auto on` / `/auto off`：开启或关闭 AUTO 模式
-  - `/auto toggle`：切换 AUTO 模式
 - `/unlimited`：查看 UNLIMITED 状态和可用指令
   - `/unlimited status`：查看当前状态
   - `/unlimited on` / `/unlimited off`：开启或关闭 UNLIMITED 模式
-  - `/unlimited toggle`：切换 UNLIMITED 模式
 - `/pi` / `/pi on`：检查 Pi 运行环境并为当前 session 启用 Pi
 - `/pi status`：查看当前 session 的 Agent 后端
 - `/pi off`：仅将当前 session 切回 SJTUClaw 原生后端
 
-> **安全提示：** AUTO 模式只会自动批准 workspace 内的操作。UNLIMITED 模式下涉及 workspace 外部的写入、覆盖、删除和 Shell 操作仍需用户明确审批。
+> **安全提示：** AUTO 模式只会自动批准 workspace 内的结构化文件写入；Shell 命令始终需要明确审批。UNLIMITED 模式下所有写入、覆盖、删除和 Shell 操作也都需要明确审批。
 
 ## Skill 管理
 
@@ -216,47 +213,68 @@ class RuntimeState:
     rollback_manager: WorkspaceRollbackManager | None = None
     # Track the current pending approval for the active agent turn
     pending_approval_id: str | None = None
-    # AUTO mode — skip approval for write/shell tools
+    # AUTO mode — skip approval for structured workspace writes only
     auto_mode: bool = False
+    # AUTO is session-scoped. Sharing this mapping across command invocations
+    # prevents a privileged mode from leaking when the user switches sessions.
+    auto_modes: dict[str, bool] = field(default_factory=dict)
     # Optional callbacks for gateway integration
     stop_handler: Callable[[], str] | None = None  # () -> result text
     exit_handler: Callable[[], str] | None = None  # () -> result text
     backend_switcher: Callable[[str], str] | None = None
 
+    def __post_init__(self) -> None:
+        if self.auto_mode:
+            self.auto_modes[self.current_session_id] = True
+        else:
+            self.auto_mode = self.auto_modes.get(
+                self.current_session_id,
+                False,
+            )
+
 
 def is_command(user_input: str) -> bool:
-    """Return True if `user_input` is a slash command."""
-    return any(
-        user_input == prefix or user_input.startswith(prefix + " ")
-        for prefix in _COMMAND_PREFIXES
-    )
+    """Return whether input belongs to a known slash-command namespace.
+
+    Unsupported or removed subcommands are still intercepted locally so they
+    cannot accidentally be forwarded to the LLM as ordinary chat messages.
+    """
+    parts = user_input.split(maxsplit=1)
+    return bool(parts) and parts[0] in _COMMAND_PREFIXES
 
 
 def handle_command(user_input: str, state: RuntimeState, *, markdown: bool = False) -> str:
     """Handle a command and return the text to print."""
-    root, *args = user_input.split()
-
     def finish(result: str) -> str:
         return _format_command_markdown(result) if markdown else result
+
+    parts = user_input.split()
+    if not parts:
+        return finish("未知命令：输入为空（输入 /help 查看可用指令）")
+    root, *args = parts
 
     if root == "/session":
         return finish(_handle_session_command(args, state))
     if root == "/memory":
-        return finish(_handle_memory_command(user_input, args, state))
+        return finish(_handle_memory_command(args, state))
     if root == "/compact":
+        if args:
+            return finish("用法: /compact")
         return finish(_handle_compact_command(state))
     if root == "/workspace":
         return finish(_handle_workspace_command(args, state))
     if root == "/rollback":
         return finish(_handle_rollback_command(args, state))
     if root == "/approvals":
+        if args:
+            return finish("用法: /approvals")
         return finish(_handle_approvals_list(state))
     if root == "/approve":
         return finish(_handle_approve(args, state))
     if root == "/reject":
-        return finish(_handle_reject(user_input, args, state))
+        return finish(_handle_reject(args, state))
     if root == "/skill":
-        return finish(_handle_skill_command(user_input, args, state))
+        return finish(_handle_skill_command(args, state))
     if root == "/reflect":
         return finish(_handle_reflect_command(args, state))
     if root == "/cron":
@@ -270,16 +288,24 @@ def handle_command(user_input: str, state: RuntimeState, *, markdown: bool = Fal
     if root == "/pi":
         return finish(_handle_pi_command(args, state))
     if root == "/help":
+        if args:
+            return finish("用法: /help")
         return _HELP_MARKDOWN if markdown else _HELP_TEXT
     if root == "/stop":
+        if args:
+            return finish("用法: /stop")
         return finish(_handle_stop_command(state))
     if root == "/exit":
+        if args:
+            return finish("用法: /exit")
         return finish(_handle_exit_command(state))
     return finish(f"未知命令: {root}（输入 /help 查看可用指令）")
 
 
 def _handle_pi_command(args: list[str], state: RuntimeState) -> str:
     """Switch only the current session's main agent backend."""
+    if len(args) > 1:
+        return "用法: /pi [on|off|status]"
     action = args[0].lower() if args else "on"
     target = {
         "on": "pi", "enable": "pi",
@@ -355,15 +381,19 @@ def _handle_session_command(args: list[str], state: RuntimeState) -> str:
     sub, rest = args[0], args[1:]
 
     if sub == "new":
+        if rest:
+            return "用法: /session new"
         session = state.session_store.create_session()
-        state.current_session_id = session.session_id
+        _activate_session(session.session_id, state)
         return f"Created session: {session.session_id}"
 
     if sub == "list":
+        if rest:
+            return "用法: /session list"
         return _format_session_list(state)
 
     if sub == "switch":
-        if not rest:
+        if len(rest) != 1:
             return "用法: /session switch <sessionId>"
         return _switch_session(rest[0], state)
 
@@ -378,7 +408,7 @@ def _handle_session_command(args: list[str], state: RuntimeState) -> str:
         return f"Renamed session {session_id} to: {title}"
 
     if sub == "delete":
-        if not rest:
+        if len(rest) != 1:
             return "用法: /session delete <sessionId>"
         return _delete_session(rest[0], state)
 
@@ -390,7 +420,7 @@ def _switch_session(session_id: str, state: RuntimeState) -> str:
         state.session_store.get(session_id)
     except SessionNotFoundError as exc:
         return f"[错误] {exc}"
-    state.current_session_id = session_id
+    _activate_session(session_id, state)
     return f"Switched to session: {session_id}"
 
 
@@ -401,28 +431,59 @@ def _delete_session(session_id: str, state: RuntimeState) -> str:
     )
     try:
         with guard:
-            if state.rollback_manager is not None:
-                state.rollback_manager.disable(session_id)
-            if state.workspace_manager is not None:
-                state.workspace_manager.unset(session_id)
-                state.workspace_manager.set_unlimited(session_id, False)
+            # Delete the primary record first. If this fails, auxiliary
+            # workspace/rollback state must remain intact.
             state.session_store.delete(session_id)
     except (SessionNotFoundError, SessionStoreError, OSError, RollbackError) as exc:
         return f"[错误] {exc}"
 
+    cleanup_warnings: list[str] = []
+    if state.rollback_manager is not None:
+        try:
+            state.rollback_manager.disable(session_id)
+        except (RollbackError, OSError) as exc:
+            cleanup_warnings.append(f"回退数据清理失败: {exc}")
+    if state.workspace_manager is not None:
+        try:
+            state.workspace_manager.unset(session_id)
+        except (WorkspaceError, OSError) as exc:
+            cleanup_warnings.append(f"workspace 绑定清理失败: {exc}")
+        finally:
+            state.workspace_manager.set_unlimited(session_id, False)
+    state.auto_modes.pop(session_id, None)
+
+    suffix = (
+        "\n[警告] " + "；".join(cleanup_warnings)
+        if cleanup_warnings
+        else ""
+    )
     if state.current_session_id != session_id:
-        return f"Deleted session: {session_id}"
+        return f"Deleted session: {session_id}{suffix}"
 
     summaries = state.session_store.list_summaries()
     if summaries:
         fallback_id = summaries[0].session_id
     else:
         fallback_id = state.session_store.ensure_default_session().session_id
-    state.current_session_id = fallback_id
+    _activate_session(fallback_id, state)
     return (
         f"Deleted session: {session_id}\n"
-        f"当前 session 已被删除，已自动切换到: {fallback_id}"
+        f"当前 session 已被删除，已自动切换到: {fallback_id}{suffix}"
     )
+
+
+def _activate_session(session_id: str, state: RuntimeState) -> None:
+    """Switch session and restore only that session's AUTO mode."""
+    state.current_session_id = session_id
+    state.auto_mode = state.auto_modes.get(session_id, False)
+
+
+def _set_auto_mode(state: RuntimeState, enabled: bool) -> None:
+    state.auto_mode = enabled
+    if enabled:
+        state.auto_modes[state.current_session_id] = True
+    else:
+        state.auto_modes.pop(state.current_session_id, None)
 
 
 def _format_session_list(state: RuntimeState) -> str:
@@ -443,14 +504,14 @@ def _format_session_list(state: RuntimeState) -> str:
 # -- /memory ------------------------------------------------------------
 
 
-def _handle_memory_command(raw_input: str, args: list[str], state: RuntimeState) -> str:
+def _handle_memory_command(args: list[str], state: RuntimeState) -> str:
     if not args:
-        return "用法: /memory <add|list|search|update|delete|stats> ..."
+        return "用法: /memory <add|list|search|update|delete|status> ..."
 
     sub = args[0]
 
     if sub == "add":
-        return _add_memory(raw_input, state)
+        return _add_memory(args[1:], state)
 
     if sub == "list":
         return _format_memory_list(args[1:], state)
@@ -460,7 +521,9 @@ def _handle_memory_command(raw_input: str, args: list[str], state: RuntimeState)
             return "用法: /memory search <关键词>"
         return _search_memory(" ".join(args[1:]), state)
 
-    if sub == "stats":
+    if sub == "status":
+        if len(args) != 1:
+            return "用法: /memory status"
         return _memory_stats(state)
 
     if sub == "update":
@@ -471,55 +534,55 @@ def _handle_memory_command(raw_input: str, args: list[str], state: RuntimeState)
         return _update_memory(memory_id, new_content, state)
 
     if sub == "delete":
-        if len(args) < 2:
+        if len(args) != 2:
             return "用法: /memory delete <memoryId>"
         return _delete_memory(args[1], state)
 
     return f"未知 /memory 子命令: {sub}"
 
 
-def _add_memory(raw_input: str, state: RuntimeState) -> str:
+_MEMORY_ADD_USAGE = (
+    "用法: /memory add [--category <类别>] [--tags <t1,t2>] "
+    "[--importance <1-5>] <内容>"
+)
+
+
+def _add_memory(tokens: list[str], state: RuntimeState) -> str:
     """Parse and add a memory entry.
 
-    Supports two forms:
-        /memory add <content>                          # legacy
-        /memory add --category <c> --tags <t1,t2> <content>  # structured
+    Options may appear in any order before the content. ``--`` explicitly
+    ends option parsing when the memory text itself starts with ``--``.
     """
-    prefix = "/memory add "
-    if not raw_input.startswith(prefix):
-        return "用法: /memory add [--category <类别>] [--tags <t1,t2>] [--importance <1-5>] <内容>"
-    rest = raw_input[len(prefix):]
-
-    # Parse optional flags
     category = "general"
     tags: list[str] = []
     importance = 3
+    index = 0
+    while index < len(tokens):
+        option = tokens[index]
+        if option == "--":
+            index += 1
+            break
+        if not option.startswith("--"):
+            break
+        if option not in {"--category", "--tags", "--importance"}:
+            return f"[错误] 未知选项: {option}\n{_MEMORY_ADD_USAGE}"
+        if index + 1 >= len(tokens) or tokens[index + 1].startswith("--"):
+            return f"[错误] {option} 缺少参数\n{_MEMORY_ADD_USAGE}"
+        value = tokens[index + 1]
+        if option == "--category":
+            category = value
+        elif option == "--tags":
+            tags = [tag.strip() for tag in value.split(",") if tag.strip()]
+        else:
+            try:
+                importance = int(value)
+            except ValueError:
+                return f"[错误] importance 必须是 1-5 的整数\n{_MEMORY_ADD_USAGE}"
+        index += 2
 
-    # --category <cat>
-    import re
-    cat_match = re.match(r"^--category\s+(\S+)", rest)
-    if cat_match:
-        category = cat_match.group(1)
-        rest = rest[cat_match.end():]
-
-    # --tags <t1,t2,...>
-    tags_match = re.match(r"^--tags\s+(\S+)", rest)
-    if tags_match:
-        tags = [t.strip() for t in tags_match.group(1).split(",") if t.strip()]
-        rest = rest[tags_match.end():]
-
-    # --importance <1-5>
-    imp_match = re.match(r"^--importance\s+(\d)", rest)
-    if imp_match:
-        try:
-            importance = int(imp_match.group(1))
-        except ValueError:
-            pass
-        rest = rest[imp_match.end():]
-
-    content = rest.strip()
+    content = " ".join(tokens[index:]).strip()
     if not content:
-        return "用法: /memory add [--category <类别>] [--tags <t1,t2>] [--importance <1-5>] <内容>"
+        return _MEMORY_ADD_USAGE
 
     try:
         entry = state.memory_store.add(
@@ -538,7 +601,9 @@ def _add_memory(raw_input: str, state: RuntimeState) -> str:
 def _format_memory_list(extra_args: list[str], state: RuntimeState) -> str:
     """List memory entries, optionally filtered by category."""
     category: str | None = None
-    if len(extra_args) >= 2 and extra_args[0] == "--category":
+    if extra_args:
+        if len(extra_args) != 2 or extra_args[0] != "--category":
+            return "用法: /memory list [--category <类别>]"
         category = extra_args[1]
 
     from claw.memory.store import MEMORY_CATEGORIES
@@ -629,6 +694,7 @@ def _handle_compact_command(state: RuntimeState) -> str:
         if callable(backend_resolver)
         else callable(pi_compact)
     )
+    pi_error: str | None = None
     if session_uses_pi and callable(pi_compact):
         try:
             return pi_compact(
@@ -636,30 +702,58 @@ def _handle_compact_command(state: RuntimeState) -> str:
                 session_store=state.session_store,
             )
         except Exception as exc:
-            return f"[错误] Pi session 压缩失败：{exc}"
+            # A newly-created Pi branch can legitimately be too small even
+            # though SJTUClaw's unified session already has compactable
+            # history.  Preserve Pi-native compaction as the first choice,
+            # then fall back to the host summary projection.
+            pi_error = str(exc)
 
     session = state.session_store.get(state.current_session_id)
 
     if len(session.messages) <= KEEP_RECENT_MESSAGES_MIN:
-        return (
+        result = (
             f"当前 session 只有 {len(session.messages)} 条消息，"
             f"不超过保留窗口（{KEEP_RECENT_MESSAGES_MIN}），无需压缩。"
         )
+        if pi_error:
+            return f"Pi 原生压缩未执行：{pi_error}\n{result}"
+        return result
+
+    worker_running = getattr(state.compaction_worker, "is_running", None)
+    if callable(worker_running) and worker_running():
+        return "后台压缩正在进行，请等待完成后再执行 /compact。"
 
     try:
-        outcome = compact_and_persist(session, state.session_store, state.llm_client)
+        outcome = compact_and_persist(
+            session,
+            state.session_store,
+            state.llm_client,
+            force=True,
+        )
     except CompactionError as exc:
+        if pi_error:
+            return (
+                f"[错误] Pi 原生压缩未完成：{pi_error}\n"
+                f"SJTUClaw 回退压缩也未完成：{exc}"
+            )
         return f"[错误] {exc}"
 
     result = outcome.result
-    lines = [
+    lines: list[str] = []
+    if pi_error:
+        lines.extend([
+            f"Pi 原生压缩未执行：{pi_error}",
+            "已回退到 SJTUClaw 统一会话压缩。",
+            "",
+        ])
+    lines.extend([
         f"Compacted session {session.session_id}.",
         f"Old messages: {result.old_message_count}",
         f"Recent messages: {result.recent_message_count}",
         "Summary updated: yes",
         "Summary:",
         result.summary,
-    ]
+    ])
     if outcome.save_error:
         lines.append(f"[警告] 压缩结果保存可能未成功: {outcome.save_error}")
     return "\n".join(lines)
@@ -704,21 +798,31 @@ def _handle_workspace_command(args: list[str], state: RuntimeState) -> str:
             return f"[错误] {exc}"
 
     if sub == "show":
+        if len(args) != 1:
+            return "用法: /workspace show"
         ws = state.workspace_manager.get(sid)
         if ws is None:
             return "当前 session 未设置 workspace。使用 /workspace set <路径> 来设置。"
         return f"当前 workspace: {ws}"
 
     if sub == "unset":
+        if len(args) != 1:
+            return "用法: /workspace unset"
         guard = (
             state.rollback_manager.session_guard(sid)
             if state.rollback_manager is not None else nullcontext()
         )
-        with guard:
-            if state.rollback_manager is not None:
-                state.rollback_manager.disable(sid)
-            state.workspace_manager.unset(sid)
-        return "Workspace 已取消设置。"
+        try:
+            with guard:
+                if state.rollback_manager is not None:
+                    state.rollback_manager.disable(sid)
+                state.workspace_manager.unset(sid)
+                # Removing the sandbox root must never leave unrestricted
+                # filesystem access enabled implicitly.
+                state.workspace_manager.set_unlimited(sid, False)
+        except (WorkspaceError, RollbackError, OSError) as exc:
+            return f"[错误] {exc}"
+        return "Workspace 已取消设置，UNLIMITED 模式已关闭。"
 
     return f"未知 /workspace 子命令: {sub}"
 
@@ -728,6 +832,8 @@ def _handle_rollback_command(args: list[str], state: RuntimeState) -> str:
     if manager is None:
         return "Workspace 回退服务未初始化。"
     sid = state.current_session_id
+    if len(args) > 1:
+        return "用法: /rollback [<n>|<checkpointId>|list|status|undo]"
     sub = args[0].lower() if args else "1"
     try:
         if sub in ("status", "show"):
@@ -804,6 +910,8 @@ def _handle_approve(args: list[str], state: RuntimeState) -> str:
     if state.approval_manager is None:
         return "Approval manager 未初始化。"
 
+    if len(args) > 1:
+        return "用法: /approve <approvalId>（或当只有一个待审批时省略 ID）"
     if not args:
         # If there's exactly one pending in this session, use it.
         pending = [r for r in state.approval_manager.get_pending()
@@ -825,7 +933,7 @@ def _handle_approve(args: list[str], state: RuntimeState) -> str:
 # -- /reject ---------------------------------------------------------------
 
 
-def _handle_reject(raw_input: str, args: list[str], state: RuntimeState) -> str:
+def _handle_reject(args: list[str], state: RuntimeState) -> str:
     if state.approval_manager is None:
         return "Approval manager 未初始化。"
 
@@ -858,9 +966,7 @@ def _handle_reject(raw_input: str, args: list[str], state: RuntimeState) -> str:
 # -- /skill (Step 9) -------------------------------------------------------
 
 
-def _handle_skill_command(
-    raw_input: str, args: list[str], state: RuntimeState
-) -> str:
+def _handle_skill_command(args: list[str], state: RuntimeState) -> str:
     """Handle /skill commands.  Returns either a plain result string or
     a special ``__SKILL_INVOKE__`` sentinel indicating that the caller
     should run an agent turn with the skill content pre-loaded.
@@ -933,10 +1039,7 @@ def _handle_skill_command(
     if skill is None:
         return f"未找到 skill: \"{skill_name}\"。使用 /skill list 查看可用 skill。"
 
-    prefix = f"/skill {skill_name} "
-    if not raw_input.startswith(prefix):
-        return f"用法: /skill {skill_name} <任务描述>"
-    task = raw_input[len(prefix):].strip()
+    task = " ".join(args[1:]).strip()
     if not task:
         return f"用法: /skill {skill_name} <任务描述>"
 
@@ -961,6 +1064,8 @@ def _handle_reflect_command(args: list[str], state: RuntimeState) -> str:
     sub = args[0]
 
     if sub == "status":
+        if len(args) != 1:
+            return "用法: /reflect status"
         config = mgr.get_config()
         last_run = config.get("lastRunAt") or "从未"
         history = config.get("runHistory", [])
@@ -984,24 +1089,29 @@ def _handle_reflect_command(args: list[str], state: RuntimeState) -> str:
         return "\n".join(lines)
 
     if sub == "enable":
+        if len(args) != 1:
+            return "用法: /reflect enable"
         mgr.update_config(enabled=True)
         return "✅ 每日记忆反思已启用。每天定时自动整理对话，提取长期记忆。"
 
     if sub == "disable":
+        if len(args) != 1:
+            return "用法: /reflect disable"
         mgr.update_config(enabled=False)
         return "❌ 每日记忆反思已禁用。"
 
     if sub == "time":
-        if len(args) < 2:
+        if len(args) != 2:
             return "用法: /reflect time <HH:MM>（如 /reflect time 23:00）"
         new_time = args[1]
-        import re as _re
-        if not _re.match(r"^\d{2}:\d{2}$", new_time):
-            return "时间格式错误，请使用 HH:MM 格式（如 23:00）"
+        if not is_valid_reflection_time(new_time):
+            return "时间无效，请使用 00:00 到 23:59 的 HH:MM 格式"
         mgr.update_config(time=new_time)
         return f"⏰ 每日反思时间已设置为 {new_time}。"
 
     if sub == "now":
+        if len(args) != 1:
+            return "用法: /reflect now"
         result = mgr.run_now()
         if result.get("ok"):
             return (
@@ -1054,6 +1164,8 @@ def _handle_cron_command(args: list[str], state: RuntimeState) -> str:
             return f"错误: {exc}"
 
     if sub == "status":
+        if len(args) != 1:
+            return "用法: /cron status"
         status = state.cron_service.status()
         return (
             f"Cron 服务: {'运行中' if status['enabled'] else '已停止'}\n"
@@ -1061,7 +1173,7 @@ def _handle_cron_command(args: list[str], state: RuntimeState) -> str:
         )
 
     if sub == "disable":
-        if len(args) < 2:
+        if len(args) != 2:
             return "用法: /cron disable <jobId>"
         job = state.cron_service.enable_job(args[1], enabled=False)
         if job is None:
@@ -1069,7 +1181,7 @@ def _handle_cron_command(args: list[str], state: RuntimeState) -> str:
         return f"已禁用作业: {args[1]}"
 
     if sub == "enable":
-        if len(args) < 2:
+        if len(args) != 2:
             return "用法: /cron enable <jobId>"
         job = state.cron_service.enable_job(args[1], enabled=True)
         if job is None:
@@ -1077,7 +1189,7 @@ def _handle_cron_command(args: list[str], state: RuntimeState) -> str:
         return f"已启用作业: {args[1]}"
 
     if sub == "delete":
-        if len(args) < 2:
+        if len(args) != 2:
             return "用法: /cron delete <jobId>"
         result = state.cron_service.remove_job(args[1])
         if result == "removed":
@@ -1128,6 +1240,8 @@ def _handle_pet_command(args: list[str], state: RuntimeState) -> str:
         return "\n".join(lines)
 
     if sub in ("open", "on", "enable"):
+        if len(args) != 1:
+            return "用法: /pet open"
         catalog.update_settings(enabled=True)
         started = process.start()
         if process.running:
@@ -1135,12 +1249,14 @@ def _handle_pet_command(args: list[str], state: RuntimeState) -> str:
         return "已提交桌面宠物启动请求。" if started else "桌面宠物已经在运行。"
 
     if sub in ("close", "off", "disable"):
+        if len(args) != 1:
+            return "用法: /pet close"
         catalog.update_settings(enabled=False)
         process.stop()
         return "桌面宠物已关闭。"
 
     if sub == "select":
-        if len(args) < 2:
+        if len(args) != 2:
             return "用法: /pet select <petId>"
         pet_id = args[1]
         try:
@@ -1155,7 +1271,7 @@ def _handle_pet_command(args: list[str], state: RuntimeState) -> str:
         return f"已选择宠物: {name} ({pet_id})"
 
     if sub == "autostart":
-        if len(args) < 2 or args[1].lower() not in ("on", "off"):
+        if len(args) != 2 or args[1].lower() not in ("on", "off"):
             return "用法: /pet autostart <on|off>"
         enabled = args[1].lower() == "on"
         catalog.update_settings(launch_on_gateway_start=enabled)
@@ -1170,6 +1286,8 @@ def _handle_auto_command(
     args: list[str], state: RuntimeState, *, markdown: bool = False
 ) -> str:
     """Inspect or explicitly change AUTO mode."""
+    if len(args) > 1:
+        return "用法: /auto [status|on|off]"
     sub = args[0].lower() if args else "status"
 
     if sub in ("status", "show", "help", "?"):
@@ -1181,36 +1299,32 @@ def _handle_auto_command(
                 "### 可用指令\n\n"
                 "- `/auto on`：开启 AUTO 模式\n"
                 "- `/auto off`：关闭 AUTO 模式\n"
-                "- `/auto toggle`：切换 AUTO 模式\n"
                 "- `/auto status`：查看当前状态\n\n"
-                "> AUTO 模式会自动批准 workspace 内的写入和 Shell 操作。"
-                "UNLIMITED 模式下涉及非 workspace 区域的危险操作仍需用户明确审批。"
+                "> AUTO 模式会自动批准 workspace 内的结构化文件写入；"
+                "Shell 命令始终需要明确审批。UNLIMITED 模式下所有危险操作"
+                "也仍需用户明确审批。"
             )
         return (
             f"AUTO 模式当前{state_text}。\n\n"
             "可用指令：\n"
             "  /auto on      开启 AUTO 模式\n"
             "  /auto off     关闭 AUTO 模式\n"
-            "  /auto toggle  切换 AUTO 模式\n"
             "  /auto status  查看当前状态\n\n"
-            "AUTO 模式会自动批准 workspace 内的写入和 Shell 操作；"
-            "UNLIMITED 模式下涉及非 workspace 区域的危险操作仍需用户明确审批。"
+            "AUTO 模式会自动批准 workspace 内的结构化文件写入；"
+            "Shell 命令始终需要明确审批。UNLIMITED 模式下所有危险操作"
+            "也仍需用户明确审批。"
         )
 
     if sub in ("on", "enable", "1"):
-        state.auto_mode = True
-        return "AUTO 模式已开启。Agent 在 workspace 内的写操作和 Shell 命令将自动执行，无需逐一审批。"
+        _set_auto_mode(state, True)
+        return "AUTO 模式已开启。workspace 内的结构化文件写入可自动执行；Shell 命令仍需逐一审批。"
     elif sub in ("off", "disable", "0"):
-        state.auto_mode = False
-        return "AUTO 模式已关闭。Agent 的写操作和 shell 命令恢复审批。"
-    elif sub == "toggle":
-        state.auto_mode = not state.auto_mode
-        state_text = "开启" if state.auto_mode else "关闭"
-        return f"AUTO 模式已{state_text}。"
+        _set_auto_mode(state, False)
+        return "AUTO 模式已关闭。Agent 的写操作恢复逐次审批；Shell 命令始终需要审批。"
 
     return (
         f"未知的 AUTO 子指令：{sub}\n"
-        "请使用 /auto 查看帮助，或使用 /auto on、/auto off、/auto toggle。"
+        "请使用 /auto 查看帮助，或使用 /auto on、/auto off。"
     )
 
 
@@ -1223,6 +1337,8 @@ def _handle_unlimited_command(
     """Show or change UNLIMITED mode for the current session."""
     if state.workspace_manager is None:
         return "Workspace manager 未初始化，无法使用此功能。"
+    if len(args) > 1:
+        return "用法: /unlimited [status|on|off]"
     sid = state.current_session_id
     sub = args[0].lower() if args else "help"
 
@@ -1237,7 +1353,7 @@ def _handle_unlimited_command(
                 "- `/unlimited status`：查看当前状态\n"
                 "- `/unlimited on`：开启模式，允许访问 workspace 之外的路径\n"
                 "- `/unlimited off`：关闭模式，恢复 workspace 边界限制\n"
-                "- `/unlimited toggle`：切换当前模式\n\n"
+                "\n"
                 "> **安全规则：** UNLIMITED 只解除路径限制；写入、覆盖、删除和 "
                 "Shell 操作仍必须由用户逐次审批，AUTO 模式不能绕过审批。"
             )
@@ -1247,7 +1363,7 @@ def _handle_unlimited_command(
             "- `/unlimited status`：查看当前状态\n"
             "- `/unlimited on`：开启模式，允许访问 workspace 之外的路径\n"
             "- `/unlimited off`：关闭模式，恢复 workspace 边界限制\n"
-            "- `/unlimited toggle`：切换当前模式\n\n"
+            "\n"
             "安全规则：UNLIMITED 只解除路径限制；写入、覆盖、删除和 shell 操作"
             "仍必须由用户逐次审批，AUTO 模式不能绕过审批。"
         )
@@ -1266,18 +1382,6 @@ def _handle_unlimited_command(
     elif sub in ("off", "disable", "0"):
         state.workspace_manager.set_unlimited(sid, False)
         return "UNLIMITED 模式已关闭。Agent 的操作将恢复到 workspace 限制。"
-    elif sub == "toggle":
-        unlimited = state.workspace_manager.is_unlimited(sid)
-        if unlimited:
-            state.workspace_manager.set_unlimited(sid, False)
-            return "UNLIMITED 模式已关闭。Agent 的操作将恢复到 workspace 限制。"
-        else:
-            state.workspace_manager.set_unlimited(sid, True)
-            return (
-                "UNLIMITED 模式已开启。\n"
-                "Agent 现在可以读取、写入、删除任意路径的文件，"
-                "不受 workspace 限制。危险操作仍需逐次审批。"
-            )
     return f"未知的 UNLIMITED 指令: {sub}\n\n{_help()}"
 
 

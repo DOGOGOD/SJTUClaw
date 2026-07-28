@@ -75,6 +75,29 @@ describe("ThreadViewport user messages", () => {
     expect(image?.getAttribute("src")).toBe("/sessions/session-a/attachments/att_demo");
   });
 
+  it("renders Pi bash results with Chinese text and Windows paths intact", () => {
+    const output =
+      "当前目录：C:/Users/GZQ/Desktop/SJTUClaw/SJTUClaw\nREADME.md 已找到";
+    const view = render(
+      <ThreadViewport
+        messages={[{
+          role: "tool",
+          name: "bash",
+          tool_call_id: "call-pi-bash",
+          content: output,
+        }]}
+        loading={false}
+        sessionId="session-pi"
+      />
+    );
+
+    fireEvent.click(view.getByText("bash").closest("button")!);
+    fireEvent.click(view.getByText("执行结果"));
+
+    expect(view.container.querySelector("pre")?.textContent).toBe(output);
+    expect(view.container.textContent).not.toContain("\ufffd");
+  });
+
   it("turns image download links into inline message images", () => {
     const view = render(
       <ThreadViewport

@@ -37,6 +37,8 @@ import os
 import re
 import subprocess
 import tempfile
+import threading
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -58,7 +60,8 @@ class ShellSession:
     def __init__(self, workspace_root: Path, cwd: Path):
         self.workspace_root = workspace_root
         self.cwd: Path = cwd
-        self.created_at: float = __import__("time").time()
+        self.last_used_at = time.time()
+        self.command_lock = threading.Lock()
         fd, self._state_path = tempfile.mkstemp(
             suffix=".txt", prefix="claw_shell_"
         )
@@ -83,6 +86,7 @@ class ShellSession:
 
 # session_id -> ShellSession
 _shell_sessions: dict[str, ShellSession] = {}
+_shell_sessions_lock = threading.Lock()
 
 # Stale session cleanup: remove sessions idle longer than this (seconds).
 _SHELL_SESSION_TTL_S = 3600  # 1 hour
@@ -97,22 +101,33 @@ def _cleanup_stale_shell_sessions() -> None:
     processes (e.g. the Gateway server) where sessions are created but
     never explicitly terminated.
     """
-    import time as _time
     global _shell_sessions_last_cleanup
 
-    now = _time.time()
-    if now - _shell_sessions_last_cleanup < _SHELL_CLEANUP_INTERVAL_S:
-        return
-
-    _shell_sessions_last_cleanup = now
-    stale_ids = [
-        sid for sid, s in _shell_sessions.items()
-        if now - s.created_at > _SHELL_SESSION_TTL_S
-    ]
-    for sid in stale_ids:
-        session = _shell_sessions.pop(sid, None)
-        if session is not None:
+    now = time.time()
+    stale: list[ShellSession] = []
+    with _shell_sessions_lock:
+        if now - _shell_sessions_last_cleanup < _SHELL_CLEANUP_INTERVAL_S:
+            return
+        _shell_sessions_last_cleanup = now
+        stale_ids = [
+            sid for sid, session in _shell_sessions.items()
+            if now - session.last_used_at > _SHELL_SESSION_TTL_S
+        ]
+        for sid in stale_ids:
+            session = _shell_sessions.pop(sid, None)
+            if session is not None:
+                stale.append(session)
+    for session in stale:
+        with session.command_lock:
             session.terminate()
+
+
+def _discard_shell(session_id: str, shell: ShellSession) -> None:
+    """Remove *shell* only if it is still the session's active shell."""
+    with _shell_sessions_lock:
+        if _shell_sessions.get(session_id) is shell:
+            _shell_sessions.pop(session_id, None)
+    shell.terminate()
 
 
 # =========================================================================
@@ -532,10 +547,6 @@ def _make_new_shell_handler(
         # Opportunistic cleanup of stale shell sessions
         _cleanup_stale_shell_sessions()
 
-        old = _shell_sessions.pop(session_id, None)
-        if old is not None:
-            old.terminate()
-
         sub_dir: str = args.get("sub_dir", "")
         if sub_dir:
             try:
@@ -551,7 +562,12 @@ def _make_new_shell_handler(
             cwd = ws
 
         shell = ShellSession(ws, cwd)
-        _shell_sessions[session_id] = shell
+        with _shell_sessions_lock:
+            old = _shell_sessions.get(session_id)
+            _shell_sessions[session_id] = shell
+        if old is not None:
+            with old.command_lock:
+                old.terminate()
 
         return ToolResult(
             ok=True,
@@ -574,12 +590,13 @@ def _make_run_command_handler(
     workspace_manager: WorkspaceManager,
     session_id_provider: Callable[[], str],
 ) -> Callable[[dict[str, Any]], ToolResult]:
-    def handler(args: dict[str, Any]) -> ToolResult:
+    def _handle(args: dict[str, Any]) -> ToolResult:
         command: str = args["command"]
         timeout: int = args.get("timeout", _DEFAULT_TIMEOUT)
         session_id = session_id_provider()
 
-        shell = _shell_sessions.get(session_id)
+        with _shell_sessions_lock:
+            shell = _shell_sessions.get(session_id)
         if shell is None:
             return ToolResult(
                 ok=False,
@@ -603,8 +620,7 @@ def _make_run_command_handler(
         except WorkspaceError:
             current_ws = None
         if current_ws is None or shell.workspace_root.resolve() != current_ws.resolve():
-            shell.terminate()
-            _shell_sessions.pop(session_id, None)
+            _discard_shell(session_id, shell)
             reason = (
                 "workspace 已取消设置" if current_ws is None
                 else f"workspace 已变为 \"{current_ws}\""
@@ -623,8 +639,7 @@ def _make_run_command_handler(
             # 1. Pre-check cwd still in workspace
             in_ws, reason = _check_in_workspace(saved_cwd, shell.workspace_root)
             if not in_ws:
-                shell.terminate()
-                _shell_sessions.pop(session_id, None)
+                _discard_shell(session_id, shell)
                 return ToolResult(
                     ok=False,
                     error=f"{reason}。shell 已被终止，请重新调用 new_shell。",
@@ -686,8 +701,7 @@ def _make_run_command_handler(
                 real_cwd or saved_cwd, shell.workspace_root
             )
             if not in_ws:
-                shell.terminate()
-                _shell_sessions.pop(session_id, None)
+                _discard_shell(session_id, shell)
                 err_obj = {
                     "tool": "run_command",
                     "ok": False,
@@ -749,6 +763,25 @@ def _make_run_command_handler(
                 ok=False,
                 error=json.dumps(result_obj, ensure_ascii=False),
             )
+
+    def handler(args: dict[str, Any]) -> ToolResult:
+        session_id = session_id_provider()
+        with _shell_sessions_lock:
+            shell = _shell_sessions.get(session_id)
+        if shell is None:
+            return _handle(args)
+        with shell.command_lock:
+            with _shell_sessions_lock:
+                if _shell_sessions.get(session_id) is not shell:
+                    return ToolResult(
+                        ok=False,
+                        error="当前 shell 已被替换，请重试命令。",
+                    )
+            shell.last_used_at = time.time()
+            try:
+                return _handle(args)
+            finally:
+                shell.last_used_at = time.time()
 
     return handler
 

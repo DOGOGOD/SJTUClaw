@@ -18,6 +18,7 @@ directory rather than the process CWD.
 
 from __future__ import annotations
 
+import heapq
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -32,6 +33,7 @@ from claw.workspace.manager import WorkspaceManager, WorkspaceError
 # Larger files are truncated with a clear marker in the returned content
 # so the model knows the result is incomplete.
 _MAX_FILE_BYTES = 64 * 1024
+_MAX_DIR_ENTRIES = 1000
 
 
 # ---------------------------------------------------------------------------
@@ -47,8 +49,8 @@ def _resolve_path(
     """Resolve *path_str* against the per-session workspace if available.
 
     When a workspace is bound to the session, relative paths are resolved
-    inside the workspace root and boundary violations are rejected.  When
-    no workspace is bound (backward-compat), the raw path is used as-is.
+    inside the workspace root and boundary violations are rejected.  An
+    unbound managed session is sandboxed to the stable application root.
 
     When unlimited mode is enabled for the session, all workspace checks
     are bypassed and the path is resolved as-is.
@@ -58,28 +60,19 @@ def _resolve_path(
         if workspace_manager.is_unlimited(session_id):
             # Unlimited mode: resolve without workspace restrictions.
             return Path(path_str).resolve()
-        ws = workspace_manager.get(session_id)
-        if ws is not None:
-            # Workspace is set - resolve relative paths inside it
-            p = Path(path_str)
-            if p.is_absolute():
-                # Absolute paths are allowed but must be within workspace
-                try:
-                    p.resolve().relative_to(ws.resolve())
-                    return p.resolve()
-                except ValueError:
-                    raise WorkspaceError(
-                        f"path outside workspace: \"{path_str}\""
-                    )
-            # Relative path - resolve against workspace root
-            resolved = (ws / p).resolve()
-            try:
-                resolved.relative_to(ws.resolve())
-            except ValueError:
-                raise WorkspaceError(
-                    f"path outside workspace: \"{path_str}\""
-                )
-            return resolved
+        # An unbound session is still sandboxed to the stable main directory.
+        # Falling through to an arbitrary absolute path here let an
+        # auto-executed read_file call expose any local file.
+        root = (workspace_manager.get(session_id) or main_dir()).resolve()
+        p = Path(path_str)
+        resolved = p.resolve() if p.is_absolute() else (root / p).resolve()
+        try:
+            resolved.relative_to(root)
+        except ValueError:
+            raise WorkspaceError(
+                f"path outside workspace: \"{path_str}\""
+            )
+        return resolved
     # No explicit workspace: use the runtime's stable main directory rather
     # than inheriting whichever cwd happened to launch the Gateway/WebUI.
     path = Path(path_str)
@@ -132,7 +125,13 @@ def _make_list_dir_handler(
 
         try:
             entries: list[str] = []
-            for entry in sorted(target.iterdir()):
+            visible = heapq.nsmallest(
+                _MAX_DIR_ENTRIES + 1,
+                target.iterdir(),
+                key=lambda entry: entry.name.casefold(),
+            )
+            truncated = len(visible) > _MAX_DIR_ENTRIES
+            for entry in visible[:_MAX_DIR_ENTRIES]:
                 suffix = "/" if entry.is_dir() else ""
                 try:
                     size = entry.stat().st_size if entry.is_file() else None
@@ -142,6 +141,10 @@ def _make_list_dir_handler(
                 if size is not None:
                     line += f"  ({_format_size(size)})"
                 entries.append(line)
+            if truncated:
+                entries.append(
+                    f"...[目录条目已截断，仅显示前 {_MAX_DIR_ENTRIES} 项]"
+                )
 
             if not entries:
                 return ToolResult(ok=True, content=f"directory \"{path_str}\" is empty")
@@ -178,31 +181,19 @@ def _make_read_file_handler(
             )
 
         try:
-            file_size = target.stat().st_size
-        except OSError as exc:
-            return ToolResult(
-                ok=False,
-                error=f"cannot get file info \"{path_str}\": {exc}",
-            )
-
-        try:
-            with open(target, "r", encoding="utf-8", errors="replace") as fh:
-                if file_size > _MAX_FILE_BYTES:
-                    raw = fh.read(_MAX_FILE_BYTES)
-                    truncated = True
-                else:
-                    raw = fh.read()
-                    truncated = False
+            with open(target, "rb") as fh:
+                payload = fh.read(_MAX_FILE_BYTES + 1)
         except OSError as exc:
             return ToolResult(
                 ok=False,
                 error=f"cannot read file \"{path_str}\": {exc}",
             )
+        truncated = len(payload) > _MAX_FILE_BYTES
+        raw = payload[:_MAX_FILE_BYTES].decode("utf-8", errors="replace")
 
         if truncated:
             content = (
                 f"[file too large, truncated] "
-                f"original size ~{_format_size(file_size)}, "
                 f"showing first {_format_size(_MAX_FILE_BYTES)}:\n\n"
                 + raw
             )

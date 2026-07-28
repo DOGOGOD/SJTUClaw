@@ -21,10 +21,10 @@ v3 changes (optimization):
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 
 from claw.context.token_counter import count_tokens, count_tokens_for_messages
+from claw.env_utils import env_int
 from claw.llm.client import LLMClient, LLMError
 from claw.session.models import Message, Session
 from claw.session.store import SessionStore, SessionStoreError
@@ -33,15 +33,17 @@ from claw.session.store import SessionStore, SessionStoreError
 # Configurable thresholds (env-overridable at import time)
 # ---------------------------------------------------------------------------
 
-KEEP_RECENT_MESSAGES_MIN = int(
-    os.getenv("COMPACT_KEEP_RECENT_MESSAGES_MIN", "4")
+KEEP_RECENT_MESSAGES_MIN = env_int(
+    "COMPACT_KEEP_RECENT_MESSAGES_MIN",
+    4,
+    minimum=0,
 )
 """Absolute floor: never compact if there are <= this many messages."""
 
-MAX_MESSAGE_TOKENS = int(os.getenv("COMPACT_MAX_MESSAGE_TOKENS", "2000"))
+MAX_MESSAGE_TOKENS = env_int("COMPACT_MAX_MESSAGE_TOKENS", 2000, minimum=1)
 """Trigger compaction when session.messages content exceeds this many tokens."""
 
-KEEP_RECENT_TOKENS = int(os.getenv("COMPACT_KEEP_RECENT_TOKENS", "1000"))
+KEEP_RECENT_TOKENS = env_int("COMPACT_KEEP_RECENT_TOKENS", 1000, minimum=1)
 """Token budget for the recent-message window that is kept verbatim."""
 
 # ---------------------------------------------------------------------------
@@ -154,6 +156,22 @@ def _find_split_index(messages: list[Message], keep_tokens: int) -> int:
     return 0
 
 
+def _align_split_to_user_boundary(
+    messages: list[Message],
+    split_index: int,
+) -> int:
+    """Move *split_index* backwards to the nearest user-turn boundary.
+
+    The recent verbatim tail must start with a user message.  Returning
+    ``0`` means that no safe compactable prefix exists.
+    """
+    upper = min(split_index, len(messages) - 1)
+    for index in range(upper, 0, -1):
+        if messages[index].role == "user":
+            return index
+    return 0
+
+
 def _find_user_boundary_index(
     messages: list[Message],
     start_from: int,
@@ -244,6 +262,7 @@ def compact_session(
     *,
     keep_recent_tokens: int | None = None,
     keep_recent_messages_min: int | None = None,
+    force: bool = False,
 ) -> CompactionResult:
     """Compute a new merged summary for *session*'s older messages.
 
@@ -253,7 +272,11 @@ def compact_session(
 
     The split point between "old" and "recent" messages is determined by
     token budget (*keep_recent_tokens*), with a floor of
-    *keep_recent_messages_min* messages always kept verbatim.
+    *keep_recent_messages_min* messages always kept verbatim.  When
+    *force* is true, the token budget is intentionally bypassed and the
+    largest safe prefix is compacted.  This is used by the explicit
+    ``/compact`` command so it can run before an automatic threshold is
+    reached.
 
     Raises:
         CompactionError: if there is nothing old enough to compact, the
@@ -273,18 +296,21 @@ def compact_session(
             f"不超过保留窗口（{keep_min}），无需压缩。"
         )
 
-    keep_tok = (
-        keep_recent_tokens if keep_recent_tokens is not None else KEEP_RECENT_TOKENS
-    )
-    split_index = _find_split_index(messages, keep_tok)
-
     # Enforce the minimum-message floor: never compact more than
     # (len - keep_min) messages, even if token budget says otherwise.
     max_old = len(messages) - keep_min
-    if split_index > max_old:
-        split_index = max_old
+    keep_tok = (
+        keep_recent_tokens if keep_recent_tokens is not None else KEEP_RECENT_TOKENS
+    )
+    split_index = max_old if force else _find_split_index(messages, keep_tok)
+    split_index = min(split_index, max_old)
+    split_index = _align_split_to_user_boundary(messages, split_index)
 
     if split_index <= 0:
+        if force:
+            raise CompactionError(
+                "当前 session 没有可安全压缩的完整旧对话轮次，无需压缩。"
+            )
         raise CompactionError(
             f"当前 session 的消息 token 数未超过保留预算"
             f"（{keep_tok} token），无需压缩。"
@@ -320,6 +346,7 @@ def compact_session_snapshot(
     *,
     keep_recent_tokens: int | None = None,
     keep_recent_messages_min: int | None = None,
+    force: bool = False,
 ) -> CompactionResult:
     """Same as ``compact_session`` but operates on an explicit snapshot
     of messages + summary instead of a live ``Session`` object.
@@ -343,6 +370,7 @@ def compact_session_snapshot(
         llm_client,
         keep_recent_tokens=keep_recent_tokens,
         keep_recent_messages_min=keep_recent_messages_min,
+        force=force,
     )
 
 
@@ -363,7 +391,11 @@ def apply_compaction_result(session: Session, result: CompactionResult) -> None:
 
 
 def compact_and_persist(
-    session: Session, session_store: SessionStore, llm_client: LLMClient
+    session: Session,
+    session_store: SessionStore,
+    llm_client: LLMClient,
+    *,
+    force: bool = False,
 ) -> CompactionOutcome:
     """Compact `session`, apply the result, and try to persist it.
 
@@ -376,7 +408,7 @@ def compact_and_persist(
     messages, but `CompactionOutcome.save_error` is set so the caller
     can warn the user that a restart might lose this specific result.
     """
-    result = compact_session(session, llm_client)
+    result = compact_session(session, llm_client, force=force)
     apply_compaction_result(session, result)
 
     save_error: str | None = None

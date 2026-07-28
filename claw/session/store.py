@@ -82,7 +82,7 @@ def _validate_session_id(session_id: str) -> None:
     though ``_encode_key`` base64-encodes the id, rejecting malformed
     ids upfront avoids confusing error paths later.
     """
-    if not session_id or not isinstance(session_id, str):
+    if not isinstance(session_id, str) or not session_id:
         raise SessionStoreError("session id 不能为空")
     if len(session_id) > _SESSION_ID_MAX_LEN:
         raise SessionStoreError(
@@ -191,6 +191,8 @@ class SessionStore:
     def __init__(self, sessions_dir: Path):
         self._sessions_dir = Path(sessions_dir)
         self._cache: dict[str, Session] = {}
+        self._cache_lock = threading.RLock()
+        self._creating_ids: set[str] = set()
         self._session_locks_guard = threading.Lock()
         self._session_locks: dict[str, threading.RLock] = {}
         self.load_warnings: list[str] = []
@@ -260,6 +262,7 @@ class SessionStore:
         revision = 0
         stored_key: str | None = None
         skipped = 0
+        header_seen = False
 
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -273,13 +276,40 @@ class SessionStore:
                         skipped += 1
                         continue
 
+                    if not isinstance(data, dict):
+                        skipped += 1
+                        continue
                     if data.get("_type") == "metadata":
-                        stored_key = data.get("key")
-                        metadata = data.get("metadata") or {}
+                        if header_seen:
+                            skipped += 1
+                            continue
+                        header_seen = True
+                        candidate_key = data.get("key")
+                        if not isinstance(candidate_key, str):
+                            raise SessionStoreError(
+                                f"session 元数据中的 key 无效: {path}"
+                            )
+                        try:
+                            _validate_session_id(candidate_key)
+                        except SessionStoreError as exc:
+                            raise SessionStoreError(
+                                f"session 元数据中的 key 无效: {path}: {exc}"
+                            ) from exc
+                        stored_key = candidate_key
+                        raw_metadata = data.get("metadata")
+                        if raw_metadata is not None and not isinstance(raw_metadata, dict):
+                            skipped += 1
+                            raw_metadata = {}
+                        metadata = raw_metadata or {}
                         created_at = data.get("created_at")
                         updated_at = data.get("updated_at")
-                        last_consolidated = data.get("last_consolidated", 0)
-                        revision = data.get("revision", 0)
+                        try:
+                            last_consolidated = int(data.get("last_consolidated", 0))
+                            revision = int(data.get("revision", 0))
+                        except (TypeError, ValueError, OverflowError):
+                            skipped += 1
+                            last_consolidated = 0
+                            revision = 0
                     else:
                         try:
                             messages.append(Message.from_jsonl_dict(data))
@@ -292,9 +322,14 @@ class SessionStore:
         # Must have a valid metadata header
         if stored_key is None:
             raise SessionStoreError(f"session 文件缺少有效的元数据头: {path}")
+        encoded_key = self._decode_key(path.stem)
+        if encoded_key is not None and encoded_key != stored_key:
+            raise SessionStoreError(
+                f"session 文件名与元数据 key 不一致: {path}"
+            )
 
         session = Session(
-            session_id=stored_key or self._decode_key(path.stem) or path.stem,
+            session_id=stored_key,
             title=_metadata_title(metadata) or stored_key or path.stem,
             messages=messages,
             summary=str(metadata.get("summary", "")),
@@ -394,14 +429,20 @@ class SessionStore:
         """Return the cross-instance lock associated with a session file."""
         return FileLock(str(path) + ".lock", timeout=10)
 
+    def _creation_lock(self) -> FileLock:
+        """Serialize session ID allocation across store instances/processes."""
+        return FileLock(str(self._sessions_dir / ".create.lock"), timeout=10)
+
     # ------------------------------------------------------------------
     # CRUD
     # ------------------------------------------------------------------
 
     def ensure_default_session(self) -> Session:
         """Return any existing session, or create the default one."""
-        if self._cache:
-            return next(iter(self._cache.values()))
+        with self._cache_lock:
+            existing = next(iter(self._cache.values()), None)
+        if existing is not None:
+            return existing
         return self.create_session(
             session_id=self.default_session_id,
             title=self.default_session_title,
@@ -410,46 +451,64 @@ class SessionStore:
     def create_session(
         self, title: str | None = None, session_id: str | None = None
     ) -> Session:
-        resolved_id = session_id or self._generate_session_id()
-        _validate_session_id(resolved_id)
-        with self._session_lock(resolved_id):
-            if resolved_id in self._cache:
-                raise SessionStoreError(f"session id 已存在: {resolved_id}")
-            session = Session(
-                session_id=resolved_id,
-                title=title or resolved_id,
-            )
-            # Persist title into metadata so it survives reload.
-            # (rename() does the same sync; create_session was missing it.)
-            if title:
-                session.metadata["title"] = title
-            # save() publishes the session to the cache only after the atomic
-            # replacement succeeds, avoiding a cache-only phantom session.
-            self.save(session)
-            return session
+        try:
+            with self._creation_lock():
+                with self._cache_lock:
+                    resolved_id = session_id or self._generate_session_id()
+                    _validate_session_id(resolved_id)
+                    if (
+                        resolved_id in self._cache
+                        or resolved_id in self._creating_ids
+                        or self._key_path(resolved_id).exists()
+                    ):
+                        raise SessionStoreError(f"session id 已存在: {resolved_id}")
+                    self._creating_ids.add(resolved_id)
+
+                try:
+                    with self._session_lock(resolved_id):
+                        session = Session(
+                            session_id=resolved_id,
+                            title=title or resolved_id,
+                        )
+                        # Persist title into metadata so it survives reload.
+                        # (rename() does the same sync; create_session was missing it.)
+                        if title:
+                            session.metadata["title"] = title
+                        # save() publishes the session to the cache only after the atomic
+                        # replacement succeeds, avoiding a cache-only phantom session.
+                        self.save(session)
+                        return session
+                finally:
+                    with self._cache_lock:
+                        self._creating_ids.discard(resolved_id)
+        except FileLockTimeout as exc:
+            raise SessionStoreError("创建 session 失败: 等待创建锁超时") from exc
 
     def get(self, session_id: str) -> Session:
         _validate_session_id(session_id)
-        try:
-            return self._cache[session_id]
-        except KeyError as exc:
-            raise SessionNotFoundError(f"未找到 session: {session_id}") from exc
+        with self._cache_lock:
+            try:
+                return self._cache[session_id]
+            except KeyError as exc:
+                raise SessionNotFoundError(f"未找到 session: {session_id}") from exc
 
     def exists(self, session_id: str) -> bool:
         try:
             _validate_session_id(session_id)
         except SessionStoreError:
             return False
-        return session_id in self._cache
+        with self._cache_lock:
+            return session_id in self._cache
 
     def invalidate(self, session_id: str) -> None:
-        """Remove from cache (force re-read from disk on next get)."""
+        """Remove one session from the in-memory cache."""
         try:
             _validate_session_id(session_id)
         except SessionStoreError:
             return
-        self._cache.pop(session_id, None)
-        self._summaries_cache = None
+        with self._cache_lock:
+            self._cache.pop(session_id, None)
+            self._summaries_cache = None
 
     def rename(self, session_id: str, new_title: str, *, user_edited: bool = True) -> Session:
         """Rename a session's title.
@@ -463,6 +522,10 @@ class SessionStore:
         _validate_session_id(session_id)
         with self._session_lock(session_id):
             session = self.get(session_id)
+            old_title = session.title
+            old_metadata = dict(session.metadata)
+            old_updated_at = session.updated_at
+            old_revision = session.revision
             session.title = new_title
             session.metadata["title"] = new_title
             if user_edited:
@@ -473,7 +536,14 @@ class SessionStore:
                 session.metadata.pop("title_user_edited", None)
             session.touch()
             self._summaries_cache = None
-            self.save(session)
+            try:
+                self.save(session)
+            except Exception:
+                session.title = old_title
+                session.metadata = old_metadata
+                session.updated_at = old_updated_at
+                session.revision = old_revision
+                raise
             return session
 
     def delete(self, session_id: str) -> bool:
@@ -486,17 +556,19 @@ class SessionStore:
                 with self._file_lock(path):
                     deleted = False
                     if path.exists():
-                        try:
-                            path.unlink()
-                            deleted = True
-                        except OSError:
-                            pass
-                    del self._cache[session_id]
-                    self._summaries_cache = None
+                        path.unlink()
+                        deleted = True
+                    with self._cache_lock:
+                        del self._cache[session_id]
+                        self._summaries_cache = None
                     return deleted
             except FileLockTimeout as exc:
                 raise SessionStoreError(
                     f"删除 session {session_id} 失败: 等待文件锁超时"
+                ) from exc
+            except OSError as exc:
+                raise SessionStoreError(
+                    f"删除 session {session_id} 失败: {exc}"
                 ) from exc
 
     # ------------------------------------------------------------------
@@ -509,6 +581,7 @@ class SessionStore:
         When *fsync* is True, the file and its parent directory are
         explicitly flushed (for graceful shutdown).
         """
+        _validate_session_id(session.session_id)
         path = self._key_path(session.session_id)
         with self._session_lock(session.session_id):
             # A unique temporary file prevents stale temporary data from being
@@ -533,9 +606,10 @@ class SessionStore:
                     f"保存 session {session.session_id} 失败: {exc}"
                 ) from exc
 
-            self._cache[session.session_id] = session
-            # Invalidate the summaries cache — the session list has changed.
-            self._summaries_cache = None
+            with self._cache_lock:
+                self._cache[session.session_id] = session
+                # Invalidate the summaries cache — the session list has changed.
+                self._summaries_cache = None
 
     @staticmethod
     def _replace_with_retry(source: Path, destination: Path) -> None:
@@ -581,7 +655,9 @@ class SessionStore:
     def flush_all(self) -> int:
         """Re-save every cached session with fsync. Returns count flushed."""
         flushed = 0
-        for key, session in list(self._cache.items()):
+        with self._cache_lock:
+            cached = list(self._cache.items())
+        for key, session in cached:
             try:
                 self.save(session, fsync=True)
                 flushed += 1
@@ -594,25 +670,25 @@ class SessionStore:
     # ------------------------------------------------------------------
 
     def list_summaries(self) -> list[SessionSummary]:
-        # Return cached summaries if available — avoids re-scanning all
-        # messages of all sessions on every call.
-        if self._summaries_cache is not None:
-            return self._summaries_cache
+        with self._cache_lock:
+            # Return a copy so callers cannot mutate the cached list.
+            if self._summaries_cache is not None:
+                return list(self._summaries_cache)
 
-        summaries = []
-        for session in self._cache.values():
-            preview = self._compute_preview(session.messages)
-            summaries.append(SessionSummary(
-                session_id=session.session_id,
-                title=_metadata_title(session.metadata) or session.title,
-                message_count=len(session.messages),
-                updated_at=session.updated_at,
-                preview=preview,
-                path=str(self._key_path(session.session_id)),
-            ))
-        summaries.sort(key=lambda s: s.updated_at, reverse=True)
-        self._summaries_cache = summaries
-        return summaries
+            summaries = []
+            for session in self._cache.values():
+                preview = self._compute_preview(session.messages)
+                summaries.append(SessionSummary(
+                    session_id=session.session_id,
+                    title=_metadata_title(session.metadata) or session.title,
+                    message_count=len(session.messages),
+                    updated_at=session.updated_at,
+                    preview=preview,
+                    path=str(self._key_path(session.session_id)),
+                ))
+            summaries.sort(key=lambda s: s.updated_at, reverse=True)
+            self._summaries_cache = summaries
+            return list(summaries)
 
     @staticmethod
     def _compute_preview(messages: list[Message], *, scan_limit: int = 50) -> str:
@@ -738,50 +814,73 @@ class SessionStore:
         if before_user_index < 0:
             return None
 
-        source = self._cache.get(source_key)
-        if source is None:
-            return None
-
-        copied: list[Message] = []
-        user_count = 0
-        found = False
-        for msg in source.messages:
-            if msg.role == "user":
-                if user_count == before_user_index:
-                    found = True
-                    break
-                user_count += 1
-            copied.append(msg)
-
-        if user_count == before_user_index:
-            found = True
-        if not found:
-            return None
-
-        # Deep-copy metadata, stripping volatile keys
         import copy
-        metadata = copy.deepcopy(source.metadata)
-        for key in _FORK_VOLATILE_META:
-            metadata.pop(key, None)
 
-        last_consolidated = min(source.last_consolidated, len(copied))
-        if source.last_consolidated > len(copied):
-            metadata.pop("_last_summary", None)
-            last_consolidated = 0
+        _validate_session_id(source_key)
+        _validate_session_id(target_key)
+        try:
+            with self._creation_lock():
+                with self._cache_lock:
+                    source = self._cache.get(source_key)
+                    if source is None:
+                        return None
+                    if (
+                        target_key in self._cache
+                        or target_key in self._creating_ids
+                        or self._key_path(target_key).exists()
+                    ):
+                        raise SessionStoreError(f"session id 已存在: {target_key}")
+                    self._creating_ids.add(target_key)
 
-        target = Session(
-            session_id=target_key,
-            title=f"{source.title} (fork)",
-            messages=[copy.deepcopy(m) for m in copied],
-            summary=source.summary if last_consolidated > 0 else "",
-            created_at=_now_iso(),
-            updated_at=_now_iso(),
-            last_consolidated=last_consolidated,
-            revision=source.revision,
-            metadata=metadata,
-        )
-        self.save(target, fsync=True)
-        return target
+                try:
+                    # Snapshot the source while another save/fork cannot serialize
+                    # it at the same time.
+                    with self._session_lock(source_key):
+                        copied: list[Message] = []
+                        user_count = 0
+                        found = False
+                        for msg in source.messages:
+                            if msg.role == "user":
+                                if user_count == before_user_index:
+                                    found = True
+                                    break
+                                user_count += 1
+                            copied.append(copy.deepcopy(msg))
+
+                        if user_count == before_user_index:
+                            found = True
+                        if not found:
+                            return None
+
+                        metadata = copy.deepcopy(source.metadata)
+                        for key in _FORK_VOLATILE_META:
+                            metadata.pop(key, None)
+
+                        last_consolidated = min(
+                            source.last_consolidated, len(copied)
+                        )
+                        if source.last_consolidated > len(copied):
+                            metadata.pop("_last_summary", None)
+                            last_consolidated = 0
+
+                        target = Session(
+                            session_id=target_key,
+                            title=f"{source.title} (fork)",
+                            messages=copied,
+                            summary=source.summary if last_consolidated > 0 else "",
+                            created_at=_now_iso(),
+                            updated_at=_now_iso(),
+                            last_consolidated=last_consolidated,
+                            revision=source.revision,
+                            metadata=metadata,
+                        )
+                    self.save(target, fsync=True)
+                    return target
+                finally:
+                    with self._cache_lock:
+                        self._creating_ids.discard(target_key)
+        except FileLockTimeout as exc:
+            raise SessionStoreError("分叉 session 失败: 等待创建锁超时") from exc
 
     # ------------------------------------------------------------------
     # Internal
@@ -790,7 +889,12 @@ class SessionStore:
     def _generate_session_id(self) -> str:
         pat = re.compile(r"^session_(\d+)$")
         max_seq = 0
-        for eid in self._cache:
+        known_ids = set(self._cache) | self._creating_ids
+        for path in self._sessions_dir.glob(f"*{_SESSION_FILE_EXT}"):
+            decoded = self._decode_key(path.stem)
+            if decoded:
+                known_ids.add(decoded)
+        for eid in known_ids:
             m = pat.match(eid)
             if m:
                 max_seq = max(max_seq, int(m.group(1)))

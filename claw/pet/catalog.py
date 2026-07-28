@@ -9,14 +9,17 @@ from __future__ import annotations
 import io
 import hashlib
 import json
+import os
 import re
 import shutil
 import stat
 import tempfile
 import threading
+import uuid
 import zipfile
 import zlib
 from dataclasses import asdict, dataclass
+from functools import wraps
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO
 
@@ -65,6 +68,15 @@ class PetCatalogError(ValueError):
     pass
 
 
+def _synchronized(method):
+    @wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return wrapper
+
+
 class PetCatalog:
     """Thread-safe pet metadata, assets, and preferences store."""
 
@@ -87,9 +99,11 @@ class PetCatalog:
                 return settings
             pos = raw.get("position") if isinstance(raw.get("position"), dict) else {}
             settings = PetSettings(
-                enabled=bool(raw.get("enabled", True)),
+                enabled=_optional_bool(raw.get("enabled"), True),
                 selected_pet_id=str(raw.get("selectedPetId") or "yuexinmiao"),
-                launch_on_gateway_start=bool(raw.get("launchOnGatewayStart", True)),
+                launch_on_gateway_start=_optional_bool(
+                    raw.get("launchOnGatewayStart"), True
+                ),
                 position_x=_optional_int(pos.get("x")),
                 position_y=_optional_int(pos.get("y")),
             )
@@ -124,6 +138,7 @@ class PetCatalog:
             self._write_settings(settings)
             return settings
 
+    @_synchronized
     def list_pets(self) -> list[dict[str, Any]]:
         pets: list[dict[str, Any]] = []
         seen: set[str] = set()
@@ -136,6 +151,8 @@ class PetCatalog:
             if not root.exists():
                 continue
             for manifest_path in sorted(root.glob("*/pet.json")):
+                if manifest_path.parent.name.startswith("."):
+                    continue
                 pet = self._read_pet(manifest_path.parent, source, read_only)
                 if pet is None or pet["id"] in seen:
                     continue
@@ -158,6 +175,7 @@ class PetCatalog:
                 asset_indexes[asset_key] = len(pets) - 1
         return pets
 
+    @_synchronized
     def get_pet(self, pet_id: str) -> dict[str, Any] | None:
         for source, root, read_only in (
             ("user", self._user_pets, False),
@@ -169,6 +187,7 @@ class PetCatalog:
                 return pet
         return None
 
+    @_synchronized
     def install(
         self,
         *,
@@ -199,8 +218,17 @@ class PetCatalog:
             delete=False,
         ) as upload_tmp:
             tmp_path = Path(upload_tmp.name)
-            shutil.copyfileobj(spritesheet, upload_tmp)
         try:
+            total = 0
+            with tmp_path.open("wb") as upload_tmp:
+                while True:
+                    chunk = spritesheet.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > _MAX_SPRITESHEET_BYTES:
+                        raise PetCatalogError("spritesheet 超过 50 MB 限制")
+                    upload_tmp.write(chunk)
             try:
                 with Image.open(tmp_path) as image:
                     width, height = image.size
@@ -222,8 +250,16 @@ class PetCatalog:
             }:
                 raise PetCatalogError("spritesheet 必须是 1536x1872 或 1536x2288")
             inferred_version = 2 if height == _CELL_SIZE[1] * 11 else 1
-            version = sprite_version_number or inferred_version
-            if version not in (1, 2) or (version == 2) != (inferred_version == 2):
+            version = (
+                inferred_version
+                if sprite_version_number is None
+                else sprite_version_number
+            )
+            if (
+                type(version) is not int
+                or version not in (1, 2)
+                or (version == 2) != (inferred_version == 2)
+            ):
                 raise PetCatalogError("spriteVersionNumber 与 spritesheet 尺寸不匹配")
             if validate_frames:
                 try:
@@ -233,29 +269,40 @@ class PetCatalog:
                 except (OSError, ValueError) as exc:
                     raise PetCatalogError("spritesheet 图像数据损坏或无法读取") from exc
 
-            try:
-                pet_dir.mkdir(parents=True, exist_ok=False)
-            except FileExistsError as exc:
-                raise PetCatalogError(f"宠物已存在: {pet_id}") from exc
-            asset_name = f"spritesheet{suffix}"
-            shutil.move(str(tmp_path), str(pet_dir / asset_name))
-            manifest = {
-                "id": pet_id,
-                "displayName": display_name.strip() or pet_id,
-                "description": description.strip(),
-                "spritesheetPath": asset_name,
-                "spriteVersionNumber": version,
-            }
-            (pet_dir / "pet.json").write_text(
-                json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
-                encoding="utf-8",
+            staged_dir = self._user_pets / (
+                f".install-{pet_id}-{uuid.uuid4().hex}"
             )
+            asset_name = f"spritesheet{suffix}"
+            try:
+                staged_dir.mkdir(parents=False, exist_ok=False)
+                shutil.move(str(tmp_path), str(staged_dir / asset_name))
+                manifest = {
+                    "id": pet_id,
+                    "displayName": display_name.strip() or pet_id,
+                    "description": description.strip(),
+                    "spritesheetPath": asset_name,
+                    "spriteVersionNumber": version,
+                }
+                (staged_dir / "pet.json").write_text(
+                    json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                try:
+                    os.replace(staged_dir, pet_dir)
+                except FileExistsError as exc:
+                    raise PetCatalogError(f"宠物已存在: {pet_id}") from exc
+                except OSError as exc:
+                    raise PetCatalogError(f"宠物安装失败: {exc}") from exc
+            finally:
+                if staged_dir.exists():
+                    shutil.rmtree(staged_dir, ignore_errors=True)
         finally:
             tmp_path.unlink(missing_ok=True)
         pet = self.get_pet(pet_id)
         assert pet is not None
         return pet
 
+    @_synchronized
     def install_package(
         self,
         *,
@@ -435,25 +482,37 @@ class PetCatalog:
                 if column >= used_count and cell_alpha.getbbox() is not None:
                     raise PetCatalogError(f"spritesheet 的第 {row + 1} 行未使用帧必须完全透明")
 
+    @_synchronized
     def remove(self, pet_id: str) -> None:
-        with self._lock:
-            if (self._bundled / pet_id).exists():
-                raise PetCatalogError("不能删除内置宠物")
-            pet_dir = self._user_pets / pet_id
-            if not pet_dir.is_dir():
-                raise PetCatalogError(f"宠物不存在: {pet_id}")
-            was_selected = self.load_settings().selected_pet_id == pet_id
-            shutil.rmtree(pet_dir)
+        if (self._bundled / pet_id).exists():
+            raise PetCatalogError("不能删除内置宠物")
+        pet_dir = self._user_pets / pet_id
+        if not pet_dir.is_dir():
+            raise PetCatalogError(f"宠物不存在: {pet_id}")
+        was_selected = self.load_settings().selected_pet_id == pet_id
+        backup_dir = self._user_pets / f".delete-{pet_id}-{uuid.uuid4().hex}"
+        os.replace(pet_dir, backup_dir)
+        try:
             if was_selected:
                 self.update_settings(selected_pet_id="yuexinmiao")
+        except BaseException:
+            os.replace(backup_dir, pet_dir)
+            raise
+        shutil.rmtree(backup_dir, ignore_errors=True)
 
     def _write_settings(self, settings: PetSettings) -> None:
-        tmp = self._settings_path.with_suffix(".tmp")
-        tmp.write_text(
-            json.dumps(settings.to_dict(), ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
+        tmp = self._settings_path.with_name(
+            f".{self._settings_path.name}.{uuid.uuid4().hex}.tmp"
         )
-        tmp.replace(self._settings_path)
+        try:
+            tmp.write_text(
+                json.dumps(settings.to_dict(), ensure_ascii=False, indent=2)
+                + "\n",
+                encoding="utf-8",
+            )
+            tmp.replace(self._settings_path)
+        finally:
+            tmp.unlink(missing_ok=True)
 
     @staticmethod
     def _read_pet(pet_dir: Path, source: str, read_only: bool) -> dict[str, Any] | None:
@@ -485,6 +544,10 @@ def _optional_int(value: Any) -> int | None:
         return None if value is None else int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _optional_bool(value: Any, default: bool) -> bool:
+    return value if isinstance(value, bool) else default
 
 
 def _pet_asset_key(pet: dict[str, Any]) -> str:

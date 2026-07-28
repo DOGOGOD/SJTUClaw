@@ -16,6 +16,7 @@ import logging
 import mimetypes
 import os
 import queue
+import re
 import shutil
 import threading
 import uuid
@@ -85,7 +86,7 @@ from claw.scheduler.callbacks import (
     HeartbeatCallback,
     make_heartbeat_system_job,
 )
-from claw.memory.reflection import ReflectionManager
+from claw.memory.reflection import ReflectionManager, is_valid_reflection_time
 from claw.pet.catalog import PetCatalog, PetCatalogError
 from claw.pet.process import PetProcessManager
 from claw.pet.replies import PetReplyStore, generate_and_store_pet_replies
@@ -557,6 +558,7 @@ from claw.gateway.middleware import (
     RequestLoggingMiddleware,
     RequestSizeMiddleware,
     allowed_gateway_origins,
+    sanitize_error_message,
 )
 from claw.gateway.uploads import UploadTooLargeError, save_upload_limited
 
@@ -631,6 +633,7 @@ def _session_turn_active(session_id: str) -> bool:
 _qq_channel: QQChannel | None = None
 _qq_task: asyncio.Task | None = None
 _qq_onboard_tasks: dict[str, dict[str, Any]] = {}
+_qq_onboard_tasks_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -640,11 +643,31 @@ _qq_onboard_tasks: dict[str, dict[str, Any]] = {}
 # Map external QQ chat_ids to clean sequential session IDs.
 # Keyed by chat_id, value is the internal session_id.
 _qq_session_map: dict[str, str] = {}
+_qq_session_map_lock = threading.Lock()
 
 
 _INLINE_IMAGE_EXTENSIONS = frozenset({
     ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".avif"
 })
+_INLINE_IMAGE_MEDIA_TYPES = frozenset({
+    "image/png",
+    "image/jpeg",
+    "image/gif",
+    "image/webp",
+    "image/bmp",
+    "image/avif",
+})
+_SAFE_UPLOAD_SUFFIX_RE = re.compile(r"^\.[A-Za-z0-9]{1,10}$")
+_PROMPT_UPDATE_LOCK = threading.RLock()
+
+
+def _is_safe_inline_image(path: Path, media_type: str) -> bool:
+    """Allow only passive raster formats to render in the Gateway origin."""
+    normalized_type = media_type.partition(";")[0].strip().lower()
+    return (
+        path.suffix.lower() in _INLINE_IMAGE_EXTENSIONS
+        and normalized_type in _INLINE_IMAGE_MEDIA_TYPES
+    )
 
 
 def _decorate_download_reply(
@@ -698,6 +721,26 @@ def _find_existing_qq_session(chat_id: str) -> str | None:
     return None
 
 
+def _resolve_or_create_qq_session(chat_id: str, chat_type: str) -> str:
+    """Resolve one stable session for a QQ chat under concurrent delivery."""
+    with _qq_session_map_lock:
+        session_key = _qq_session_map.get(chat_id)
+        if session_key is not None:
+            return session_key
+
+        existing = _find_existing_qq_session(chat_id)
+        if existing is not None:
+            session_key = existing
+        else:
+            session = _session_store.create_session(title="QQ 对话")
+            session_key = session.session_id
+            session.metadata["qq_chat_id"] = chat_id
+            session.metadata["qq_chat_type"] = chat_type
+            _session_store.save(session)
+        _qq_session_map[chat_id] = session_key
+        return session_key
+
+
 async def _qq_interaction_handler(event: QQInteraction) -> None:
     """Resolve an approval button after binding it to its chat and operator."""
     parsed = parse_approval_button_data(event.button_data)
@@ -747,26 +790,8 @@ async def _qq_message_handler(
     """
     import asyncio as _asyncio
 
-    # Resolve or create a session ID for this chat
-    session_key = _qq_session_map.get(chat_id)
     chat_type = (metadata or {}).get("chat_type", "c2c")
-    if session_key is None:
-        # Try to find an existing session for this chat_id on disk
-        existing = _find_existing_qq_session(chat_id)
-        if existing is not None:
-            session_key = existing
-        else:
-            # Create a new session — auto-generates session_NNN format
-            session = _session_store.create_session(
-                title=f"QQ 对话"
-            )
-            session_key = session.session_id
-            # Persist the QQ chat_id mapping so we can recover
-            # after a gateway restart.
-            session.metadata["qq_chat_id"] = chat_id
-            session.metadata["qq_chat_type"] = chat_type
-            _session_store.save(session)
-        _qq_session_map[chat_id] = session_key
+    session_key = _resolve_or_create_qq_session(chat_id, chat_type)
 
     session = _session_store.get(session_key)
     is_approval_command = content.strip().lower().startswith(("/approve", "/reject"))
@@ -944,6 +969,13 @@ class AttachmentInfo(BaseModel):
 # Attachment helpers (session-scoped metadata)
 # ---------------------------------------------------------------------------
 
+_ATTACHMENT_META_LOCKS = tuple(threading.RLock() for _ in range(64))
+
+
+def _attachment_meta_lock(session_id: str) -> threading.RLock:
+    """Return a fixed-size striped lock for one session's metadata."""
+    return _ATTACHMENT_META_LOCKS[hash(session_id) % len(_ATTACHMENT_META_LOCKS)]
+
 
 def _attachments_dir(session_id: str) -> Path:
     """Return the attachments directory for a session.
@@ -960,24 +992,32 @@ def _meta_file(session_id: str) -> Path:
 
 
 def _read_attachments_meta(session_id: str) -> list[dict[str, Any]]:
-    mf = _meta_file(session_id)
-    if not mf.exists():
+    with _attachment_meta_lock(session_id):
+        mf = _meta_file(session_id)
+        if not mf.exists():
+            return []
+        try:
+            data = json.loads(mf.read_text(encoding="utf-8"))
+            if isinstance(data, list):
+                return data
+        except (OSError, json.JSONDecodeError):
+            pass
         return []
-    try:
-        data = json.loads(mf.read_text(encoding="utf-8"))
-        if isinstance(data, list):
-            return data
-    except (OSError, json.JSONDecodeError):
-        pass
-    return []
 
 
 def _write_attachments_meta(session_id: str, meta: list[dict[str, Any]]) -> None:
-    d = _attachments_dir(session_id)
-    d.mkdir(parents=True, exist_ok=True)
-    tmp = d / ".meta.tmp"
-    tmp.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(_meta_file(session_id))
+    with _attachment_meta_lock(session_id):
+        d = _attachments_dir(session_id)
+        d.mkdir(parents=True, exist_ok=True)
+        tmp = d / f".meta.{uuid.uuid4().hex}.tmp"
+        try:
+            tmp.write_text(
+                json.dumps(meta, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            tmp.replace(_meta_file(session_id))
+        finally:
+            tmp.unlink(missing_ok=True)
 
 
 def _add_attachment_record(
@@ -988,18 +1028,19 @@ def _add_attachment_record(
     size: int,
     mime_type: str,
 ) -> dict[str, Any]:
-    record = {
-        "id": attachment_id,
-        "originalName": original_name,
-        "storedName": stored_name,
-        "size": size,
-        "mimeType": mime_type,
-        "uploadedAt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-    }
-    meta = _read_attachments_meta(session_id)
-    meta.append(record)
-    _write_attachments_meta(session_id, meta)
-    return record
+    with _attachment_meta_lock(session_id):
+        record = {
+            "id": attachment_id,
+            "originalName": original_name,
+            "storedName": stored_name,
+            "size": size,
+            "mimeType": mime_type,
+            "uploadedAt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        }
+        meta = _read_attachments_meta(session_id)
+        meta.append(record)
+        _write_attachments_meta(session_id, meta)
+        return record
 
 
 def _markdown_image_alt(filename: str) -> str:
@@ -1033,9 +1074,9 @@ def _resolve_chat_attachments(
         if record is None:
             raise HTTPException(status_code=404, detail=f"附件不存在: {attachment_id}")
         mime_type = str(record.get("mimeType") or "")
-        if not mime_type.startswith("image/"):
-            raise HTTPException(status_code=400, detail="当前消息仅支持粘贴图片")
         path = (root / str(record.get("storedName") or "")).resolve()
+        if not _is_safe_inline_image(path, mime_type):
+            raise HTTPException(status_code=400, detail="当前消息仅支持粘贴图片")
         try:
             path.relative_to(root)
         except ValueError as exc:
@@ -1059,26 +1100,41 @@ def _resolve_chat_attachments(
 
 
 @app.exception_handler(LLMError)
-async def _llm_error_handler(_request, exc: LLMError):
+async def _llm_error_handler(request, exc: LLMError):
+    logger.exception(
+        "LLM request failed: request_id=%s",
+        getattr(request.state, "request_id", "unknown"),
+        exc_info=exc,
+    )
     return JSONResponse(
         status_code=502,
-        content={"ok": False, "error": f"LLM 调用失败: {exc}"},
+        content={"ok": False, "error": f"LLM 调用失败: {sanitize_error_message(exc)}"},
     )
 
 
 @app.exception_handler(SessionStoreError)
-async def _session_error_handler(_request, exc: SessionStoreError):
+async def _session_error_handler(request, exc: SessionStoreError):
+    logger.exception(
+        "Session storage request failed: request_id=%s",
+        getattr(request.state, "request_id", "unknown"),
+        exc_info=exc,
+    )
     return JSONResponse(
         status_code=500,
-        content={"ok": False, "error": f"Session 存储错误: {exc}"},
+        content={"ok": False, "error": "Session 存储操作失败，请检查数据目录或查看日志。"},
     )
 
 
 @app.exception_handler(Exception)
-async def _generic_error_handler(_request, exc: Exception):
+async def _generic_error_handler(request, exc: Exception):
+    logger.exception(
+        "Unhandled gateway request error: request_id=%s",
+        getattr(request.state, "request_id", "unknown"),
+        exc_info=exc,
+    )
     return JSONResponse(
         status_code=500,
-        content={"ok": False, "error": f"服务器内部错误: {exc}"},
+        content={"ok": False, "error": sanitize_error_message(exc)},
     )
 
 
@@ -1312,6 +1368,31 @@ def _is_slash_command(text: str) -> bool:
     return is_command(text)
 
 
+def _mutating_command_session(command: str, current_session_id: str) -> str | None:
+    """Return the session whose active turn conflicts with this command."""
+    parts = command.split()
+    if not parts:
+        return None
+    root = parts[0].lower()
+    sub = parts[1].lower() if len(parts) > 1 else ""
+
+    if root == "/compact":
+        return current_session_id
+    if root == "/workspace" and sub in {"set", "unset"}:
+        return current_session_id
+    if root == "/unlimited" and sub in {
+        "on", "off", "enable", "disable", "1", "0", "toggle",
+    }:
+        return current_session_id
+    if root == "/pi" and sub not in {"status"}:
+        return current_session_id
+    if root == "/rollback" and sub not in {"status", "show", "list"}:
+        return current_session_id
+    if root == "/session" and sub in {"rename", "delete"} and len(parts) > 2:
+        return parts[2]
+    return None
+
+
 def _execute_slash_command(
     command: str,
     session_id: str,
@@ -1327,8 +1408,8 @@ def _execute_slash_command(
     from claw.cli.commands import RuntimeState, handle_command
 
     sid = session_id or "default"
-    root = command.strip().split(maxsplit=1)[0].lower() if command.strip() else ""
-    if root in {"/workspace", "/pi"} and _session_turn_active(sid):
+    mutation_session = _mutating_command_session(command, sid)
+    if mutation_session is not None and _session_turn_active(mutation_session):
         return "[错误] 当前任务正在运行，请先停止任务后再修改运行配置。"
 
     def _stop_impl() -> str:
@@ -1387,11 +1468,13 @@ def _execute_slash_command(
         tool_registry=_tool_registry,
         skill_registry=_skill_registry,
         reflection_manager=_reflection_mgr,
+        compaction_worker=_compaction_worker,
         cron_service=_cron_service,
         pet_catalog=_pet_catalog,
         pet_process=_pet_process,
         rollback_manager=_rollback_manager,
         auto_mode=_auto_mode.get(sid, False),
+        auto_modes=_auto_mode,
         stop_handler=_stop_impl,
         exit_handler=_exit_impl,
         backend_switcher=_switch_backend,
@@ -1399,10 +1482,6 @@ def _execute_slash_command(
     result = handle_command(command, state, markdown=True)
     if state_out is not None:
         state_out["current_session_id"] = state.current_session_id
-    if state.auto_mode:
-        _auto_mode[sid] = True
-    else:
-        _auto_mode.pop(sid, None)
     return result
 
 
@@ -1523,7 +1602,12 @@ async def handle_command(req: CommandRequest):
     """Execute a CLI-style command and return the result."""
     from claw.cli.commands import parse_skill_invoke_result
 
-    root, *args = req.command.split()
+    parts = req.command.split()
+    if not parts:
+        raise HTTPException(status_code=400, detail="命令不能为空")
+    root, *args = parts
+    root = root.lower()
+    args_lower = [arg.lower() for arg in args]
     command_state: dict[str, str] = {}
     sid = req.session_id or "default"
     result_text = _execute_slash_command(
@@ -1540,17 +1624,17 @@ async def handle_command(req: CommandRequest):
     actions: list[str] = []
     switch_to: str | None = None
 
-    if root == "/session" and args and args[0] == "new":
+    if root == "/session" and args_lower and args_lower[0] == "new":
         actions = ["reload_sessions", "switch_session"]
         switch_to = command_state.get("current_session_id")
-    elif root == "/session" and args and args[0] == "switch":
+    elif root == "/session" and args_lower and args_lower[0] == "switch":
         actions = ["reload_sessions"]
         if len(args) > 1 and _session_store.exists(args[1]):
             actions.append("switch_session")
             switch_to = command_state.get("current_session_id")
-    elif root == "/session" and args and args[0] in ("list", "rename", "delete"):
+    elif root == "/session" and args_lower and args_lower[0] in ("list", "rename", "delete"):
         actions = ["reload_sessions"]
-        if args[0] == "delete" and len(args) > 1 and args[1] == sid:
+        if args_lower[0] == "delete" and len(args) > 1 and args[1] == sid:
             actions.append("clear_session")
     elif root == "/workspace":
         actions = ["reload_sessions", "reload_rollback_status"]
@@ -1558,7 +1642,9 @@ async def handle_command(req: CommandRequest):
         actions = ["reload_sessions"]
     elif root == "/rollback":
         actions = ["reload_messages", "reload_sessions", "reload_rollback_status"]
-    elif root == "/pet" and (not args or args[0] in ("settings", "config")):
+    elif root == "/pet" and (
+        not args_lower or args_lower[0] in ("settings", "config")
+    ):
         actions = ["open_pet_settings"]
     elif root == "/exit":
         actions = ["clear_session"]
@@ -1662,29 +1748,40 @@ async def upload_attachment(
     mime_type = file.content_type or "application/octet-stream"
 
     attachment_id = f"att_{uuid.uuid4().hex[:12]}"
-    safe_suffix = Path(original_name).suffix
-    if safe_suffix and len(safe_suffix) > 20:
-        safe_suffix = ""
+    raw_suffix = Path(original_name).suffix
+    safe_suffix = (
+        raw_suffix.lower()
+        if _SAFE_UPLOAD_SUFFIX_RE.fullmatch(raw_suffix)
+        else ""
+    )
     stored_name = f"{attachment_id}{safe_suffix}"
 
     d = _attachments_dir(session_id)
     file_path = d / stored_name
     try:
-        size = await save_upload_limited(
-            file, file_path, max_bytes=MAX_ATTACHMENT_BYTES
-        )
+        try:
+            size = await save_upload_limited(
+                file, file_path, max_bytes=MAX_ATTACHMENT_BYTES
+            )
+        finally:
+            await file.close()
     except UploadTooLargeError as exc:
         raise HTTPException(status_code=413, detail=str(exc)) from exc
 
-    record = _add_attachment_record(
-        session_id, attachment_id, original_name, stored_name, size, mime_type
-    )
+    try:
+        record = _add_attachment_record(
+            session_id, attachment_id, original_name, stored_name, size, mime_type
+        )
+    except Exception:
+        with suppress(OSError):
+            file_path.unlink(missing_ok=True)
+        raise
 
     content_url = f"/sessions/{session_id}/attachments/{attachment_id}"
     markdown_name = _markdown_image_alt(original_name)
     message_content = (
         f"![{markdown_name}]({content_url})"
-        if mime_type.startswith("image/")
+        if _is_safe_inline_image(Path(original_name), mime_type)
         else f"[{markdown_name}]({content_url})"
     )
     if persist_message:
@@ -1725,12 +1822,19 @@ def get_attachment_content(session_id: str, attachment_id: str):
     if not path.is_file():
         raise HTTPException(status_code=404, detail="附件文件不存在")
     media_type = str(record.get("mimeType") or "application/octet-stream")
-    if media_type.startswith("image/"):
-        return FileResponse(path, media_type=media_type, content_disposition_type="inline")
+    headers = {"X-Content-Type-Options": "nosniff"}
+    if _is_safe_inline_image(path, media_type):
+        return FileResponse(
+            path,
+            media_type=media_type,
+            content_disposition_type="inline",
+            headers=headers,
+        )
     return FileResponse(
         path,
         media_type=media_type,
         filename=str(record.get("originalName") or path.name),
+        headers=headers,
     )
 
 
@@ -1753,11 +1857,16 @@ def get_local_image(session_id: str, path: str = Query(...)):
     except ValueError as exc:
         raise HTTPException(status_code=403, detail="图片路径超出 workspace") from exc
     media_type = mimetypes.guess_type(candidate.name)[0] or ""
-    if not candidate.is_file() or not media_type.startswith("image/"):
+    if not candidate.is_file() or not _is_safe_inline_image(candidate, media_type):
         raise HTTPException(status_code=404, detail="本地图片不存在或格式不受支持")
     if candidate.stat().st_size > 20 * 1024 * 1024:
         raise HTTPException(status_code=413, detail="图片不能超过 20 MB")
-    return FileResponse(candidate, media_type=media_type, content_disposition_type="inline")
+    return FileResponse(
+        candidate,
+        media_type=media_type,
+        content_disposition_type="inline",
+        headers={"X-Content-Type-Options": "nosniff"},
+    )
 
 
 @app.get("/sessions/{session_id}/attachments")
@@ -2211,16 +2320,19 @@ def serve_download(download_id: str):
             status_code=404, detail=f"文件已被删除: {file_path.name}"
         )
     media_type = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
-    if media_type.startswith("image/"):
+    headers = {"X-Content-Type-Options": "nosniff"}
+    if _is_safe_inline_image(file_path, media_type):
         return FileResponse(
             path=str(file_path),
             media_type=media_type,
             content_disposition_type="inline",
+            headers=headers,
         )
     return FileResponse(
         path=str(file_path),
         filename=file_path.name,
         media_type=media_type,
+        headers=headers,
     )
 
 
@@ -2323,10 +2435,11 @@ def get_system_prompt():
 
 @app.put("/admin/system-prompt")
 def update_system_prompt(req: UpdateContentRequest):
-    _write_prompt_file("system_prompt.md", req.content)
-    import claw.gateway.server as _srv
-    _srv.__dict__["_system_prompt"] = req.content
-    _context_builder.update_system_prompt(req.content)
+    with _PROMPT_UPDATE_LOCK:
+        _write_prompt_file("system_prompt.md", req.content)
+        import claw.gateway.server as _srv
+        _srv.__dict__["_system_prompt"] = req.content
+        _context_builder.update_system_prompt(req.content)
     return {"ok": True}
 
 
@@ -2337,10 +2450,11 @@ def get_soul():
 
 @app.put("/admin/soul")
 def update_soul(req: UpdateContentRequest):
-    _write_prompt_file("soul.md", req.content)
-    import claw.gateway.server as _srv
-    _srv.__dict__["_soul"] = req.content
-    _context_builder.update_soul(req.content)
+    with _PROMPT_UPDATE_LOCK:
+        _write_prompt_file("soul.md", req.content)
+        import claw.gateway.server as _srv
+        _srv.__dict__["_soul"] = req.content
+        _context_builder.update_soul(req.content)
     return {"ok": True}
 
 
@@ -2358,18 +2472,33 @@ def delete_session(session_id: str):
         raise HTTPException(status_code=404, detail=f"Session 不存在: {session_id}")
     if _session_turn_active(session_id):
         raise HTTPException(status_code=409, detail="当前任务正在运行，请先停止任务。")
+    cleanup_warnings: list[str] = []
     with _rollback_manager.session_guard(session_id):
-        # Clean up rollback data and bindings before removing the authoritative
-        # session object; this avoids leaving unreachable checkpoint storage.
-        _rollback_manager.disable(session_id)
-        _workspace_manager.unset(session_id)
-        _workspace_manager.set_unlimited(session_id, False)
+        # Remove the authoritative record first.  If disk deletion fails, the
+        # workspace binding and rollback checkpoints must remain recoverable.
         _session_store.delete(session_id)
+        try:
+            _rollback_manager.disable(session_id)
+        except (RollbackError, OSError) as exc:
+            cleanup_warnings.append("回退数据清理失败，请查看 Gateway 日志。")
+            logger.exception("删除 session 后清理回退数据失败: %s", session_id)
+        try:
+            _workspace_manager.unset(session_id)
+        except (WorkspaceError, OSError) as exc:
+            cleanup_warnings.append("workspace 绑定清理失败，请查看 Gateway 日志。")
+            logger.exception("删除 session 后清理 workspace 失败: %s", session_id)
+        finally:
+            _workspace_manager.set_unlimited(session_id, False)
+    _auto_mode.pop(session_id, None)
     # Clean up attachments directory
     att_dir = _attachments_dir(session_id)
     if att_dir.exists():
-        shutil.rmtree(str(att_dir), ignore_errors=True)
-    return {"ok": True}
+        try:
+            shutil.rmtree(str(att_dir))
+        except OSError as exc:
+            cleanup_warnings.append("附件清理失败，请查看 Gateway 日志。")
+            logger.exception("删除 session 后清理附件失败: %s", session_id)
+    return {"ok": True, "warnings": cleanup_warnings}
 
 
 @app.get("/memories")
@@ -2469,7 +2598,7 @@ def update_memory(memory_id: str, req: UpdateMemoryRequest):
     """Update a memory entry's content."""
     try:
         entry = _memory_store.update(memory_id, req.content)
-    except Exception as exc:
+    except MemoryStoreError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     return {
         "ok": True,
@@ -2483,7 +2612,7 @@ def update_memory(memory_id: str, req: UpdateMemoryRequest):
 def delete_memory(memory_id: str):
     try:
         _memory_store.delete(memory_id)
-    except Exception as exc:
+    except MemoryStoreError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
     return {"ok": True}
 
@@ -2511,6 +2640,11 @@ def update_reflection_config(req: UpdateReflectionRequest):
     if req.enabled is not None:
         kwargs["enabled"] = req.enabled
     if req.time is not None:
+        if not is_valid_reflection_time(req.time.strip()):
+            raise HTTPException(
+                status_code=400,
+                detail="反思时间必须是 00:00 到 23:59 的 HH:MM 格式",
+            )
         kwargs["time"] = req.time
     config = _reflection_mgr.update_config(**kwargs)
     return {"ok": True, "config": config}
@@ -2525,9 +2659,13 @@ def trigger_reflection():
 
 def _write_prompt_file(filename: str, content: str) -> None:
     target = prompts_dir() / filename
-    tmp = target.with_suffix(".tmp")
-    tmp.write_text(content, encoding="utf-8")
-    tmp.replace(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_text(content, encoding="utf-8")
+        tmp.replace(target)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 # ==========================================================================
@@ -3059,12 +3197,13 @@ def _make_qr_data_uri(text: str) -> str:
 
 def _prune_qq_onboard_tasks(max_age_seconds: int = 600) -> None:
     now = datetime.now(timezone.utc).timestamp()
-    stale = [
-        task_id for task_id, task in _qq_onboard_tasks.items()
-        if now - float(task.get("created_at", 0)) > max_age_seconds
-    ]
-    for task_id in stale:
-        _qq_onboard_tasks.pop(task_id, None)
+    with _qq_onboard_tasks_lock:
+        stale = [
+            task_id for task_id, task in _qq_onboard_tasks.items()
+            if now - float(task.get("created_at", 0)) > max_age_seconds
+        ]
+        for task_id in stale:
+            _qq_onboard_tasks.pop(task_id, None)
 
 
 @app.post("/settings/channel/qq/onboard/start")
@@ -3078,10 +3217,11 @@ def start_qq_onboard():
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"创建 QQ 扫码任务失败: {exc}") from exc
 
-    _qq_onboard_tasks[task_id] = {
-        "aes_key": aes_key,
-        "created_at": datetime.now(timezone.utc).timestamp(),
-    }
+    with _qq_onboard_tasks_lock:
+        _qq_onboard_tasks[task_id] = {
+            "aes_key": aes_key,
+            "created_at": datetime.now(timezone.utc).timestamp(),
+        }
     return {
         "ok": True,
         "taskId": task_id,
@@ -3093,7 +3233,8 @@ def start_qq_onboard():
 @app.get("/settings/channel/qq/onboard/{task_id}")
 async def poll_qq_onboard(task_id: str):
     _prune_qq_onboard_tasks()
-    task = _qq_onboard_tasks.get(task_id)
+    with _qq_onboard_tasks_lock:
+        task = _qq_onboard_tasks.get(task_id)
     if not task:
         return {"ok": True, "status": "expired", "message": "二维码已过期，请重新发起扫码连接"}
 
@@ -3106,12 +3247,19 @@ async def poll_qq_onboard(task_id: str):
         return {"ok": True, "status": "pending", "message": f"等待扫码确认: {exc}"}
 
     if status == BindStatus.EXPIRED:
-        _qq_onboard_tasks.pop(task_id, None)
+        with _qq_onboard_tasks_lock:
+            _qq_onboard_tasks.pop(task_id, None)
         return {"ok": True, "status": "expired", "message": "二维码已过期，请重新发起扫码连接"}
     if status != BindStatus.COMPLETED:
         return {"ok": True, "status": "pending", "message": "等待手机 QQ 扫码确认"}
 
-    client_secret = decrypt_secret(encrypted_secret, str(task["aes_key"]))
+    # Only one concurrent poll may consume and apply a completed task.
+    with _qq_onboard_tasks_lock:
+        claimed_task = _qq_onboard_tasks.pop(task_id, None)
+    if claimed_task is None:
+        return {"ok": True, "status": "expired", "message": "二维码已完成或已过期"}
+
+    client_secret = decrypt_secret(encrypted_secret, str(claimed_task["aes_key"]))
     allow_from = user_openid or setting_value("QQ_ALLOW_FROM", "*")
     update_runtime_settings({
         "QQ_ENABLED": "true",
@@ -3120,7 +3268,6 @@ async def poll_qq_onboard(task_id: str):
         "QQ_ALLOW_FROM": allow_from,
         "QQ_MSG_FORMAT": setting_value("QQ_MSG_FORMAT", "markdown"),
     })
-    _qq_onboard_tasks.pop(task_id, None)
     await _apply_qq_runtime_config()
     return {
         "ok": True,

@@ -14,11 +14,26 @@ All tools return a ``ToolResult`` with contextual information:
 from __future__ import annotations
 
 import json
+import threading
+from functools import wraps
 from pathlib import Path
 from typing import Any, Callable
 
 from claw.tools.base import Tool, ToolResult
+from claw.utils import atomic_write
 from claw.workspace.manager import WorkspaceManager, WorkspaceError
+
+
+_UPDATE_LOCK = threading.RLock()
+
+
+def _synchronized(method):
+    @wraps(method)
+    def wrapper(*args, **kwargs):
+        with _UPDATE_LOCK:
+            return method(*args, **kwargs)
+
+    return wrapper
 
 
 def _make_update_handler(
@@ -60,16 +75,18 @@ def _make_update_handler(
 # ---------------------------------------------------------------------------
 
 
+@_synchronized
 def _do_create(resolved: Path, display_path: str) -> ToolResult:
     """Create an empty file at *resolved*. Fails if it already exists."""
-    if resolved.exists():
+    try:
+        resolved.parent.mkdir(parents=True, exist_ok=True)
+        with resolved.open("x", encoding="utf-8"):
+            pass
+    except FileExistsError:
         return ToolResult(
             ok=False,
             error=f"create_file 失败：文件已存在 \"{display_path}\"",
         )
-    try:
-        resolved.parent.mkdir(parents=True, exist_ok=True)
-        resolved.write_text("", encoding="utf-8")
     except OSError as exc:
         return ToolResult(
             ok=False,
@@ -85,11 +102,11 @@ def _do_create(resolved: Path, display_path: str) -> ToolResult:
     )
 
 
+@_synchronized
 def _do_overwrite(resolved: Path, display_path: str, content: str) -> ToolResult:
     """Overwrite *resolved* with *content*. Creates parent dirs as needed."""
     try:
-        resolved.parent.mkdir(parents=True, exist_ok=True)
-        resolved.write_text(content, encoding="utf-8")
+        atomic_write(resolved, content)
     except OSError as exc:
         return ToolResult(
             ok=False,
@@ -109,6 +126,7 @@ def _do_overwrite(resolved: Path, display_path: str, content: str) -> ToolResult
     )
 
 
+@_synchronized
 def _do_edit(
     resolved: Path, display_path: str, old_str: str, new_str: str
 ) -> ToolResult:
@@ -148,7 +166,7 @@ def _do_edit(
 
     new_content = original.replace(old_str, new_str, 1)
     try:
-        resolved.write_text(new_content, encoding="utf-8")
+        atomic_write(resolved, new_content)
     except OSError as exc:
         return ToolResult(
             ok=False,

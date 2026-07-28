@@ -30,7 +30,9 @@ SJTUClaw 不替换 Pi 的默认 system prompt。Pi 会根据实际启用的工�
 只追加身份、人格、长期记忆和运行环境。长期记忆、Web、Cron、下载等宿主工具
 通过 Extension 桥接进入同一份 Pi 工具清单与 schema，并继续使用 SJTUClaw
 ToolRegistry、审批流程和 workspace 边界。
-Pi 后端下的 `/compact` 会直接调用 Pi RPC 的原生压缩命令，不依赖辅助 LLM。
+Pi 后端下的 `/compact` 会优先调用 Pi RPC 的原生压缩命令；如果 Pi
+会话过短或原生压缩失败，但统一会话历史仍可压缩，则回退到 SJTUClaw
+会话压缩。回退路径需要已配置可用的辅助 LLM。
 
 启动前先构建相邻的 `pi` 仓库，或把 `pi` 安装到系统命令路径。SJTUClaw 按
 `PI_COMMAND`、`PI_CLI_PATH`、相邻 Pi 构建产物、系统 `pi` / `pi.cmd` 的顺序查找。
@@ -53,6 +55,7 @@ Pi 状态。
 | `AGENT_BACKEND` | `sjtuclaw`（默认）或 `pi` |
 | `PI_COMMAND` | 完整 Pi 启动命令 |
 | `PI_CLI_PATH` / `PI_NODE_PATH` | Pi `cli.js` 与 Node.js 路径 |
+| `PI_SHELL_PATH` | Windows 下可选的 Bash 路径；优先推荐 Git Bash/MSYS Bash |
 | `PI_REPO_DIR` | Pi 源码路径；默认是 SJTUClaw 相邻的 `pi` |
 | `PI_PROVIDER` / `PI_MODEL` | 可选 provider 与 model；留空使用 Pi 设置 |
 | `PI_THINKING` | `off` 到 `max` 的 Pi reasoning level |
@@ -61,6 +64,11 @@ Pi 状态。
 | `PI_AGENT_DIR` / `PI_SESSION_DIR` | Pi 配置与持久会话目录 |
 | `PI_TURN_TIMEOUT_S` | 单轮最长秒数，默认 1800 |
 | `PI_TRUST_TOOLS` | 跳过写入审批；默认 `false`，仅可信环境使用 |
+
+Windows 下 SJTUClaw 会优先探测可正常运行的 Git Bash/MSYS Bash，并避开旧版 WSL
+`bash.exe` 启动器；只能使用 WSL 时会启用 UTF-8 诊断输出，防止 WebUI 工具结果乱码。
+Pi 的 Bash 命令应优先使用当前工作目录和相对路径，不要直接传入带反斜杠的
+`C:\...` 路径。
 
 Pi 本身不提供宿主权限沙箱。SJTUClaw 默认加载一个薄 Extension，把 `bash`、
 `edit`、`write` 转交给现有审批通道；没有审批通道时安全拒绝。

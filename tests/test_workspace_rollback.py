@@ -79,6 +79,25 @@ def test_invalid_rollback_target_is_a_user_error(rollback_env):
         rollback.preview("s1", "not-a-checkpoint")
 
 
+def test_checkpoint_scan_ignores_dependency_and_cache_directories(rollback_env):
+    _, _, workspace, _, rollback = rollback_env
+    (workspace / "src").mkdir()
+    (workspace / "src" / "app.py").write_text("print('ok')", encoding="utf-8")
+    for directory in ("node_modules", ".venv", "__pycache__", ".pytest_cache"):
+        target = workspace / directory
+        target.mkdir()
+        (target / "large-generated.bin").write_bytes(b"x" * 1024)
+
+    manifest = rollback._scan_workspace(workspace, store_blobs=False)
+
+    assert "src/app.py" in manifest
+    assert not any(
+        path.split("/", 1)[0]
+        in {"node_modules", ".venv", "__pycache__", ".pytest_cache"}
+        for path in manifest
+    )
+
+
 def test_restore_files_and_conversation_together(rollback_env):
     sessions, session, workspace, manager, rollback = rollback_env
     original = workspace / "original.txt"

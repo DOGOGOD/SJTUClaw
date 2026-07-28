@@ -163,6 +163,72 @@ class TestCompactionV2:
         assert loaded.last_consolidated == session.last_consolidated
         assert len(loaded.messages) == 10
 
+    def test_manual_compact_forces_short_history_before_auto_threshold(self, tmp_path):
+        from claw.cli.commands import RuntimeState, handle_command
+        from claw.context.compaction import needs_compaction
+        from claw.memory.store import MemoryStore
+        from claw.session.store import SessionStore
+
+        class SummaryLLM:
+            def chat(self, _messages):
+                return "MANUAL_SUMMARY"
+
+        store = SessionStore(tmp_path / "sessions")
+        session = store.create_session(session_id="manual-compact")
+        for index in range(6):
+            role = "user" if index % 2 == 0 else "assistant"
+            session.append_message(role, f"short-{index}")
+        store.save(session)
+
+        assert not needs_compaction(session)
+
+        state = RuntimeState(
+            session_store=store,
+            memory_store=MemoryStore(tmp_path / "memory"),
+            llm_client=SummaryLLM(),
+            current_session_id=session.session_id,
+        )
+        result = handle_command("/compact", state)
+
+        assert "Compacted session manual-compact." in result
+        assert "Old messages: 2" in result
+        loaded = store.get(session.session_id)
+        assert loaded.summary == "MANUAL_SUMMARY"
+        assert loaded.last_consolidated == 2
+        assert len(loaded.messages) == 6
+
+    def test_manual_compact_does_not_race_background_worker(self, tmp_path):
+        from claw.cli.commands import RuntimeState, handle_command
+        from claw.memory.store import MemoryStore
+        from claw.session.store import SessionStore
+
+        class BusyWorker:
+            def is_running(self):
+                return True
+
+        store = SessionStore(tmp_path / "sessions")
+        session = store.create_session(session_id="busy-compact")
+        for index in range(6):
+            session.append_message(
+                "user" if index % 2 == 0 else "assistant",
+                f"short-{index}",
+            )
+        store.save(session)
+
+        state = RuntimeState(
+            session_store=store,
+            memory_store=MemoryStore(tmp_path / "memory"),
+            llm_client=object(),
+            current_session_id=session.session_id,
+            compaction_worker=BusyWorker(),
+        )
+        result = handle_command("/compact", state)
+
+        assert "后台压缩正在进行" in result
+        loaded = store.get(session.session_id)
+        assert loaded.summary == ""
+        assert loaded.last_consolidated == 0
+
     def test_missing_legacy_summary_reexposes_raw_transcript(self, tmp_path):
         from claw.session.store import SessionStore
 
@@ -218,6 +284,74 @@ class TestCompactionV2:
         s.append_message("assistant", "x" * 5000)
         s.append_message("user", "x" * 5000)
         assert not needs_compaction(s)
+
+    def test_worker_submits_only_after_token_threshold(self, ss, monkeypatch):
+        from claw.config import CompactionConfig
+        from claw.context.compaction_worker import CompactionWorker
+
+        class NoopLLM:
+            pass
+
+        worker = CompactionWorker(
+            NoopLLM(),
+            ss,
+            config=CompactionConfig(max_message_tokens=5),
+        )
+        submitted = []
+        monkeypatch.setattr(
+            worker,
+            "submit",
+            lambda session: submitted.append(session.session_id) or True,
+        )
+
+        short = ss.create_session(session_id="below-token-threshold")
+        for index in range(6):
+            short.append_message(
+                "user" if index % 2 == 0 else "assistant",
+                "",
+            )
+        assert not worker.submit_if_needed(short)
+
+        long = ss.create_session(session_id="above-token-threshold")
+        for index in range(6):
+            long.append_message(
+                "user" if index % 2 == 0 else "assistant",
+                "token rich message",
+            )
+        assert worker.submit_if_needed(long)
+        assert submitted == ["above-token-threshold"]
+
+    def test_idle_worker_still_compacts_inactive_session(self, ss):
+        from datetime import datetime, timedelta, timezone
+
+        from claw.context.compaction_worker import CompactionWorker
+
+        class SummaryLLM:
+            def chat(self, _messages):
+                return "IDLE_SUMMARY"
+
+        session = ss.create_session(session_id="idle-compact")
+        for index in range(12):
+            session.append_message(
+                "user" if index % 2 == 0 else "assistant",
+                f"idle-message-{index}",
+            )
+        session.updated_at = (
+            datetime.now(timezone.utc) - timedelta(minutes=10)
+        ).isoformat()
+        ss.save(session)
+
+        worker = CompactionWorker(
+            SummaryLLM(),
+            ss,
+            idle_ttl_minutes=1,
+        )
+        worker._idle_tick()
+
+        loaded = ss.get(session.session_id)
+        assert loaded.summary == "IDLE_SUMMARY"
+        assert loaded.last_consolidated == 4
+        assert len(loaded.messages) == 12
 
     def test_split_by_tokens(self):
         from claw.context.compaction import _find_split_index

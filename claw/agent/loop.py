@@ -112,9 +112,6 @@ import json
 import logging
 
 
-import os
-
-
 import threading
 
 
@@ -136,6 +133,8 @@ from typing import Any, Callable
 
 
 from claw.context.builder import ContextBuilder
+
+from claw.env_utils import env_int
 
 
 from claw.agent.events import (
@@ -183,23 +182,9 @@ _APPROVAL_REQUIRED_LEVELS = {"write", "shell"}
 _SKILL_SELECT_LEVEL = "skill_select"
 
 
-def _positive_env_int(name: str, default: int) -> int:
-    """Read a positive integer without making module import fragile."""
-    raw = os.getenv(name, str(default))
-    try:
-        value = int(raw)
-    except (TypeError, ValueError):
-        logger.warning("环境变量 %s=%r 不是整数，使用默认值 %d", name, raw, default)
-        return default
-    if value < 1:
-        logger.warning("环境变量 %s=%r 必须大于 0，使用默认值 %d", name, raw, default)
-        return default
-    return value
-
-
-_MAX_AGENT_ITERATIONS = _positive_env_int("CLAW_MAX_AGENT_ITERATIONS", 15)
-_MAX_TOOL_CALLS_PER_TURN = _positive_env_int("CLAW_MAX_TOOL_CALLS_PER_TURN", 20)
-_MAX_IDENTICAL_TOOL_CALLS = _positive_env_int("CLAW_MAX_IDENTICAL_TOOL_CALLS", 3)
+_MAX_AGENT_ITERATIONS = env_int("CLAW_MAX_AGENT_ITERATIONS", 15, minimum=1)
+_MAX_TOOL_CALLS_PER_TURN = env_int("CLAW_MAX_TOOL_CALLS_PER_TURN", 20, minimum=1)
+_MAX_IDENTICAL_TOOL_CALLS = env_int("CLAW_MAX_IDENTICAL_TOOL_CALLS", 3, minimum=1)
 
 
 _MAX_REJECTIONS_PER_OPERATION = 3  # stop LLM from retrying the same rejected operation
@@ -450,19 +435,22 @@ def _run_agent_turn_unlocked(
             background compaction after the turn completes.
 
 
-        auto_mode: if True, skip approval for write/shell tools while the
+        auto_mode: if True, skip approval for structured write tools while the
 
 
-            workspace sandbox remains active.  Tool handlers still reject
+            workspace sandbox remains active. Shell tools still require an
 
 
-            operations that escape the workspace.
+            explicit decision because arbitrary commands cannot be reliably
 
 
-        unlimited_mode: if True, the session is in unlimited mode. Shell
+            sandboxed with lexical path checks.
 
 
-            tools always require explicit approval in this mode.
+        unlimited_mode: if True, the session is in unlimited mode. All write
+
+
+            and shell tools require explicit approval in this mode.
 
 
         event_callback: optional callback for turn events.
@@ -571,15 +559,19 @@ def _run_agent_turn_unlocked(
 
 
     def _maybe_async_compact(_sess) -> None:
+        """Submit token-threshold compaction without blocking the reply."""
+        if compaction_worker is None:
+            return
 
-
-        """Background compaction is handled by the idle compaction worker.
-
-
-        (only compact idle sessions, not every turn.)"""
-
-
-        pass
+        submit_if_needed = getattr(compaction_worker, "submit_if_needed", None)
+        try:
+            if callable(submit_if_needed) and submit_if_needed(_sess):
+                metrics.record_compaction()
+        except Exception:
+            logger.exception(
+                "提交 token 阈值压缩失败，已保留当前 session: %s",
+                session_id,
+            )
 
 
 
@@ -1310,16 +1302,22 @@ def _run_agent_turn_unlocked(
                     # caused intermittent approval prompts in AUTO mode.
 
 
-                    # In unlimited mode, every write/shell tool ALWAYS
+                    # Shell languages can expand variables, invoke nested
 
 
-                    #    requires approval because relative paths and shell
+                    # interpreters and access devices in ways that lexical
 
 
-                    #    commands can also resolve outside the workspace.
+                    # path checks cannot sandbox reliably. Shell tools always
 
 
-                    force_approval = unlimited_mode
+                    # require an explicit decision, even in AUTO mode.
+
+
+                    shell_tool = _is_shell_tool(tc.name)
+
+
+                    force_approval = unlimited_mode or shell_tool
 
 
 
@@ -1328,7 +1326,25 @@ def _run_agent_turn_unlocked(
                     if force_approval:
 
 
-                        if unlimited_mode:
+                        if shell_tool:
+
+
+                            logger.warning(
+
+
+                                "shell tool %s requires explicit approval; "
+
+
+                                "AUTO mode cannot safely sandbox a shell",
+
+
+                                tc.name,
+
+
+                            )
+
+
+                        elif unlimited_mode:
 
 
                             logger.warning(
@@ -1352,7 +1368,7 @@ def _run_agent_turn_unlocked(
                     if auto_mode and not force_approval:
 
 
-                        # AUTO mode: skip approval, tool operates freely
+                        # AUTO mode: skip approval for structured writes
 
 
                         # within workspace.  Workspace boundary is still

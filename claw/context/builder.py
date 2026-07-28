@@ -37,6 +37,7 @@ _RUNTIME_CONTEXT_END = "[/运行时上下文]"
 
 # Bootstrap files loaded from workspace root (if present)
 _BOOTSTRAP_FILES = ["AGENTS.md", "SOUL.md", "USER.md"]
+_MAX_CONTEXT_IMAGE_BYTES = 10 * 1024 * 1024
 
 # Memory context fencing
 # Wraps memory content in fenced tags with a system note so the model
@@ -59,7 +60,11 @@ def _multimodal_user_content(text: str, media: list[str]) -> str | list[dict[str
         try:
             path = Path(item)
             mime_type = mimetypes.guess_type(path.name)[0] or ""
-            if not path.is_file() or not mime_type.startswith("image/"):
+            if (
+                not path.is_file()
+                or not mime_type.startswith("image/")
+                or path.stat().st_size > _MAX_CONTEXT_IMAGE_BYTES
+            ):
                 continue
             encoded = base64.b64encode(path.read_bytes()).decode("ascii")
             blocks.append({
@@ -305,6 +310,14 @@ class ContextBuilder:
         )
 
         unconsolidated = session.get_unconsolidated_messages()
+        latest_user_index = next(
+            (
+                index
+                for index in range(len(unconsolidated) - 1, -1, -1)
+                if unconsolidated[index].role == "user"
+            ),
+            -1,
+        )
         for i, msg in enumerate(unconsolidated):
             msg_dict = msg.to_dict()
             msg_dict.pop("media", None)
@@ -323,7 +336,7 @@ class ContextBuilder:
                 and runtime_ctx
             ):
                 message_content = f"{message_content}\n\n{runtime_ctx}"
-            if msg.role == "user" and msg.media:
+            if msg.role == "user" and msg.media and i == latest_user_index:
                 msg_dict["content"] = _multimodal_user_content(message_content, msg.media)
             else:
                 msg_dict["content"] = message_content
@@ -448,6 +461,14 @@ class ContextBuilder:
             "和工具专属 guidelines 是工具调用的权威说明。SJTUClaw 通过宿主工具桥接"
             "补充长期记忆、Web、Cron 等能力；工具结果均来自实际执行，不得伪造。"
             "会改变状态的操作仍受 SJTUClaw 审批与 workspace 边界约束。"
+            + (
+                "\n\n当前宿主是 Windows。Pi 的 bash 已经在当前工作区启动；执行工作区内"
+                "命令时优先使用 `.` 和相对路径，不要把带反斜杠的 Windows 绝对路径"
+                "原样传给 bash。确需绝对路径时，先执行 `pwd` 获取当前 shell 使用的"
+                "路径格式，再使用该格式并加引号。"
+                if platform.system() == "Windows"
+                else ""
+            )
         )
         return "\n\n---\n\n".join(section for section in sections if section.strip())
 

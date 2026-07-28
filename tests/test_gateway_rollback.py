@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 import claw.gateway.server as gateway
 import claw.workspace.manager as workspace_module
 from claw.session.store import SessionStore
+from claw.session.store import SessionStoreError
 from claw.workspace.manager import WorkspaceManager
 from claw.workspace.rollback import WorkspaceRollbackManager
 
@@ -122,6 +123,30 @@ def test_gateway_rollback_requires_workspace(rollback_client):
     response = client.post("/sessions/api-session/rollback/preview", json={})
     assert response.status_code == 409
     assert "workspace" in response.json()["detail"]
+
+
+def test_gateway_delete_failure_preserves_workspace_and_rollback(
+    rollback_client, tmp_path, monkeypatch
+):
+    client, sessions, workspaces, rollback = rollback_client
+    workspace = tmp_path / "preserved-project"
+    workspace.mkdir()
+    assert client.post(
+        "/workspace",
+        json={"sessionId": "api-session", "path": str(workspace)},
+    ).status_code == 200
+    assert rollback.status("api-session")["enabled"] is True
+
+    def fail_delete(_session_id: str):
+        raise SessionStoreError("disk is locked")
+
+    monkeypatch.setattr(sessions, "delete", fail_delete)
+    response = client.delete("/sessions/api-session")
+
+    assert response.status_code == 500
+    assert sessions.exists("api-session")
+    assert workspaces.get("api-session") == workspace.resolve()
+    assert rollback.status("api-session")["enabled"] is True
 
 
 def test_gateway_rejects_invalid_checkpoint_target(rollback_client, tmp_path):

@@ -7,10 +7,15 @@ import os
 import shutil
 import tarfile
 import tempfile
+import threading
+import uuid
 import zipfile
 from dataclasses import dataclass, field
+from functools import wraps
 from pathlib import Path, PurePosixPath
 from typing import Iterable
+
+from filelock import FileLock, Timeout as FileLockTimeout
 
 from claw.config import PROJECT_ROOT
 from claw.skills.registry import SKILLS_DIR, SkillRegistryError, parse_frontmatter
@@ -40,10 +45,27 @@ ALLOWED_SUFFIXES = {
 }
 ALLOWED_TOP_LEVEL_FILES = {"SKILL.md", "README.md", "LICENSE", "LICENSE.md"}
 ALLOWED_DIRS = {"assets", "references", "templates"}
+_MANAGEMENT_LOCK = threading.RLock()
 
 
 class SkillPackageError(RuntimeError):
     """Raised when a skill package cannot be safely installed."""
+
+
+def _management_synchronized(method):
+    """Serialize skill directory swaps within and across processes."""
+
+    @wraps(method)
+    def wrapper(*args, **kwargs):
+        with _MANAGEMENT_LOCK:
+            SKILLS_DIR.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                with FileLock(str(SKILLS_DIR) + ".lock", timeout=10):
+                    return method(*args, **kwargs)
+            except FileLockTimeout as exc:
+                raise SkillPackageError("等待 Skill 管理锁超时，请稍后重试") from exc
+
+    return wrapper
 
 
 @dataclass
@@ -76,6 +98,7 @@ def validate_skill_package_bytes(data: bytes, filename: str) -> ValidatedPackage
     raise SkillPackageError("仅支持 .zip、.tar、.tar.gz、.tgz 压缩包")
 
 
+@_management_synchronized
 def install_skill_package_bytes(
     data: bytes,
     filename: str,
@@ -90,21 +113,74 @@ def install_skill_package_bytes(
     if existing_dir is not None:
         if not replace:
             raise SkillPackageError(f"Skill '{validated.skill_name}' 已存在")
+    elif target_dir.exists():
+        raise SkillPackageError(
+            f"Skill 目标目录已存在但内容无效，请先检查或移除: {target_dir.name}"
+        )
 
-    with tempfile.TemporaryDirectory(prefix="skill-upload-") as tmp:
-        tmp_dir = Path(tmp)
-        if zipfile.is_zipfile(io.BytesIO(data)):
-            _extract_zip(data, tmp_dir)
-        else:
-            _extract_tar(data, tmp_dir)
-        source_root = _locate_extracted_root(tmp_dir, validated.root_prefix)
-        _validate_extracted_tree(source_root, validated.skill_name)
-        staged_root = tmp_dir / f".staged-{validated.skill_name}"
-        shutil.move(str(source_root), str(staged_root))
-        SKILLS_DIR.mkdir(parents=True, exist_ok=True)
-        if existing_dir is not None:
-            _safe_rmtree(existing_dir, SKILLS_DIR)
-        shutil.move(str(staged_root), str(target_dir))
+    try:
+        with tempfile.TemporaryDirectory(prefix="skill-upload-") as tmp:
+            tmp_dir = Path(tmp)
+            if zipfile.is_zipfile(io.BytesIO(data)):
+                _extract_zip(data, tmp_dir)
+            else:
+                _extract_tar(data, tmp_dir)
+            source_root = _locate_extracted_root(tmp_dir, validated.root_prefix)
+            _validate_extracted_tree(source_root, validated.skill_name)
+
+            # Finish the potentially cross-filesystem copy before touching
+            # the installed version.  The final directory swaps then happen
+            # atomically on the skills filesystem.
+            SKILLS_DIR.mkdir(parents=True, exist_ok=True)
+            staged_root = SKILLS_DIR / (
+                f".install-{validated.skill_name}-{uuid.uuid4().hex}"
+            )
+            backup_root = (
+                existing_dir.with_name(
+                    f".{existing_dir.name}.backup-{uuid.uuid4().hex}"
+                )
+                if existing_dir is not None
+                else None
+            )
+            try:
+                shutil.copytree(source_root, staged_root)
+                _validate_extracted_tree(staged_root, validated.skill_name)
+                if existing_dir is not None and backup_root is not None:
+                    os.replace(existing_dir, backup_root)
+                try:
+                    os.replace(staged_root, target_dir)
+                except BaseException:
+                    if (
+                        existing_dir is not None
+                        and backup_root is not None
+                        and backup_root.exists()
+                    ):
+                        os.replace(backup_root, existing_dir)
+                    raise
+                if backup_root is not None and backup_root.exists():
+                    try:
+                        _safe_rmtree(backup_root, SKILLS_DIR)
+                    except OSError:
+                        # Installation is already committed.  A hidden backup
+                        # is preferable to reporting a false failure or
+                        # deleting the new version.
+                        pass
+                if (
+                    existing_dir is not None
+                    and existing_dir.parent != SKILLS_DIR
+                    and existing_dir.parent.exists()
+                ):
+                    try:
+                        existing_dir.parent.rmdir()
+                    except OSError:
+                        pass
+            finally:
+                if staged_root.exists():
+                    _safe_rmtree(staged_root, SKILLS_DIR)
+    except SkillPackageError:
+        raise
+    except OSError as exc:
+        raise SkillPackageError(f"Skill 安装失败，旧版本已保留: {exc}") from exc
 
     return {
         "name": validated.skill_name,
@@ -114,12 +190,23 @@ def install_skill_package_bytes(
     }
 
 
+@_management_synchronized
 def remove_skill_completely(name: str) -> dict:
     """Completely delete one skill directory and its usage data."""
     skill_dir = find_skill_dir(name)
     if skill_dir is None:
         raise SkillPackageError(f"Skill '{name}' 不存在")
-    _safe_rmtree(skill_dir, SKILLS_DIR)
+    tombstone = SKILLS_DIR / f".delete-{name}-{uuid.uuid4().hex}"
+    try:
+        os.replace(skill_dir, tombstone)
+    except OSError as exc:
+        raise SkillPackageError(f"Skill '{name}' 删除失败，原目录已保留: {exc}") from exc
+    try:
+        _safe_rmtree(tombstone, SKILLS_DIR)
+    except OSError:
+        # The skill has already been removed atomically from the registry.
+        # A hidden tombstone is safe to clean on a later maintenance pass.
+        pass
 
     parent = skill_dir.parent
     if parent != SKILLS_DIR and parent.exists() and parent.parent == SKILLS_DIR:

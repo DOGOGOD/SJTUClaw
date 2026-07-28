@@ -4,15 +4,17 @@
 It does NOT return file content to the model — only a downloadId that
 the frontend can use to retrieve the file.
 
-Gateway stores these entries in memory; they are short-lived (the file
-must already exist at creation time, but the entry persists until the
-server restarts or is explicitly cleaned up).
+Gateway stores these entries in a bounded in-memory registry. Entries expire
+after one hour and are also cleared when the server restarts.
 """
 
 from __future__ import annotations
 
 import json
+import threading
+import time
 import uuid
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Callable
 
@@ -24,25 +26,51 @@ from claw.workspace.manager import WorkspaceManager, WorkspaceError
 # Download registry (in-memory, shared with Gateway)
 # ---------------------------------------------------------------------------
 
-_downloads: dict[str, Path] = {}
-"""downloadId -> absolute Path to the workspace file."""
+_DOWNLOAD_TTL_S = 60 * 60
+_MAX_DOWNLOADS = 1_000
+_downloads: OrderedDict[str, tuple[Path, float]] = OrderedDict()
+"""downloadId -> (absolute Path, creation time)."""
+_downloads_lock = threading.Lock()
+
+
+def _prune_downloads_locked(now: float) -> None:
+    expired = [
+        download_id
+        for download_id, (_path, created_at) in _downloads.items()
+        if now - created_at >= _DOWNLOAD_TTL_S
+    ]
+    for download_id in expired:
+        _downloads.pop(download_id, None)
+    while len(_downloads) > _MAX_DOWNLOADS:
+        _downloads.popitem(last=False)
 
 
 def register_download(file_path: Path) -> str:
     """Create a download entry and return its id."""
     download_id = f"dl_{uuid.uuid4().hex[:12]}"
-    _downloads[download_id] = file_path
+    now = time.monotonic()
+    with _downloads_lock:
+        _prune_downloads_locked(now)
+        _downloads[download_id] = (file_path, now)
+        _prune_downloads_locked(now)
     return download_id
 
 
 def get_download(download_id: str) -> Path | None:
     """Return the file path for *download_id* or None."""
-    return _downloads.get(download_id)
+    now = time.monotonic()
+    with _downloads_lock:
+        _prune_downloads_locked(now)
+        entry = _downloads.get(download_id)
+        return entry[0] if entry is not None else None
 
 
 def list_downloads() -> dict[str, str]:
     """Return {downloadId: file_name} for all active downloads."""
-    return {did: p.name for did, p in _downloads.items()}
+    now = time.monotonic()
+    with _downloads_lock:
+        _prune_downloads_locked(now)
+        return {did: entry[0].name for did, entry in _downloads.items()}
 
 
 # ---------------------------------------------------------------------------

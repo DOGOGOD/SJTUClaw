@@ -1,0 +1,1001 @@
+{
+  "ok": true,
+  "frames_root": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\pet-runs\\sunny\\frames",
+  "states": [
+    "idle",
+    "running-right",
+    "running-left",
+    "waving",
+    "jumping",
+    "failed",
+    "waiting",
+    "running",
+    "review"
+  ],
+  "errors": [],
+  "warnings": [
+    "idle used extraction method stable-slots; confirm motion playback remains stable and unclipped",
+    "running-right used extraction method stable-slots; confirm motion playback remains stable and unclipped",
+    "running-left used extraction method stable-slots; confirm motion playback remains stable and unclipped",
+    "waving used extraction method stable-slots; confirm motion playback remains stable and unclipped",
+    "jumping used extraction method stable-slots; confirm motion playback remains stable and unclipped",
+    "failed used extraction method stable-slots; confirm motion playback remains stable and unclipped",
+    "waiting used extraction method stable-slots; confirm motion playback remains stable and unclipped",
+    "running used extraction method stable-slots; confirm motion playback remains stable and unclipped",
+    "review used extraction method stable-slots; confirm motion playback remains stable and unclipped"
+  ],
+  "rows": [
+    {
+      "state": "idle",
+      "expected_frames": 6,
+      "actual_frames": 6,
+      "extraction_method": "stable-slots",
+      "ok": true,
+      "errors": [],
+      "warnings": [
+        "idle used extraction method stable-slots; confirm motion playback remains stable and unclipped"
+      ],
+      "frames": [
+        {
+          "index": 0,
+          "file": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\pet-runs\\sunny\\frames\\idle\\00.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 20426,
+          "bbox": [
+            29,
+            9,
+            162,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 201
+        },
+        {
+          "index": 1,
+          "file": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\pet-runs\\sunny\\frames\\idle\\01.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 20751,
+          "bbox": [
+            28,
+            5,
+            162,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 209
+        },
+        {
+          "index": 2,
+          "file": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\pet-runs\\sunny\\frames\\idle\\02.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 21187,
+          "bbox": [
+            28,
+            5,
+            163,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 219
+        },
+        {
+          "index": 3,
+          "file": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\pet-runs\\sunny\\frames\\idle\\03.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 20141,
+          "bbox": [
+            30,
+            9,
+            161,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 191
+        },
+        {
+          "index": 4,
+          "file": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\pet-runs\\sunny\\frames\\idle\\04.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 20160,
+          "bbox": [
+            30,
+            10,
+            161,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 198
+        },
+        {
+          "index": 5,
+          "file": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\pet-runs\\sunny\\frames\\idle\\05.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 20027,
+          "bbox": [
+            30,
+            10,
+            160,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 207
+        }
+      ]
+    },
+    {
+      "state": "running-right",
+      "expected_frames": 8,
+      "actual_frames": 8,
+      "extraction_method": "stable-slots",
+      "ok": true,
+      "errors": [],
+      "warnings": [
+        "running-right used extraction method stable-slots; confirm motion playback remains stable and unclipped"
+      ],
+      "frames": [
+        {
+          "index": 0,
+          "file": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\pet-runs\\sunny\\frames\\running-right\\00.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 19211,
+          "bbox": [
+            28,
+            7,
+            164,
+            195
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 296
+        },
+        {
+          "index": 1,
+          "file": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\pet-runs\\sunny\\frames\\running-right\\01.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 17600,
+          "bbox": [
+            24,
+            7,
+            168,
+            195
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 253
+        },
+        {
+          "index": 2,
+          "file": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\pet-runs\\sunny\\frames\\running-right\\02.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 17599,
+          "bbox": [
+            28,
+            5,
+            163,
+            192
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 273
+        },
+        {
+          "index": 3,
+          "file": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\pet-runs\\sunny\\frames\\running-right\\03.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 17158,
+          "bbox": [
+            27,
+            8,
+            164,
+            202
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 236
+        },
+        {
+          "index": 4,
+          "file": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\pet-runs\\sunny\\frames\\running-right\\04.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 17177,
+          "bbox": [
+            25,
+            5,
+            167,
+            196
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 251
+        },
+        {
+          "index": 5,
+          "file": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\pet-runs\\sunny\\frames\\running-right\\05.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 18285,
+          "bbox": [
+            23,
+            6,
+            169,
+            193
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 252
+        },
+        {
+          "index": 6,
+          "file": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\pet-runs\\sunny\\frames\\running-right\\06.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 17685,
+          "bbox": [
+            22,
+            7,
+            170,
+            192
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 260
+        },
+        {
+          "index": 7,
+          "file": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\pet-runs\\sunny\\frames\\running-right\\07.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 17304,
+          "bbox": [
+            30,
+            7,
+            162,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 241
+        }
+      ]
+    },
+    {
+      "state": "running-left",
+      "expected_frames": 8,
+      "actual_frames": 8,
+      "extraction_method": "stable-slots",
+      "ok": true,
+      "errors": [],
+      "warnings": [
+        "running-left used extraction method stable-slots; confirm motion playback remains stable and unclipped"
+      ],
+      "frames": [
+        {
+          "index": 0,
+          "file": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\pet-runs\\sunny\\frames\\running-left\\00.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 19211,
+          "bbox": [
+            28,
+            7,
+            164,
+            195
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 296
+        },
+        {
+          "index": 1,
+          "file": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\pet-runs\\sunny\\frames\\running-left\\01.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 17600,
+          "bbox": [
+            24,
+            7,
+            168,
+            195
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 253
+        },
+        {
+          "index": 2,
+          "file": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\pet-runs\\sunny\\frames\\running-left\\02.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 17616,
+          "bbox": [
+            28,
+            5,
+            163,
+            192
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 260
+        },
+        {
+          "index": 3,
+          "file": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\pet-runs\\sunny\\frames\\running-left\\03.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 17134,
+          "bbox": [
+            27,
+            8,
+            164,
+            202
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 224
+        },
+        {
+          "index": 4,
+          "file": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\pet-runs\\sunny\\frames\\running-left\\04.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 17177,
+          "bbox": [
+            25,
+            5,
+            167,
+            196
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 251
+        },
+        {
+          "index": 5,
+          "file": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\pet-runs\\sunny\\frames\\running-left\\05.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 18285,
+          "bbox": [
+            23,
+            6,
+            169,
+            193
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 252
+        },
+        {
+          "index": 6,
+          "file": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\pet-runs\\sunny\\frames\\running-left\\06.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 17685,
+          "bbox": [
+            22,
+            7,
+            170,
+            192
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 260
+        },
+        {
+          "index": 7,
+          "file": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\pet-runs\\sunny\\frames\\running-left\\07.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 17298,
+          "bbox": [
+            30,
+            7,
+            162,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 240
+        }
+      ]
+    },
+    {
+      "state": "waving",
+      "expected_frames": 4,
+      "actual_frames": 4,
+      "extraction_method": "stable-slots",
+      "ok": true,
+      "errors": [],
+      "warnings": [
+        "waving used extraction method stable-slots; confirm motion playback remains stable and unclipped"
+      ],
+      "frames": [
+        {
+          "index": 0,
+          "file": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\pet-runs\\sunny\\frames\\waving\\00.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 21397,
+          "bbox": [
+            25,
+            5,
+            167,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 138
+        },
+        {
+          "index": 1,
+          "file": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\pet-runs\\sunny\\frames\\waving\\01.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 21946,
+          "bbox": [
+            19,
+            5,
+            173,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 166
+        },
+        {
+          "index": 2,
+          "file": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\pet-runs\\sunny\\frames\\waving\\02.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 21802,
+          "bbox": [
+            19,
+            6,
+            173,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 147
+        },
+        {
+          "index": 3,
+          "file": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\pet-runs\\sunny\\frames\\waving\\03.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 21200,
+          "bbox": [
+            25,
+            5,
+            167,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 140
+        }
+      ]
+    },
+    {
+      "state": "jumping",
+      "expected_frames": 5,
+      "actual_frames": 5,
+      "extraction_method": "stable-slots",
+      "ok": true,
+      "errors": [],
+      "warnings": [
+        "jumping used extraction method stable-slots; confirm motion playback remains stable and unclipped"
+      ],
+      "frames": [
+        {
+          "index": 0,
+          "file": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\pet-runs\\sunny\\frames\\jumping\\00.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 11311,
+          "bbox": [
+            41,
+            70,
+            151,
+            200
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 136
+        },
+        {
+          "index": 1,
+          "file": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\pet-runs\\sunny\\frames\\jumping\\01.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 12521,
+          "bbox": [
+            36,
+            31,
+            156,
+            189
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 130
+        },
+        {
+          "index": 2,
+          "file": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\pet-runs\\sunny\\frames\\jumping\\02.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 12012,
+          "bbox": [
+            35,
+            5,
+            157,
+            144
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 133
+        },
+        {
+          "index": 3,
+          "file": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\pet-runs\\sunny\\frames\\jumping\\03.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 12051,
+          "bbox": [
+            42,
+            40,
+            149,
+            193
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 125
+        },
+        {
+          "index": 4,
+          "file": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\pet-runs\\sunny\\frames\\jumping\\04.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 10655,
+          "bbox": [
+            41,
+            81,
+            151,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 119
+        }
+      ]
+    },
+    {
+      "state": "failed",
+      "expected_frames": 8,
+      "actual_frames": 8,
+      "extraction_method": "stable-slots",
+      "ok": true,
+      "errors": [],
+      "warnings": [
+        "failed used extraction method stable-slots; confirm motion playback remains stable and unclipped"
+      ],
+      "frames": [
+        {
+          "index": 0,
+          "file": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\pet-runs\\sunny\\frames\\failed\\00.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 20682,
+          "bbox": [
+            25,
+            5,
+            167,
+            200
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 228
+        },
+        {
+          "index": 1,
+          "file": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\pet-runs\\sunny\\frames\\failed\\01.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 16458,
+          "bbox": [
+            25,
+            37,
+            167,
+            200
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 192
+        },
+        {
+          "index": 2,
+          "file": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\pet-runs\\sunny\\frames\\failed\\02.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 13706,
+          "bbox": [
+            30,
+            61,
+            162,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 166
+        },
+        {
+          "index": 3,
+          "file": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\pet-runs\\sunny\\frames\\failed\\03.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 13759,
+          "bbox": [
+            31,
+            61,
+            161,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 161
+        },
+        {
+          "index": 4,
+          "file": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\pet-runs\\sunny\\frames\\failed\\04.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 15089,
+          "bbox": [
+            35,
+            52,
+            157,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 190
+        },
+        {
+          "index": 5,
+          "file": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\pet-runs\\sunny\\frames\\failed\\05.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 16557,
+          "bbox": [
+            30,
+            33,
+            162,
+            200
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 207
+        },
+        {
+          "index": 6,
+          "file": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\pet-runs\\sunny\\frames\\failed\\06.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 17694,
+          "bbox": [
+            34,
+            17,
+            158,
+            200
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 218
+        },
+        {
+          "index": 7,
+          "file": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\pet-runs\\sunny\\frames\\failed\\07.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 18517,
+          "bbox": [
+            33,
+            14,
+            159,
+            199
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 206
+        }
+      ]
+    },
+    {
+      "state": "waiting",
+      "expected_frames": 6,
+      "actual_frames": 6,
+      "extraction_method": "stable-slots",
+      "ok": true,
+      "errors": [],
+      "warnings": [
+        "waiting used extraction method stable-slots; confirm motion playback remains stable and unclipped"
+      ],
+      "frames": [
+        {
+          "index": 0,
+          "file": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\pet-runs\\sunny\\frames\\waiting\\00.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 18877,
+          "bbox": [
+            34,
+            10,
+            156,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 190
+        },
+        {
+          "index": 1,
+          "file": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\pet-runs\\sunny\\frames\\waiting\\01.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 20095,
+          "bbox": [
+            15,
+            12,
+            176,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 213
+        },
+        {
+          "index": 2,
+          "file": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\pet-runs\\sunny\\frames\\waiting\\02.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 18203,
+          "bbox": [
+            30,
+            5,
+            161,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 208
+        },
+        {
+          "index": 3,
+          "file": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\pet-runs\\sunny\\frames\\waiting\\03.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 20351,
+          "bbox": [
+            10,
+            12,
+            181,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 231
+        },
+        {
+          "index": 4,
+          "file": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\pet-runs\\sunny\\frames\\waiting\\04.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 18299,
+          "bbox": [
+            35,
+            12,
+            156,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 172
+        },
+        {
+          "index": 5,
+          "file": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\pet-runs\\sunny\\frames\\waiting\\05.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 17296,
+          "bbox": [
+            36,
+            12,
+            154,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 170
+        }
+      ]
+    },
+    {
+      "state": "running",
+      "expected_frames": 6,
+      "actual_frames": 6,
+      "extraction_method": "stable-slots",
+      "ok": true,
+      "errors": [],
+      "warnings": [
+        "running used extraction method stable-slots; confirm motion playback remains stable and unclipped"
+      ],
+      "frames": [
+        {
+          "index": 0,
+          "file": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\pet-runs\\sunny\\frames\\running\\00.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 18985,
+          "bbox": [
+            36,
+            15,
+            156,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 205
+        },
+        {
+          "index": 1,
+          "file": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\pet-runs\\sunny\\frames\\running\\01.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 19884,
+          "bbox": [
+            32,
+            5,
+            160,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 198
+        },
+        {
+          "index": 2,
+          "file": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\pet-runs\\sunny\\frames\\running\\02.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 19121,
+          "bbox": [
+            34,
+            16,
+            158,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 199
+        },
+        {
+          "index": 3,
+          "file": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\pet-runs\\sunny\\frames\\running\\03.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 19289,
+          "bbox": [
+            33,
+            14,
+            158,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 192
+        },
+        {
+          "index": 4,
+          "file": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\pet-runs\\sunny\\frames\\running\\04.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 19069,
+          "bbox": [
+            33,
+            17,
+            159,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 210
+        },
+        {
+          "index": 5,
+          "file": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\pet-runs\\sunny\\frames\\running\\05.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 18923,
+          "bbox": [
+            35,
+            16,
+            157,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 163
+        }
+      ]
+    },
+    {
+      "state": "review",
+      "expected_frames": 6,
+      "actual_frames": 6,
+      "extraction_method": "stable-slots",
+      "ok": true,
+      "errors": [],
+      "warnings": [
+        "review used extraction method stable-slots; confirm motion playback remains stable and unclipped"
+      ],
+      "frames": [
+        {
+          "index": 0,
+          "file": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\pet-runs\\sunny\\frames\\review\\00.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 20079,
+          "bbox": [
+            24,
+            6,
+            167,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 184
+        },
+        {
+          "index": 1,
+          "file": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\pet-runs\\sunny\\frames\\review\\01.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 19019,
+          "bbox": [
+            32,
+            5,
+            159,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 177
+        },
+        {
+          "index": 2,
+          "file": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\pet-runs\\sunny\\frames\\review\\02.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 19626,
+          "bbox": [
+            32,
+            6,
+            159,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 187
+        },
+        {
+          "index": 3,
+          "file": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\pet-runs\\sunny\\frames\\review\\03.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 19043,
+          "bbox": [
+            28,
+            15,
+            163,
+            202
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 161
+        },
+        {
+          "index": 4,
+          "file": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\pet-runs\\sunny\\frames\\review\\04.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 18965,
+          "bbox": [
+            31,
+            6,
+            160,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 157
+        },
+        {
+          "index": 5,
+          "file": "C:\\Users\\GZQ\\Desktop\\SJTUClaw\\SJTUClaw\\pet-runs\\sunny\\frames\\review\\05.png",
+          "width": 192,
+          "height": 208,
+          "nontransparent_pixels": 19059,
+          "bbox": [
+            24,
+            5,
+            167,
+            203
+          ],
+          "edge_pixels": 0,
+          "chroma_adjacent_pixels": 147
+        }
+      ]
+    }
+  ]
+}

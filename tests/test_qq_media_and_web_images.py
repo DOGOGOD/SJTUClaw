@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 
 from starlette.datastructures import UploadFile
@@ -98,6 +99,96 @@ def test_qq_sends_local_image_as_rich_media(tmp_path):
     assert send_call[2]["json"]["media"] == {"file_info": "uploaded-token"}
 
 
+def test_qq_dedup_records_new_ids_after_capacity_eviction(monkeypatch):
+    import claw.channels.qq as qq_module
+
+    monkeypatch.setattr(qq_module, "DEDUP_MAX_SIZE", 2)
+    channel = qq_module.QQChannel(qq_module.QQConfig())
+
+    assert channel._is_duplicate("first") is False
+    assert channel._is_duplicate("second") is False
+    assert channel._is_duplicate("third") is False
+    assert channel._is_duplicate("third") is True
+    assert len(channel._seen_messages) == 2
+
+
+def test_qq_hello_clamps_untrusted_heartbeat_interval():
+    from claw.channels.qq import QQChannel, QQConfig
+
+    async def exercise():
+        channel = QQChannel(QQConfig())
+
+        async def identify():
+            return None
+
+        channel._send_identify = identify
+        channel._dispatch_payload(
+            {"op": 10, "d": {"heartbeat_interval": -1}}
+        )
+        await asyncio.sleep(0)
+        return channel._heartbeat_interval
+
+    assert asyncio.run(exercise()) == 0.8
+
+
+def test_qq_connect_reuses_socket_opened_by_reconnect():
+    from claw.channels.qq import QQChannel, QQConfig
+
+    class Socket:
+        closed = False
+
+    async def exercise():
+        channel = QQChannel(QQConfig())
+        channel._ws = Socket()
+        opened = 0
+
+        async def fail_if_opened(_url):
+            nonlocal opened
+            opened += 1
+
+        async def read_events():
+            return None
+
+        async def heartbeat():
+            return None
+
+        channel._open_ws = fail_if_opened
+        channel._read_events = read_events
+        channel._heartbeat_loop = heartbeat
+        await channel._connect_and_listen()
+        await asyncio.sleep(0)
+        return opened
+
+    assert asyncio.run(exercise()) == 0
+
+
+def test_concurrent_qq_messages_resolve_one_session(monkeypatch, tmp_path):
+    from claw.gateway import server
+    from claw.session.store import SessionStore
+
+    store = SessionStore(tmp_path / "sessions")
+    monkeypatch.setattr(server, "_session_store", store)
+    monkeypatch.setattr(server, "_qq_session_map", {})
+
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        session_ids = [
+            future.result()
+            for future in [
+                pool.submit(
+                    server._resolve_or_create_qq_session,
+                    "same-chat",
+                    "group",
+                )
+                for _ in range(40)
+            ]
+        ]
+
+    assert len(set(session_ids)) == 1
+    assert len(store.list_summaries()) == 1
+    session = store.get(session_ids[0])
+    assert session.metadata["qq_chat_id"] == "same-chat"
+
+
 def test_web_attachment_image_is_persisted_as_message(monkeypatch, tmp_path):
     from claw.gateway import server
     from claw.session.store import SessionStore
@@ -117,6 +208,88 @@ def test_web_attachment_image_is_persisted_as_message(monkeypatch, tmp_path):
         session.session_id, result["attachment"]["id"]
     )
     assert response.media_type == "image/png"
+    assert response.headers["x-content-type-options"] == "nosniff"
+
+
+def test_active_svg_attachment_is_never_rendered_inline(monkeypatch, tmp_path):
+    from claw.gateway import server
+    from claw.session.store import SessionStore
+
+    store = SessionStore(tmp_path / "session-data")
+    session = store.create_session(session_id="svg-session")
+    monkeypatch.setattr(server, "_session_store", store)
+    monkeypatch.setattr(server, "SESSIONS_DIR", tmp_path / "session-data")
+
+    upload = UploadFile(
+        BytesIO(b"<svg><script>alert(1)</script></svg>"),
+        filename="active.svg",
+        headers={"content-type": "image/svg+xml"},
+    )
+    result = asyncio.run(server.upload_attachment(session.session_id, upload))
+
+    assert result["message"]["content"].startswith("[active.svg]")
+    response = server.get_attachment_content(
+        session.session_id, result["attachment"]["id"]
+    )
+    assert response.headers["content-disposition"].startswith("attachment;")
+    assert response.headers["x-content-type-options"] == "nosniff"
+
+
+def test_concurrent_prompt_updates_keep_disk_and_runtime_in_sync(monkeypatch, tmp_path):
+    from claw.gateway import server
+
+    class _Builder:
+        system_prompt = ""
+
+        def update_system_prompt(self, content):
+            self.system_prompt = content
+
+    builder = _Builder()
+    monkeypatch.setattr(server, "prompts_dir", lambda: tmp_path)
+    monkeypatch.setattr(server, "_context_builder", builder)
+
+    contents = [f"prompt-{index}" for index in range(30)]
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        futures = [
+            pool.submit(
+                server.update_system_prompt,
+                server.UpdateContentRequest(content=content),
+            )
+            for content in contents
+        ]
+        for future in futures:
+            future.result()
+
+    persisted = (tmp_path / "system_prompt.md").read_text(encoding="utf-8")
+    assert persisted == server._system_prompt == builder.system_prompt
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_concurrent_attachment_metadata_updates_preserve_every_record(monkeypatch, tmp_path):
+    from claw.gateway import server
+
+    monkeypatch.setattr(server, "SESSIONS_DIR", tmp_path / "session-data")
+
+    def add_record(index: int):
+        return server._add_attachment_record(
+            "attachment-race",
+            f"att_{index}",
+            f"image-{index}.png",
+            f"att_{index}.png",
+            index,
+            "image/png",
+        )
+
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        futures = [pool.submit(add_record, index) for index in range(40)]
+        for future in futures:
+            future.result()
+
+    records = server._read_attachments_meta("attachment-race")
+    assert {record["id"] for record in records} == {
+        f"att_{index}"
+        for index in range(40)
+    }
 
 
 def test_web_attachment_markdown_escapes_bracketed_filename(monkeypatch, tmp_path):
@@ -171,6 +344,49 @@ def test_context_builder_sends_local_image_as_multimodal_content(tmp_path):
     assert content[0] == {"type": "text", "text": "请描述图片"}
     assert content[1]["type"] == "image_url"
     assert content[1]["image_url"]["url"].startswith("data:image/png;base64,")
+
+
+def test_context_builder_skips_oversized_local_image(monkeypatch, tmp_path):
+    import claw.context.builder as builder_module
+
+    image = tmp_path / "oversized.png"
+    image.write_bytes(b"12345")
+    monkeypatch.setattr(builder_module, "_MAX_CONTEXT_IMAGE_BYTES", 4)
+
+    content = builder_module._multimodal_user_content(
+        "请描述图片", [str(image)]
+    )
+
+    assert content == "请描述图片"
+
+
+def test_context_builder_only_replays_latest_user_images(tmp_path):
+    from claw.context.builder import ContextBuilder
+    from claw.memory.store import MemoryStore
+    from claw.session.store import SessionStore
+
+    old_image = tmp_path / "old.png"
+    new_image = tmp_path / "new.png"
+    old_image.write_bytes(b"old-image")
+    new_image.write_bytes(b"new-image")
+    store = SessionStore(tmp_path / "sessions")
+    session = store.create_session(session_id="image-history")
+    session.append_message("user", "old", media=[str(old_image)])
+    session.append_message("assistant", "seen")
+    session.append_message("user", "new", media=[str(new_image)])
+    builder = ContextBuilder("system", "soul", MemoryStore(tmp_path / "memory"))
+
+    messages = builder.build_messages(session)
+    image_urls = [
+        block["image_url"]["url"]
+        for message in messages
+        if isinstance(message.get("content"), list)
+        for block in message["content"]
+        if block.get("type") == "image_url"
+    ]
+
+    assert len(image_urls) == 1
+    assert "bmV3LWltYWdl" in image_urls[0]
 
 
 def test_chat_sends_uploaded_image_and_text_in_one_agent_turn(monkeypatch, tmp_path):

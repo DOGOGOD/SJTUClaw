@@ -83,6 +83,38 @@ def test_real_pi_request_keeps_native_tool_prompt_and_adds_sjtu_tools(tmp_path):
                         "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
                     },
                 ]
+            elif len(requests) == 3:
+                bash_command = f"pwd; ls -d '{root.as_posix()}'"
+                chunks = [
+                    {
+                        "id": "local-test-bash",
+                        "object": "chat.completion.chunk",
+                        "created": 1,
+                        "model": "verification-model",
+                        "choices": [{"index": 0, "delta": {
+                            "role": "assistant",
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": "call-bash",
+                                "type": "function",
+                                "function": {
+                                    "name": "bash",
+                                    "arguments": json.dumps(
+                                        {"command": bash_command},
+                                        ensure_ascii=False,
+                                    ),
+                                },
+                            }],
+                        }, "finish_reason": None}],
+                    },
+                    {
+                        "id": "local-test-bash",
+                        "object": "chat.completion.chunk",
+                        "created": 1,
+                        "model": "verification-model",
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
+                    },
+                ]
             else:
                 chunks = [
                     {
@@ -156,6 +188,7 @@ def test_real_pi_request_keeps_native_tool_prompt_and_adds_sjtu_tools(tmp_path):
             append_prompt_file=prompt_file,
             tool_manifest_file=manifest,
             bridge_token="local-bridge-token",
+            trust_tools=True,
             turn_timeout_s=20,
         )
 
@@ -193,7 +226,7 @@ def test_real_pi_request_keeps_native_tool_prompt_and_adds_sjtu_tools(tmp_path):
     assert "Use recall before answering questions" in system_text
     assert "SJTUCLAW_PROMPT_MARKER" in system_text
     assert {"read", "bash", "edit", "write", "recall"} <= tool_names
-    assert len(requests) == 3
+    assert len(requests) == 4
     assert any(
         message.get("role") == "tool" and "memory-hit:theme" in str(message.get("content"))
         for message in requests[1]["messages"]
@@ -204,3 +237,12 @@ def test_real_pi_request_keeps_native_tool_prompt_and_adds_sjtu_tools(tmp_path):
         message.get("role") == "tool" and "# SJTUClaw" in str(message.get("content"))
         for message in requests[2]["messages"]
     )
+    bash_results = [
+        str(message.get("content"))
+        for message in requests[3]["messages"]
+        if message.get("role") == "tool" and message.get("tool_call_id") == "call-bash"
+    ]
+    assert bash_results
+    assert root.as_posix() in bash_results[0]
+    assert "wsl:" not in bash_results[0].lower()
+    assert "\ufffd" not in bash_results[0]

@@ -6,6 +6,7 @@ from claw.sandbox.config import (
     load_sandbox_config,
 )
 from claw.sandbox.runtime import (
+    GUEST_PROJECT_VENV,
     GUEST_WORKSPACE,
     SandboxCommandResult,
     SandboxEntry,
@@ -14,6 +15,7 @@ from claw.sandbox.runtime import (
 )
 
 __all__ = [
+    "GUEST_PROJECT_VENV",
     "GUEST_WORKSPACE",
     "SandboxCommandResult",
     "SandboxConfig",

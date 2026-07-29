@@ -19,7 +19,7 @@ import uuid
 import zipfile
 import zlib
 from dataclasses import asdict, dataclass
-from functools import wraps
+from functools import lru_cache, wraps
 from pathlib import Path, PurePosixPath
 from typing import Any, BinaryIO
 
@@ -521,8 +521,7 @@ class PetCatalog:
             asset = pet_dir / str(raw.get("spritesheetPath") or "spritesheet.webp")
             if not asset.is_file() or not _PET_ID_RE.fullmatch(str(raw.get("id", ""))):
                 return None
-            with Image.open(asset) as image:
-                width, height = image.size
+            width, height = _image_dimensions(asset)
             if width != 1536 or height not in (1872, 2288):
                 return None
             version = int(raw.get("spriteVersionNumber") or (2 if height == 2288 else 1))
@@ -535,7 +534,13 @@ class PetCatalog:
                 "source": source,
                 "readOnly": read_only,
             }
-        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+        except (
+            MemoryError,
+            OSError,
+            ValueError,
+            TypeError,
+            json.JSONDecodeError,
+        ):
             return None
 
 
@@ -553,15 +558,71 @@ def _optional_bool(value: Any, default: bool) -> bool:
 def _pet_asset_key(pet: dict[str, Any]) -> str:
     """Return a stable identity for a pet's visual asset."""
     try:
-        # Hash decoded pixels rather than compressed file bytes so an
-        # identical PNG/WebP re-encode is also recognized as a duplicate.
-        with Image.open(Path(str(pet["spritesheetPath"]))) as image:
-            pixels = image.convert("RGBA").tobytes()
-        digest = hashlib.sha256(pixels).hexdigest()
-    except (KeyError, OSError, TypeError, ValueError):
+        asset = Path(str(pet["spritesheetPath"]))
+        stat_result = asset.stat()
+        digest = _asset_file_digest(
+            str(asset.resolve()),
+            stat_result.st_size,
+            stat_result.st_mtime_ns,
+        )
+    except (KeyError, MemoryError, OSError, TypeError, ValueError):
         # _read_pet already validates the path; retain a malformed entry as a
         # distinct item if a caller supplies a hand-built pet mapping.
         digest = str(pet.get("spritesheetPath", ""))
     display_name = str(pet.get("displayName", "")).strip().casefold()
     description = str(pet.get("description", "")).strip()
     return f"{display_name}\0{description}\0{digest}"
+
+
+@lru_cache(maxsize=256)
+def _asset_file_digest(path: str, size: int, mtime_ns: int) -> str:
+    """Hash a pet asset incrementally and cache it by filesystem identity."""
+    del size, mtime_ns
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        while chunk := stream.read(64 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _image_dimensions(path: Path) -> tuple[int, int]:
+    """Read PNG/WebP canvas dimensions without asking Pillow to decode it.
+
+    Pillow's WebP plugin reads the complete compressed file when opening an
+    image. Catalog endpoints only need dimensions, so decoding every pet on
+    each poll wastes tens of MiB and can fail when a sandbox VM is active.
+    """
+    with path.open("rb") as stream:
+        header = stream.read(32)
+    if header.startswith(b"\x89PNG\r\n\x1a\n"):
+        if len(header) < 24 or header[12:16] != b"IHDR":
+            raise ValueError("invalid PNG header")
+        return (
+            int.from_bytes(header[16:20], "big"),
+            int.from_bytes(header[20:24], "big"),
+        )
+    if (
+        len(header) >= 20
+        and header[:4] == b"RIFF"
+        and header[8:12] == b"WEBP"
+    ):
+        chunk_type = header[12:16]
+        payload = header[20:]
+        if chunk_type == b"VP8X" and len(payload) >= 10:
+            return (
+                1 + int.from_bytes(payload[4:7], "little"),
+                1 + int.from_bytes(payload[7:10], "little"),
+            )
+        if chunk_type == b"VP8L" and len(payload) >= 5 and payload[0] == 0x2F:
+            bits = int.from_bytes(payload[1:5], "little")
+            return 1 + (bits & 0x3FFF), 1 + ((bits >> 14) & 0x3FFF)
+        if (
+            chunk_type == b"VP8 "
+            and len(payload) >= 10
+            and payload[3:6] == b"\x9d\x01\x2a"
+        ):
+            return (
+                int.from_bytes(payload[6:8], "little") & 0x3FFF,
+                int.from_bytes(payload[8:10], "little") & 0x3FFF,
+            )
+    raise ValueError("unsupported image header")

@@ -45,13 +45,20 @@ _SESSION_FILE_EXT = ".jsonl"
 _LEGACY_FILE_NAME = "session.json"
 _SESSION_PREVIEW_MAX_CHARS = 120
 
+# Persisted, session-scoped runtime preferences.  They are intentionally not
+# copied by session forks or restored from conversation rollback snapshots.
+AUTO_MODE_METADATA_KEY = "runtime_auto_enabled"
+SANDBOX_MODE_METADATA_KEY = "runtime_sandbox_enabled"
+
 # Metadata keys that are volatile (should not be forked)
 _FORK_VOLATILE_META = frozenset({
+    AUTO_MODE_METADATA_KEY,
     "claude_initialized_generation", "claude_session_cwd",
     "claude_session_generation", "claude_session_owner",
     "goal_state", "pending_user_turn",
     "pi_initialized_generation", "pi_session_generation", "pi_session_owner",
     "runtime_checkpoint", "title", "title_user_edited",
+    SANDBOX_MODE_METADATA_KEY,
 })
 
 # Max session id length (filesystem-safe).  Base64-encoded filenames
@@ -502,6 +509,42 @@ class SessionStore:
             return False
         with self._cache_lock:
             return session_id in self._cache
+
+    def get_metadata_flag(self, session_id: str, key: str) -> bool | None:
+        """Return a persisted boolean metadata flag, or ``None`` if unset."""
+        value = self.get(session_id).metadata.get(key)
+        return value if isinstance(value, bool) else None
+
+    def set_metadata_flag(
+        self,
+        session_id: str,
+        key: str,
+        value: bool | None,
+    ) -> None:
+        """Atomically update one boolean session metadata preference."""
+        if value is not None and not isinstance(value, bool):
+            raise TypeError("session metadata flag 必须是 bool 或 None")
+        with self._session_lock(session_id):
+            session = self.get(session_id)
+            had_old = key in session.metadata
+            old_value = session.metadata.get(key)
+            old_updated_at = session.updated_at
+            old_revision = session.revision
+            if value is None:
+                session.metadata.pop(key, None)
+            else:
+                session.metadata[key] = value
+            session.touch()
+            try:
+                self.save(session)
+            except Exception:
+                if had_old:
+                    session.metadata[key] = old_value
+                else:
+                    session.metadata.pop(key, None)
+                session.updated_at = old_updated_at
+                session.revision = old_revision
+                raise
 
     def invalidate(self, session_id: str) -> None:
         """Remove one session from the in-memory cache."""

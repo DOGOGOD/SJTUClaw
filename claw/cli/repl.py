@@ -89,15 +89,19 @@ def run_repl(
                 "sjtuclaw": "SJTUClaw",
             }.get(current, current)
             return f"当前 session 的 Agent 后端：{label}。"
-        if (
-            target in {"pi", "claude"}
-            and sandbox_manager is not None
-            and sandbox_manager.required
-        ):
-            return (
-                "[错误] required sandbox 模式当前只覆盖 SJTUClaw 原生后端；"
-                "为避免外部 Agent 绕过 microVM，已拒绝切换。"
-            )
+        if target in {"pi", "claude"} and sandbox_manager is not None:
+            if sandbox_manager.required:
+                return (
+                    "[错误] required sandbox 模式当前只覆盖 "
+                    "SJTUClaw 原生后端；已拒绝切换。"
+                )
+            if sandbox_manager.is_session_explicitly_enabled(
+                state.current_session_id
+            ):
+                return (
+                    "[错误] 当前 session 已要求使用 sandbox，而 sandbox "
+                    "目前只覆盖 SJTUClaw 原生后端；请先使用 /sandbox off。"
+                )
         if target == current:
             if target == "pi":
                 try:

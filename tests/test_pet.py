@@ -164,6 +164,45 @@ class PetCatalogTests(unittest.TestCase):
         )
         self.assertEqual(persisted["selectedPetId"], "yuexinmiao")
 
+    def test_catalog_listing_does_not_decode_spritesheets(self):
+        with patch(
+            "claw.pet.catalog.Image.open",
+            side_effect=MemoryError("simulated host memory pressure"),
+        ):
+            pet = self.catalog.get_pet("yuexinmiao")
+            listed = self.catalog.list_pets()
+
+        self.assertIsNotNone(pet)
+        self.assertEqual([item["id"] for item in listed], ["yuexinmiao"])
+
+    def test_catalog_reads_png_dimensions_without_decoding(self):
+        pet_dir = self.catalog._user_pets / "png-pet"
+        pet_dir.mkdir(parents=True)
+        Image.new("RGBA", (1536, 1872), (0, 0, 0, 0)).save(
+            pet_dir / "spritesheet.png",
+            "PNG",
+        )
+        (pet_dir / "pet.json").write_text(
+            json.dumps(
+                {
+                    "id": "png-pet",
+                    "displayName": "PNG Pet",
+                    "spriteVersionNumber": 1,
+                    "spritesheetPath": "spritesheet.png",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with patch(
+            "claw.pet.catalog.Image.open",
+            side_effect=MemoryError("simulated host memory pressure"),
+        ):
+            pet = self.catalog.get_pet("png-pet")
+
+        self.assertIsNotNone(pet)
+        self.assertEqual(pet["spriteVersionNumber"], 1)
+
     def _make_pet_package(
         self,
         *,

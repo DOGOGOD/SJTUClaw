@@ -99,7 +99,9 @@ session_002 → c2Vzc2lvbl8wMDI
     "title": "...",
     "agent_backend": "...",
     "summary": "...",
-    "pi_session_generation": "..."
+    "pi_session_generation": "...",
+    "runtime_auto_enabled": true,
+    "runtime_sandbox_enabled": true
   },
   "last_consolidated": 0,
   "revision": 0
@@ -118,6 +120,11 @@ session_002 → c2Vzc2lvbl8wMDI
 ```
 
 根据消息类型，还可能包含媒体、工具调用、回退检查点等字段。
+
+`runtime_auto_enabled` 与 `runtime_sandbox_enabled` 是按 session 保存的运行偏好，
+因此 CLI、Gateway 或桌面应用重启后仍能恢复。UNLIMITED 不写入 Session metadata，
+重启后关闭。新建或 fork session 不复制这些权限偏好；Rollback 恢复对话时也保留
+回退操作发生时的当前 AUTO/Sandbox 值，而不会恢复历史检查点里的旧权限。
 
 ### 3.3 数据从哪里来
 
@@ -186,6 +193,24 @@ SJTUClaw 或使用 `/sandbox off` 只停止当前 session 的 microVM，不删�
 因此再次 `/sandbox on` 后仍能看到原文件；删除对应 SJTUClaw session 时会同时
 请求删除该命名卷。若应用异常退出，可使用 `msb ps --all` 和
 `msb volume list` 检查残留资源。
+
+项目专属 Python 包和 console scripts 默认保存在该 workspace 的 `.venv/` 中；
+运行 venv 位于 microVM 临时 rootfs，启动与命令结束时自动双向同步。私有命名卷
+场景下，删除 session 会连同 `.venv` 一起删除；绑定宿主 workspace 时，`.venv`
+是宿主项目目录的一部分，删除 session 不会删除它。该目录是 SJTUClaw 管理的
+依赖存储，不应手动 source 其中的 `bin/activate`。microVM 镜像或 Python 大版本
+改变后若环境失效，应删除 `.venv` 并让 SJTUClaw 在下次启动时重建。
+
+Workspace 回退默认排除虚拟环境目录，因此回退项目文件不会回退
+`/workspace/.venv` 中已经安装或卸载的依赖。若需要可复现环境，应同时维护
+`requirements.txt`、`pyproject.toml` 或锁文件，而不要把 `.venv` 当作唯一依赖
+清单。多个 session 绑定同一个宿主 workspace 时会共享这份 `.venv`，不要并发
+修改其中的依赖。
+
+基础镜像和私有卷一样由 microsandbox 管理，不保存在 SJTUClaw 的 `data/` 中。
+`sjtuclaw-sandbox:py3.12-bookworm` 是所有 session 可复用的只读镜像层；删除
+SJTUClaw session 不会删除镜像。可用 `msb image list --format json` 检查镜像缓存，
+通过 `packaging/sandbox/Build-SandboxImage.ps1` 重新构建并导入。
 
 ## 4. 外部 Agent 后端数据
 

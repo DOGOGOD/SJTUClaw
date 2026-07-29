@@ -19,7 +19,12 @@ from claw.cli.commands import (
     parse_skill_invoke_result,
 )
 from claw.memory.store import MemoryStore
-from claw.session.store import SessionStore, SessionStoreError
+from claw.session.store import (
+    AUTO_MODE_METADATA_KEY,
+    SANDBOX_MODE_METADATA_KEY,
+    SessionStore,
+    SessionStoreError,
+)
 
 
 def _state(tmp_path, **overrides):
@@ -215,6 +220,41 @@ def test_auto_mode_is_isolated_per_session(tmp_path):
     handle_command("/auto on", state)
     handle_command("/session switch session-a", state)
     assert state.auto_mode is True
+
+
+def test_auto_mode_survives_runtime_state_restart(tmp_path):
+    sessions_dir = tmp_path / "sessions"
+    first_store = SessionStore(sessions_dir)
+    first_store.create_session(session_id="session-a")
+    first_state = _state(tmp_path, session_store=first_store)
+
+    assert "已开启" in handle_command("/auto on", first_state)
+    assert first_store.get_metadata_flag(
+        "session-a",
+        AUTO_MODE_METADATA_KEY,
+    ) is True
+
+    restarted_store = SessionStore(sessions_dir)
+    restarted_state = _state(tmp_path, session_store=restarted_store)
+
+    assert restarted_state.auto_mode is True
+    assert "当前已开启" in handle_command("/auto", restarted_state)
+
+
+def test_fork_does_not_inherit_runtime_mode_preferences(tmp_path):
+    store = SessionStore(tmp_path / "sessions")
+    source = store.create_session(session_id="source")
+    store.set_metadata_flag("source", AUTO_MODE_METADATA_KEY, True)
+    store.set_metadata_flag("source", SANDBOX_MODE_METADATA_KEY, True)
+    source = store.get("source")
+    source.append_message("user", "first")
+    store.save(source)
+
+    forked = store.fork_session_before_user_index("source", "forked", 1)
+
+    assert forked is not None
+    assert AUTO_MODE_METADATA_KEY not in forked.metadata
+    assert SANDBOX_MODE_METADATA_KEY not in forked.metadata
 
 
 def test_failed_session_delete_preserves_auxiliary_state(tmp_path):

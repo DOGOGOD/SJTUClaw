@@ -435,6 +435,18 @@ class ContextBuilder:
             if status["workspaceKind"] == "host-mounted"
             else "当前 session 的持久化 sandbox 私有 workspace"
         )
+        python_context = ""
+        if status.get("projectVenv"):
+            python_context = (
+                f"项目依赖持久化在 `{status['projectVenv']}`；Shell 中的 "
+                "`python` 与 `pip` 已指向 microVM 内的运行 venv，并通过 "
+                "`--system-site-packages` 复用基础镜像通用库。每条 Shell "
+                "命令结束后，项目包和 console scripts 会自动同步回持久目录，"
+                "下次 microVM 启动时恢复。直接使用 `pip install` 或 "
+                "`python -m pip install` 即可；不要尝试 source "
+                "`/workspace/.venv/bin/activate`。项目依赖仍应写入 "
+                "requirements.txt 或项目自己的依赖清单。"
+            )
         return (
             "## Sandbox 运行环境\n\n"
             "SJTUClaw 原生文件工具与 Shell 在同一个 microsandbox microVM 中运行。"
@@ -444,6 +456,7 @@ class ContextBuilder:
             "需要宿主文件时请使用附件导入或请用户显式绑定 workspace。"
             "Shell 是 Linux `/bin/sh`，可以安全使用 microVM 内的 `/tmp` 等路径；"
             "结构化文件工具仍限定在 `/workspace`。"
+            f"{python_context}"
         )
 
     def bound_workspace(self, session_id: str) -> str | None:

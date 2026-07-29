@@ -34,16 +34,30 @@ microsandbox 源码调试时，可以改为安装
 `../microsandbox/sdk/python`，但源码构建仍需准备 Rust 与 microsandbox 的原生运行
 依赖；发布版更适合使用包含 `msb` 与 `libkrunfw` 的官方 wheel。
 
+推荐先构建并导入项目提供的通用依赖镜像：
+
+```powershell
+.\packaging\sandbox\Build-SandboxImage.ps1
+```
+
+构建成功后把 `SANDBOX_IMAGE` 设置为
+`sjtuclaw-sandbox:py3.12-bookworm`。代码级默认值仍是
+`python:3.12-bookworm`，用于没有构建自定义镜像时的基础兼容环境，但它不包含
+SJTUClaw 的通用科学计算和文档处理库。
+
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `SANDBOX_MODE` | `off` | `off`、`auto` 或 fail-closed 的 `required` |
-| `SANDBOX_IMAGE` | `python:3.12-bookworm` | 带常用开发基础的 OCI 镜像 |
+| `SANDBOX_IMAGE` | `python:3.12-bookworm` | OCI 镜像；推荐构建后设为 `sjtuclaw-sandbox:py3.12-bookworm` |
+| `SANDBOX_PROJECT_VENV` | `true` | 是否启用运行 venv 并将项目依赖持久化到 `/workspace/.venv` |
+| `SANDBOX_PIP_INDEX_URL` | 清华 PyPI 镜像 | 项目依赖安装源；留空时不覆盖 pip 配置 |
 | `SANDBOX_CPUS` | `2` | vCPU 数 |
 | `SANDBOX_MEMORY_MIB` | `2048` | 内存上限（MiB） |
 | `SANDBOX_MAX_DURATION_S` | `21600` | 单个 microVM 最长生命周期 |
 | `SANDBOX_IDLE_TIMEOUT_S` | `3600` | 空闲回收时间 |
 | `SANDBOX_NETWORK` | `public` | `public` 允许开发联网，`none` 禁止 guest 网络 |
 | `SANDBOX_SECURITY` | `restricted` | microsandbox 安全策略 |
+| `SANDBOX_STAT_VIRTUALIZATION` | `auto` | `auto`、`strict`、`relaxed` 或 `off` |
 | `SANDBOX_WORKSPACE_QUOTA_MIB` | `4096` | guest 对 workspace 的新增写入配额 |
 
 行为规则：
@@ -52,6 +66,23 @@ microsandbox 源码调试时，可以改为安装
   单独为当前 session 开启。
 - Sandbox 开启且未设置 workspace 时，第一次原生文件或 Shell 工具调用会自动
   创建 session 私有的持久卷，并挂载到 guest `/workspace`。
+- 默认在每个 microVM 的 Linux rootfs 创建运行 venv，通过
+  `system-site-packages` 复用镜像通用库。Shell 中的 `python`、`python3` 和
+  `pip` 均使用该环境；命令结束后，项目新增包与 console scripts 会同步到
+  `/workspace/.venv`，下次 microVM 启动时恢复。由于 `/workspace/.venv` 是
+  持久依赖存储而不是可直接激活的 venv，不应执行
+  `source /workspace/.venv/bin/activate`。若目录已存在但不是 SJTUClaw 管理的
+  布局，初始化会明确报错，用户应移动、删除或重命名它。
+- 推荐镜像预装 NumPy、Pandas、SciPy、Matplotlib、Seaborn、scikit-learn、
+  Pillow、Requests/HTTPX、HTML 解析、OpenPyXL、PyYAML、PDF、Word 和 ReportLab
+  等通用库；准确版本见
+  [`packaging/sandbox/requirements-common.txt`](../packaging/sandbox/requirements-common.txt)。
+  项目专属库直接用普通 `pip install` 安装，不要为了单个项目重新构建基础镜像。
+- `auto` 在 Windows 上使用 `relaxed` stat virtualization 和 `mirror` 普通 rwx 位
+  传播，以避开 NTFS 挂载中 guest 新文件的 ELOOP/EACCES、不可重新执行以及
+  不支持 POSIX 符号链接的问题；其他宿主使用 `strict` 和 `private`。挂载始终
+  保持 `nosuid`、`nodev`，且 `mirror` 不会扩大 guest 可见的宿主目录范围。
+  `strict`/`relaxed` 可用于已确认支持 microsandbox 元数据 sidecar 的宿主。
 - 设置 workspace 后，只把用户明确绑定的目录挂载到 guest `/workspace`；
   不会因为模型给出宿主绝对路径或 `../` 就扩大挂载范围。
 - Shell 可以在 microVM 内使用 `/tmp` 等 guest 路径；结构化文件工具仍只访问
@@ -70,12 +101,23 @@ microsandbox 源码调试时，可以改为安装
   都就绪时才启用；显式打开 `UNLIMITED` 仍表示用户选择
   原有宿主级不受限行为。生产或处理不可信代码时应使用 `required`。
 
-可在任意对话入口输入 `/sandbox status` 查看当前状态，使用 `/sandbox on` 或
-`/sandbox off` 单独控制当前 session。不同 session 的开关互不影响；关闭时会
-停止当前 microVM，再次开启后由下次工具调用按需重建。`required` 模式不允许
-关闭。session 覆盖状态保存在当前 CLI/Gateway 进程内，应用重启后恢复
-`SANDBOX_MODE` 的默认值。改变 workspace 绑定也会自动重建 microVM，确保旧
-挂载不会继续生效。停止失败时命令会返回错误，不会误报关闭成功。
+可在任意对话入口使用：
+
+```text
+/sandbox          # 显示相关命令的简要说明
+/sandbox on       # 只开启当前 session
+/sandbox off      # 只关闭当前 session
+/sandbox status   # 查看模式、镜像、运行状态和 workspace 类型
+```
+
+不同 session 的开关互不影响；Web UI 会在 sandbox 当前生效的 session 上显示
+Sandbox 图标。关闭时会停止当前 microVM，再次开启后由下次工具调用按需重建。
+`required` 模式不允许关闭。显式 on/off 状态写入 Session metadata，CLI、
+Gateway 或桌面应用重启后继续生效；仅从未显式设置过的 session 才使用
+`SANDBOX_MODE` 默认值。若持久状态为开启但重启后 SDK、虚拟化或运行文件不可用，
+文件和 Shell 工具会 fail-closed，不会回退宿主执行。改变 workspace 绑定也会
+自动重建 microVM，确保旧挂载不会继续生效。停止或状态保存失败时命令会返回错误，
+不会误报成功。
 修改上述环境变量后需要重启 CLI 或 Gateway。
 任务运行期间使用 `/stop` 时，Gateway 还会停止该 session 的 microVM，以中断
 正在等待的 sandbox 命令；私有命名卷不会因此丢失。
@@ -83,13 +125,31 @@ microsandbox 源码调试时，可以改为安装
 安装后可执行真实环境冒烟测试：
 
 ```bash
-python tests/sandbox_smoke.py --image alpine:3.21
-python tests/sandbox_smoke.py --image alpine:3.21 --workspace C:\path\to\test-workspace
+python tests/sandbox_smoke.py --image alpine:3.21 --no-project-venv
+python tests/sandbox_smoke.py --image alpine:3.21 --no-project-venv --workspace C:\path\to\test-workspace
+python tests/sandbox_smoke.py --image sjtuclaw-sandbox:py3.12-bookworm --verify-common-libs
 ```
 
-第一条验证私有命名卷，第二条验证显式宿主目录挂载。脚本会实际启动 microVM，
-完成 Shell、文件读写、导出和清理；镜像尚未缓存时需要访问 OCI registry。生产
-配置建议将 `SANDBOX_IMAGE` 固定到团队审核过的镜像 digest。
+前两条使用非 Python 镜像分别验证私有命名卷和显式宿主目录挂载；第三条同时验证
+项目依赖同步层和基础镜像通用库。脚本会实际启动 microVM，离线安装测试 wheel，
+重启 microVM 后验证包和 console script，并完成 Shell、文件读写、
+导出和清理；镜像尚未缓存时需要访问 OCI registry。自定义镜像的构建与
+`msb load` 方法见 [Sandbox 基础镜像](../packaging/sandbox/README.md)。生产配置
+建议将 `SANDBOX_IMAGE` 固定到团队审核过的镜像 digest。
+
+依赖隔离由 workspace 决定：
+
+- 未绑定宿主 workspace：每个 session 使用自己的 microsandbox 命名卷，
+  `/workspace/.venv` 也彼此独立；删除 session 时会请求删除该卷。
+- 已绑定宿主 workspace：`.venv` 就在绑定目录中；删除 session 不删除该目录，
+  绑定同一个物理目录的其他 session 会复用其中的项目依赖。
+- `/sandbox off` 只停止 microVM，不删除 workspace 或 `.venv`。
+- 新建和 fork session 不继承来源 session 的 AUTO、Sandbox 或 UNLIMITED 状态；
+  删除 session 时 AUTO/Sandbox metadata 随 Session 一并删除。
+
+AUTO 同样持久化在 Session metadata 中，重启后保持；UNLIMITED 仍只保存在内存中，
+进程重启后关闭。Rollback 只恢复对话和 workspace，不改变回退操作发生时的
+AUTO/Sandbox 状态，避免历史检查点意外恢复旧权限。
 
 ## Pi Agent 后端
 

@@ -1,6 +1,6 @@
 # SJTUClaw Code Wiki
 
-> 本文档是 SJTUClaw 项目的结构化代码百科，覆盖项目整体架构、模块职责、关键类与函数、依赖关系、运行方式，并对 `SJTUClaw.md` 中要求的所有功能以及开发者新增功能给出具体代码位置与实现阐释。
+> 本文档是 SJTUClaw 项目的结构化代码百科，覆盖项目整体架构、模块职责、关键类与函数、依赖关系、运行方式，并对课程 Step 0–Step 9 功能以及开发者新增功能给出具体代码位置与实现阐释。
 
 ---
 
@@ -12,7 +12,7 @@
 - [四、关键类与函数说明](#四关键类与函数说明)
 - [五、依赖关系](#五依赖关系)
 - [六、项目运行方式](#六项目运行方式)
-- [七、SJTUClaw.md 功能要求实现说明](#七sjtuclawmd-功能要求实现说明)
+- [七、课程功能要求实现说明](#七课程功能要求实现说明)
   - [7.1 多 Session 管理与持久化（Step 2）](#71-多-session-管理与持久化step-2)
   - [7.2 Agent Loop（Step 1、5、8）](#72-agent-loopstep-158)
   - [7.3 Context Build（Step 2、3、4、5）](#73-context-buildstep-2345)
@@ -29,6 +29,7 @@
   - [8.3 Reflect 每日反思](#83-reflect-每日反思)
   - [8.4 Auto 与 Unlimited 模式](#84-auto-与-unlimited-模式)
   - [8.5 Pi Agent 接入](#85-pi-agent-接入)
+  - [8.6 microsandbox 接入](#86-microsandbox-接入)
 - [九、核心运行机制与模块关系](#九核心运行机制与模块关系)
   - [9.1 状态归属与隔离总表](#91-状态归属与隔离总表)
   - [9.2 Session 隔离](#92-session-隔离)
@@ -43,7 +44,8 @@
   - [9.11 Rollback](#911-rollback)
   - [9.12 AUTO 与 UNLIMITED 模式](#912-auto-与-unlimited-模式)
   - [9.13 Pi 与 Claude Code 后端切换](#913-pi-与-claude-code-后端切换)
-  - [9.14 端到端流程与模块协作](#914-端到端流程与模块协作)
+  - [9.14 Sandbox 运行时](#914-sandbox-运行时)
+  - [9.15 端到端流程与模块协作](#915-端到端流程与模块协作)
 - [十、测试体系](#十测试体系)
 
 ---
@@ -56,6 +58,8 @@ SJTUClaw 是面向个人与教学场景的本地 AI Agent Runtime。它将多轮
 
 - **统一主对话入口**：CLI / Web UI / QQ Bot / Heartbeat / Cron 的完整 turn 共享 `run_agent_turn()`；摘要、反思、标题等辅助 LLM 任务有各自的受控调用链。
 - **可选 Pi Agent 后端**：通过 JSONL RPC 接入 Pi 编码 Agent，按 session 切换后端。
+- **可选 microVM 沙箱**：原生 Agent 的文件、Shell、附件和下载工具可按 session
+  路由到 microsandbox；未绑定 workspace 时自动使用私有 `/workspace`。
 - **安全审批**：写入/Shell 等高风险工具必须审批，AUTO/UNLIMITED 模式按 session 隔离生效。
 - **三层 Token 安全网**：`ContextBudget.check_overflow` → `ContextGovernor._snip_history` → `compaction.maybe_consolidate_by_tokens`。
 - **Workspace 回退**：基于 SHA-256 内容寻址对象存储 + SQLite 元数据，原子性恢复文件与对话状态。
@@ -70,6 +74,7 @@ SJTUClaw 是面向个人与教学场景的本地 AI Agent Runtime。它将多轮
 | Agent | 自研 Agent Loop、ToolRegistry、ContextBuilder、CompactionWorker、ApprovalManager |
 | 存储 | JSONL Session、SQLite 回退元数据、SHA-256 对象库、Markdown + YAML 记忆 |
 | 调度 | croniter、Heartbeat 后台线程 |
+| 隔离执行 | microsandbox microVM、OCI 镜像、session 私有卷或显式宿主挂载 |
 | 前端 | React 18、TypeScript、Vite、Tailwind CSS、react-markdown、KaTeX、react-syntax-highlighter |
 | 通道 | Windows 桌面应用（pywebview）、CLI、Web UI、REST API、QQ Bot WebSocket |
 | 打包 | PyInstaller、Inno Setup 7、tkinter、Pillow |
@@ -188,6 +193,7 @@ SJTUClaw/
 │   ├── pi/                       # 可选 Pi Agent RPC 客户端与工具桥接
 │   ├── prompts/                  # Prompt 模板与加载器
 │   ├── scheduler/                # Cron、Heartbeat、任务分发与状态持久化
+│   ├── sandbox/                  # microVM 配置、生命周期、挂载、文件/Shell 适配
 │   ├── session/                  # Session/Message 模型、标题与 JSONL Store
 │   ├── skills/                   # Skill Registry、安装、统计与状态管理
 │   ├── tools/                    # 文件、Shell、网页、附件、Memory、Cron、Skill 工具
@@ -204,12 +210,12 @@ SJTUClaw/
 ├── webui/                        # React + TypeScript + Vite 前端源码
 ├── web/                          # 已构建的 Web UI 静态产物
 ├── packaging/windows/            # PyInstaller spec + Inno Setup iss
+├── packaging/sandbox/            # 通用 Python 镜像与构建导入脚本
 ├── docs/                         # 配置、测试、打包文档
 ├── tests/                        # pytest 测试套件
 ├── pyproject.toml                # 项目元数据与 CLI 入口
 ├── requirements.txt              # Python 依赖
 ├── .env.example                  # 环境变量模板
-├── SJTUClaw.md                   # 课程任务说明
 └── 中期报告.md
 ```
 
@@ -369,6 +375,15 @@ SJTUClaw/
 | `runtime_settings.py` | Fernet 加密的 WebUI 可写设置（密钥不写回 .env）。 |
 | `paths.py` | 源码版 / PyInstaller 版 / 安装版路径切换。 |
 | `utils.py` | `force_utf8_stdio` / `now_iso` / `default_timezone_name` / `decode_subprocess_output`。 |
+
+### 3.18 `claw/sandbox/` — microVM 隔离运行
+
+| 文件 | 职责 |
+|------|------|
+| `config.py` | `SandboxConfig` 与环境/运行时设置校验；默认 `off`，支持 `auto` 和 fail-closed `required`。 |
+| `runtime.py` | `SandboxManager`、microsandbox SDK 后端、session microVM/卷生命周期、挂载策略、有界 Shell/文件适配和导入导出。 |
+| `project_env_sync.py` | 在 microVM-local 运行 venv 与 `/workspace/.venv` 之间增量同步项目包和 console scripts。 |
+| `__init__.py` | 对外导出配置、错误类型、管理器和 guest 路径常量。 |
 
 ---
 
@@ -580,6 +595,7 @@ dependencies = [
 [project.optional-dependencies]
 desktop = ["pywebview>=5.0"]
 build = ["pyinstaller>=6.0", "pywebview>=5.0"]
+sandbox = ["microsandbox>=0.6.7,<0.7"]
 ```
 
 ### 5.2 前端依赖（webui/package.json）
@@ -600,6 +616,8 @@ gateway/server.py
   │    └─ agent/loop.py (run_agent_turn)  ← 核心入口
   ├─ workspace/manager.py (WorkspaceManager)
   ├─ workspace/rollback.py (WorkspaceRollbackManager)
+  ├─ sandbox/runtime.py (SandboxManager)
+  │    └─ sandbox/project_env_sync.py (项目依赖持久化)
   ├─ approval/manager.py (ApprovalManager)
   ├─ skills/registry.py (SkillRegistry)
   │    └─ skills/usage.py (SkillUsageStore)
@@ -612,6 +630,8 @@ gateway/server.py
 ### 5.4 外部运行时依赖
 
 - **Pi Agent**（可选）：同级目录的 `pi` 仓库或系统 `pi`/`pi.cmd`。通过 `PI_COMMAND`/`PI_CLI_PATH`/`PI_NODE_PATH` 等环境变量配置。
+- **microsandbox**（可选）：Python SDK、`msb` 原生运行文件和宿主虚拟化；自定义
+  OCI 镜像需通过 Docker 构建后导入 microsandbox 缓存。
 - **OpenAI 兼容模型服务**：OpenAI / Ollama / vLLM / LM Studio 等。
 - **Inno Setup 7**（仅打包时）：生成 Windows 安装包。
 
@@ -629,6 +649,7 @@ source .venv/bin/activate       # Windows: .venv\Scripts\activate
 # 2. 安装依赖
 python -m pip install -r requirements.txt
 python -m pip install -e .
+# 启用 microVM 时改用：python -m pip install -e ".[sandbox]"
 
 # 3. 配置（交互式向导）
 sjtuclaw setup
@@ -682,13 +703,16 @@ npm run build       # 输出到项目根目录 web/
 | `GATEWAY_PORT` | 8000 | Gateway 端口 |
 | `GATEWAY_API_TOKEN` | - | 非本机监听时必填 |
 | `AGENT_BACKEND` | sjtuclaw | 默认后端（sjtuclaw/pi/claude） |
+| `SANDBOX_MODE` | off | 新 session 的 sandbox 默认策略（off/auto/required） |
+| `SANDBOX_IMAGE` | python:3.12-bookworm | OCI 镜像；推荐自建 `sjtuclaw-sandbox:py3.12-bookworm` |
+| `SANDBOX_PROJECT_VENV` | true | 将项目包持久化到 `/workspace/.venv` |
 | `QQ_ENABLED` | false | 启用 QQ Bot |
 
 ---
 
-## 七、SJTUClaw.md 功能要求实现说明
+## 七、课程功能要求实现说明
 
-本节按 `SJTUClaw.md` 中的 Step 0–Step 9 顺序，给出每个功能在本项目中的具体实现位置与关键代码。
+本节按课程 Step 0–Step 9 顺序，给出每个功能在本项目中的具体实现位置与关键代码。
 
 ### 7.1 多 Session 管理与持久化（Step 2）
 
@@ -1644,7 +1668,8 @@ SJTUClaw 严格遵守"复用同一套 runtime"原则：
 
 ## 八、开发者新增功能实现说明
 
-本节重点说明开发者在 SJTUClaw.md 基础要求之上新增的功能：Pet、Rollback、Reflect、Auto/Unlimited 模式、Pi Agent 接入。
+本节重点说明开发者在课程基础要求之上新增的功能：Pet、Rollback、Reflect、
+Auto/Unlimited 模式、Pi Agent、Claude Code 与 microsandbox 接入。
 
 ### 8.1 Pet 桌面宠物
 
@@ -1992,7 +2017,9 @@ _REFLECTION_SYSTEM_PROMPT = (
 
 **实现位置**：[claw/workspace/manager.py](file:///c:/Users/GZQ/Desktop/SJTUClaw/SJTUClaw/claw/workspace/manager.py) + [claw/agent/loop.py](file:///c:/Users/GZQ/Desktop/SJTUClaw/SJTUClaw/claw/agent/loop.py)
 
-AUTO 和 UNLIMITED 是两个相互独立、按 Session 生效的执行模式。新建 Session 时二者默认均为关闭状态，Gateway 重启后也会恢复为关闭状态。
+AUTO 和 UNLIMITED 是两个相互独立、按 Session 生效的执行模式。新建 Session 时
+二者默认均为关闭状态；AUTO 写入 Session metadata 并在 Gateway/CLI 重启后恢复，
+UNLIMITED 仍是内存中的临时权限，重启后关闭。
 
 #### 8.4.1 模式对比
 
@@ -2068,6 +2095,8 @@ if tc.safety_level in _APPROVAL_REQUIRED_LEVELS:  # {"write", "shell"}
 - **两个模式同时开启时，UNLIMITED 的强制审批规则优先**。
 - **Skill 加载确认不受 AUTO 影响**：`skill_select` 始终需要用户确认。
 - **per-session 隔离**：模式状态绑定到 session，不影响其他 session。
+- **权限不随 fork 或 rollback 扩散**：fork 不继承 AUTO，Rollback 不恢复旧的
+  AUTO 值。
 
 ### 8.5 Pi Agent 接入
 
@@ -2205,6 +2234,44 @@ SJTUClaw/
 | `PI_TRUST_TOOLS` | 是否信任 Pi 内置工具 |
 | `PI_TURN_TIMEOUT_S` | 单 turn 超时（默认 1800） |
 
+### 8.6 microsandbox 接入
+
+microsandbox 只覆盖 SJTUClaw 原生 ToolRegistry。`SandboxManager` 在每次文件或
+Shell 工具调用时根据 session、后端、workspace 和配置决定是否路由到 microVM：
+
+```text
+session sandbox 状态
+  → 未开启：沿用宿主 workspace handler
+  → 已开启且为原生后端
+      → 有 workspace：只挂载该宿主目录为 /workspace
+      → 无 workspace：创建 session 私有命名卷为 /workspace
+      → 文件/Shell/附件/下载复用同一 microVM
+```
+
+默认 `SANDBOX_MODE=off`，新 session 关闭；`/sandbox on`、`/sandbox off` 把当前
+session 的显式偏好写入 Session metadata，应用重启后恢复。`required` 模式禁止
+回退宿主、禁止关闭 sandbox、禁止 UNLIMITED，并拒绝切换到尚未被 microVM 覆盖的
+Pi/Claude Code 后端。显式开启的普通 session 在 sandbox 不可用时同样
+fail-closed。Gateway 把有效状态写入 session API/SSE，Web UI 据此显示 Sandbox
+图标。
+
+Python 环境采用“两层依赖”：
+
+1. `packaging/sandbox/Dockerfile` 构建所有 session 共享的只读通用库镜像；
+2. microVM rootfs 中的 `/opt/sjtuclaw/project-venv` 是实际运行 venv，通过
+   `--system-site-packages` 复用镜像库；
+3. 项目新增包和 console scripts 增量同步到 `/workspace/.venv`，microVM 重启后
+   自动恢复。
+
+`/workspace/.venv` 是受管依赖存储，不是可直接激活的完整 venv。它跟随 workspace：
+私有卷按 session 隔离，宿主挂载则由物理目录决定。删除私有 session 会请求删除
+其卷；删除绑定宿主目录的 session 不会删除目录或其中的 `.venv`。
+
+Windows 默认使用 `relaxed` stat virtualization 与 `mirror` 普通 rwx 位传播，
+同时保留 `nosuid`、`nodev` 和挂载目录边界。项目同步器还兼容 microsandbox 0.6.7
+只读 passthrough handle 在 `flush` 时返回 EACCES 的行为；其他 I/O 错误不会被
+吞掉。
+
 ---
 
 ## 九、核心运行机制与模块关系
@@ -2225,8 +2292,11 @@ SJTUClaw/
 | 当前活动 turn | 每个 Session | 仅内存 | 同一 Session 拒绝并发 turn，不同 Session 可并行 |
 | 附件 | 每个 Session | `data/sessions/<session-id>/attachments/` | 解析时校验附件所属 Session |
 | Workspace 绑定 | 每个 Session | `data/workspace/bindings.json` | 合并写入 + 文件锁；路径解析强制边界 |
-| AUTO 状态 | 每个 Session | 仅内存 | Gateway/CLI 分别维护映射，重启后关闭 |
+| AUTO 状态 | 每个 Session | Session metadata | Gateway/CLI 使用内存热缓存；重启后恢复 |
 | UNLIMITED 状态 | 每个 Session | 仅内存 | `WorkspaceManager` 内集合，重启后关闭 |
+| Sandbox 开关覆盖 | 每个 Session | Session metadata | 显式 on/off 重启后恢复；未设置时使用配置默认值 |
+| Sandbox 私有 workspace | 每个未绑定 Session | microsandbox `MSB_HOME` 命名卷 | `/sandbox off` 保留；删除 session 时请求删除 |
+| Sandbox 项目依赖 | 每个物理 workspace | `/workspace/.venv` | 私有卷隔离；宿主目录可被绑定同一路径的 session 共享 |
 | Pi/SJTUClaw 后端 | 每个 Session | Session metadata | 切换到 Pi 时旋转 generation |
 | 回退检查点 | Session + Workspace generation | `data/workspace/rollback/` | Session 锁 + 规范化 workspace 根锁 |
 | Cron 任务 | 每个 Job，payload 引用 Session | `data/cron/jobs.json` 及输出目录 | claim 先持久化，再执行回调 |
@@ -2267,7 +2337,8 @@ session_id
    ├─ SessionStore.get/save                  对话与 metadata
    ├─ Gateway _active_turns[session_id]      活动 turn 与取消事件
    ├─ WorkspaceManager binding[session_id]   文件系统根
-   ├─ AUTO / UNLIMITED maps                  模式
+   ├─ AUTO / UNLIMITED / Sandbox maps        模式
+   ├─ SandboxManager session VM/volume       隔离执行环境
    ├─ RuntimeAgentClient backend metadata    原生/Pi
    ├─ attachment directory                  附件
    ├─ Cron payload.session_key              定时任务回到原 Session
@@ -2624,6 +2695,7 @@ MemoryStore  ─┤
 SkillRegistry ├─> ContextBuilder ─┐
 WorkspaceMgr ─┘                   │
 ToolRegistry + ApprovalManager ───┼─> run_agent_turn
+SandboxManager ───────────────────┤
 RollbackManager ──────────────────┤
 RuntimeAgentClient ────────────────┘
 CronService / Reflection / CompactionWorker / Channels
@@ -2642,6 +2714,8 @@ Agent worker --TurnEvent--> queue --SSE encoder--> browser
 Thinking、ToolCallStart、ToolCallEnd、Approval 和 FinalEvent 可以逐步到达前端；keepalive 防止代理误判连接空闲。Agent 不占用 FastAPI 事件循环，所以模型运行期间 `/stop` 和审批决定接口仍可响应。
 
 `_active_turns[session_id]` 保存取消事件和任务状态。同一 Session 再次发送消息会冲突，不同 Session 允许并行。斜杠命令先经过白名单解析：已识别命令在本地执行，未知或伪造的控制命令不会混入 LLM 主对话链。
+`/sandbox on|off` 执行后，Gateway 同步刷新 session 信息和 SSE 中的
+`sandboxMode`，使 Web UI 的 session 图标与有效路由状态一致。
 
 #### 9.10.3 边界防护
 
@@ -2693,7 +2767,7 @@ Rollback 先持有 Session 锁，再持有规范化 workspace 根锁。这个顺
 
 | 模式 | 改变什么 | 不改变什么 | 持久化 |
 |------|----------|------------|--------|
-| AUTO | workspace 内结构化 write 可跳过人工审批 | Shell 仍审批；workspace 边界仍有效 | 仅内存 |
+| AUTO | workspace 内结构化 write 可跳过人工审批 | Shell 仍审批；workspace 边界仍有效 | Session metadata |
 | UNLIMITED | 路径解析可访问 workspace 外 | write/shell 仍强制审批；回退范围仍是绑定 workspace | 仅内存 |
 
 原生 Agent Loop 的决策可以概括为：
@@ -2712,7 +2786,11 @@ write/shell
 
 当 AUTO 与 UNLIMITED 同时开启时，UNLIMITED 的强制审批优先，AUTO 不能自动批准越界写入。即使结构化 write 被 AUTO 放行，handler 仍调用 WorkspaceManager 做最终路径检查。
 
-Gateway 用 `_auto_mode[session_id]` 保存 AUTO，WorkspaceManager 用 `_unlimited_sessions` 保存 UNLIMITED；CLI 的 `RuntimeState` 也按 Session 保存 AUTO。两者均不写入 Session metadata，重启后恢复为安全默认值。删除/切换相关 Session 时也会清理内存模式，避免状态错误继承。
+Gateway 用 `_auto_mode[session_id]` 缓存 AUTO，CLI 的 `RuntimeState` 也维护当前
+Session 投影；修改时同步写入 `runtime_auto_enabled` metadata。WorkspaceManager
+仍用 `_unlimited_sessions` 保存 UNLIMITED，后者不落盘。Session fork 会剔除
+AUTO/Sandbox metadata，Rollback 保留操作发生时的当前值，删除 Session 则连同
+持久偏好一起删除。
 
 ### 9.13 Pi 与 Claude Code 后端切换
 
@@ -2764,9 +2842,43 @@ Claude 原生 Hook 和宿主工具执行层统一以“是否改变状态”分�
 
 辅助 LLM 仍可能存在：`RuntimeAgentClient.chat()` / `chat_with_tools()` 委托给原生兼容客户端，供 Reflection、标题等非 Pi 主 turn 功能使用。如果只配置 Pi 而未配置辅助 LLM，这些辅助功能会明确报“辅助 LLM 未配置”，不会偷偷改用主 turn。
 
-### 9.14 端到端流程与模块协作
+### 9.14 Sandbox 运行时
 
-#### 9.14.1 人工消息
+Sandbox 路由位于工具 handler 层，不改变 LLM Tool Schema。模型仍调用
+`new_shell`、`run_command`、`read_file` 等原有工具；handler 根据当前
+`session_id` 选择宿主实现或 `SandboxManager`：
+
+```text
+ToolRegistry
+  → session sandbox 是否有效
+      ├─ 否：WorkspaceManager + 宿主 handler
+      └─ 是：SandboxManager._ensure()
+               → 创建/复用 microVM
+               → /workspace 私有卷或显式宿主挂载
+               → microsandbox 文件 API 或 /bin/sh
+```
+
+每个进程为同一 session 使用进程级 VM 名称，避免 CLI 与 Gateway 共享 session
+存储时互相替换运行实例；持久卷名称保持确定性，使 microVM 重建后仍能恢复数据。
+同一 session 的创建与命令由 session 锁串行化，不同 session 可以并行。
+
+`SandboxManager` 通过 loader/saver hooks 读取和写入
+`runtime_sandbox_enabled`。缓存只用于热路径，Session metadata 才是重启后的
+真相源。显式开启时，如果 SDK、虚拟化、运行文件或后端覆盖条件不满足，
+`should_use()` 抛出 `SandboxError`，防止静默转回宿主；未显式设置且全局模式为
+`auto` 时仍保留能力探测失败后的兼容回退。
+
+Shell 事件流始终持续排空，宿主只保留有界头尾；结构化写入使用临时文件加 rename。
+`/stop` 会停止当前 session microVM 以中断进行中的命令。workspace 绑定变化、
+后端切换和 `/sandbox off` 都会停止旧实例，避免挂载或执行状态泄漏。
+
+通用库在共享镜像中，项目包在 `/workspace/.venv`。实际运行 venv 每次 microVM
+创建时位于 `/opt/sjtuclaw/project-venv`；启动时恢复，Shell 命令结束后保存。
+Workspace 回退排除 `.venv`，因此依赖可复现性应由 requirements/lock 文件保证。
+
+### 9.15 端到端流程与模块协作
+
+#### 9.15.1 人工消息
 
 ```text
 WebUI/CLI/QQ
@@ -2790,7 +2902,7 @@ WebUI/CLI/QQ
   → JSON/SSE/CLI/QQ 输出
 ```
 
-#### 9.14.2 定时消息
+#### 9.15.2 定时消息
 
 ```text
 CronService 到期
@@ -2802,7 +2914,7 @@ CronService 到期
   → CronService 保存输出与历史
 ```
 
-#### 9.14.3 写文件并回退
+#### 9.15.3 写文件并回退
 
 ```text
 turn 开始
@@ -2822,7 +2934,7 @@ turn 开始
   → Pi generation 变化使旧 Pi 分支失效
 ```
 
-#### 9.14.4 最重要的模块边界
+#### 9.15.4 最重要的模块边界
 
 维护代码时应保持以下关系：
 
@@ -2861,6 +2973,9 @@ python -m pytest tests/ -v
 | `test_skill_management.py` | Skill 管理 |
 | `test_pet.py` / `test_pet_replies.py` / `test_pet_command.py` | 桌宠 |
 | `test_pi_integration.py` / `test_pi_real_prompt.py` | Pi 集成 |
+| `test_sandbox_integration.py` | Sandbox 配置、路由、session 生命周期、挂载和失败策略 |
+| `test_project_env_sync.py` | `/workspace/.venv` 项目依赖增量同步 |
+| `sandbox_smoke.py` | 可选真实 microVM、通用库和重启持久化冒烟测试 |
 | `test_unlimited_approval.py` | Unlimited 模式审批 |
 | `test_security_hardening.py` | 安全加固 |
 | `test_session_store_concurrency.py` | Session 存储并发 |
@@ -2898,7 +3013,9 @@ npx vitest run
 10. **原子写入**——SessionStore、MemoryStore、SkillManager、CronService 等均采用 tmp + replace 原子写入策略。
 11. **JSONL 独立持久化**——每个 Session 采用一行 metadata + 每行一消息的 JSONL，并通过整文件原子替换保存；单行损坏只跳过一条消息。
 12. **ContextVar per-turn 绑定**——RequestContext、FileStates、WorkspaceScope 通过 contextvars 实现异步安全的 per-turn 上下文传递。
+13. **Sandbox 不静默回退**——某次工具调用一旦选择 microVM，启动或执行失败必须
+    返回错误；`required` 模式不能切换到尚未被 microVM 覆盖的后端。
 
 ---
 
-> 本文档基于 SJTUClaw 项目源码生成，覆盖 `SJTUClaw.md` 中 Step 0–Step 9 的所有功能要求以及开发者新增的 Pet、Rollback、Reflect、Auto/Unlimited 模式、Pi Agent 接入等功能。所有代码引用均提供可点击的文件链接，便于跳转到源码位置。
+> 本文档基于 SJTUClaw 项目源码生成，覆盖课程 Step 0–Step 9 的所有功能要求以及开发者新增的 Pet、Rollback、Reflect、Auto/Unlimited 模式、Pi Agent、Claude Code 与 microsandbox 接入等功能。所有代码引用均提供可点击的文件链接，便于跳转到源码位置。

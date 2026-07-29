@@ -27,7 +27,11 @@ from typing import Iterator
 
 from claw.config import DATA_DIR
 from claw.session.models import Session
-from claw.session.store import SessionStore
+from claw.session.store import (
+    AUTO_MODE_METADATA_KEY,
+    SANDBOX_MODE_METADATA_KEY,
+    SessionStore,
+)
 from claw.utils import now_iso
 from claw.workspace.manager import WorkspaceError, WorkspaceManager
 
@@ -835,6 +839,11 @@ class WorkspaceRollbackManager:
     def _restore_session(self, live: Session, snapshot: dict) -> None:
         restored = Session.from_dict(snapshot)
         next_revision = live.revision + 1
+        runtime_preferences = {
+            key: live.metadata[key]
+            for key in (AUTO_MODE_METADATA_KEY, SANDBOX_MODE_METADATA_KEY)
+            if key in live.metadata
+        }
         live.title = restored.title
         live.messages = restored.messages
         live.summary = restored.summary
@@ -843,6 +852,9 @@ class WorkspaceRollbackManager:
         live.updated_at = now_iso()
         live.last_consolidated = restored.last_consolidated
         live.metadata = restored.metadata
+        for key in (AUTO_MODE_METADATA_KEY, SANDBOX_MODE_METADATA_KEY):
+            live.metadata.pop(key, None)
+        live.metadata.update(runtime_preferences)
         # External-agent sessions are append-only.  After restoring an older
         # SJTUClaw conversation, start fresh branches so removed turns cannot
         # leak back into subsequent prompts. Undo rotates again for the same

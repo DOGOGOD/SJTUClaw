@@ -77,6 +77,7 @@ SJTUClaw/
 │   └── vite.config.ts
 ├── web/                          # 已构建的 Web UI 静态产物，供 Gateway/桌面版直接加载
 ├── packaging/
+│   ├── sandbox/                  # 通用 microVM 镜像、依赖清单与构建导入脚本
 │   └── windows/
 │       ├── build.ps1             # 一键构建脚本
 │       ├── SJTUClaw.spec         # PyInstaller 打包规格
@@ -86,6 +87,7 @@ SJTUClaw/
 │   ├── CODE_WIKI.md              # 模块、调用链与实现细节
 │   ├── configuration.md          # 配置说明
 │   ├── data-directory-guide.md   # 运行数据目录与生命周期
+│   ├── sandbox-architecture.md   # microsandbox 路由、挂载与依赖分层
 │   ├── testing.md                # 测试与开发说明
 │   ├── windows-packaging.md      # Windows 安装包构建说明
 │   └── images/                   # README 与文档截图
@@ -96,7 +98,6 @@ SJTUClaw/
 ├── requirements.txt              # Python 依赖列表
 ├── pyproject.toml                # Python 项目元数据与 `sjtuclaw` CLI 入口
 ├── .env.example                  # 环境变量模板
-├── SJTUClaw.md                   # 课程任务说明
 └── 中期报告.md                    # 当前阶段报告
 ```
 
@@ -144,7 +145,16 @@ sjtuclaw setup
 
 也可以复制 `.env.example` 为 `.env` 手动配置。
 如需 microVM 隔离，改用 `python -m pip install -e ".[sandbox]"`，并在 Windows
-启用 Windows Hypervisor Platform。
+启用 Windows Hypervisor Platform。推荐先启动 Docker Desktop 并构建、导入包含
+通用 Python 库的镜像：
+
+```powershell
+.\packaging\sandbox\Build-SandboxImage.ps1
+```
+
+若脚本无法自动找到 `msb.exe`，使用
+`-MsbPath D:\path\to\msb.exe` 显式指定。完整步骤见
+[Sandbox 基础镜像](packaging/sandbox/README.md)。
 
 #### 切换 Agent 后端
 
@@ -251,8 +261,8 @@ JSON 数字，例如 `2`，不能写成字符串 `"2"`。
 SJTUClaw 默认对写入和 Shell 等高风险工具进行审批。未启用 microsandbox 时，
 文件及命令操作限制在当前 Session 绑定的 workspace 内；启用后由 microVM
 承载绑定目录或 session 私有 workspace。AUTO 和 UNLIMITED 是两个相互独立、
-按 Session 生效的审批/路径模式；新建 Session 时二者默认均为关闭状态，
-Gateway 重启后也会恢复为关闭状态。
+按 Session 生效的审批/路径模式；新建 Session 时二者默认均为关闭状态。AUTO
+会随 session 持久保存，UNLIMITED 属于临时权限提升，进程重启后自动关闭。
 
 | 模式 | 作用 | 审批行为 | 文件系统边界 |
 |------|------|----------|--------------|
@@ -287,10 +297,27 @@ microVM。未绑定 workspace 时使用持久化私有卷；绑定后只把该�
 `/workspace`。如需保证绝不回退到宿主执行，设置 `SANDBOX_MODE=required`；
 该模式禁止 UNLIMITED，并拒绝使用尚未纳入 microVM 的 Pi / Claude Code 后端。
 
-使用 `/sandbox status` 查看当前状态，使用 `/sandbox on` 或 `/sandbox off`
-单独控制当前 session；其他 session 不受影响。关闭会停止当前 microVM，但保留
-其私有 workspace 数据；开关覆盖在应用重启后恢复配置默认值，`required` 模式
-不允许关闭。详细配置和架构见
+直接输入 `/sandbox` 可查看命令说明；使用 `/sandbox status` 查看当前状态，
+使用 `/sandbox on` 或 `/sandbox off` 单独控制当前 session，其他 session 不受
+影响。Web UI 会在已生效的 session 上显示 Sandbox 图标。关闭会停止当前
+microVM，但保留其私有 workspace 数据。显式开关会随 session 持久保存；重启后
+若显式开启但 microsandbox 不可用，文件和 Shell 工具会 fail-closed，绝不会静默
+回退宿主执行。`required` 模式不允许关闭。
+
+新建或 fork 出的 session 不继承其他 session 的 AUTO、Sandbox 或 UNLIMITED
+权限状态；删除 session 会同时删除其 AUTO/Sandbox 偏好。
+
+推荐使用 [Sandbox 基础镜像](packaging/sandbox/README.md) 预装 numpy、pandas、
+scipy、matplotlib、Pillow、网络与常用文档处理库。Sandbox 启动时在 Linux
+rootfs 创建运行 venv，并通过 `--system-site-packages` 复用镜像通用库；Shell
+中的 `python` 和 `pip` 默认使用它。项目新增包与 console scripts 会在命令结束后
+同步到 `/workspace/.venv`，下次 microVM 启动时自动恢复，因此不会随临时 rootfs
+消失。直接执行 `pip install <package>` 或 `python -m pip install <package>`
+即可，不需要手动激活 `/workspace/.venv`。
+
+依赖跟随 workspace，而不是跟随 sandbox 开关：未绑定宿主 workspace 时，每个
+session 的私有卷独立保存文件和依赖；绑定宿主目录时，`.venv` 位于该目录中，
+绑定同一目录的 session 会看到相同的项目依赖。详细配置和架构见
 [配置说明](docs/configuration.md) 与
 [sandbox 接入架构](docs/sandbox-architecture.md)。
 

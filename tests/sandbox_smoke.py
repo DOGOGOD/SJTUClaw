@@ -28,6 +28,16 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--image", help="override SANDBOX_IMAGE")
     parser.add_argument("--workspace", type=Path)
+    parser.add_argument(
+        "--no-project-venv",
+        action="store_true",
+        help="disable /workspace/.venv for non-Python images",
+    )
+    parser.add_argument(
+        "--verify-common-libs",
+        action="store_true",
+        help="verify the SJTUClaw common Python package set",
+    )
     args = parser.parse_args()
 
     workspace = args.workspace.resolve() if args.workspace else None
@@ -39,6 +49,9 @@ def main() -> int:
         config,
         mode="required",
         image=args.image or config.image,
+        project_venv=(
+            False if args.no_project_venv else config.project_venv
+        ),
     )
     manager = SandboxManager(config)
     manager.set_agent_backend_provider(lambda _sid: "sjtuclaw")
@@ -56,6 +69,137 @@ def main() -> int:
         )
         if not command.ok:
             raise RuntimeError(command.stderr or f"exit code {command.exit_code}")
+        if args.verify_common_libs:
+            common = manager.run_command(
+                session_id,
+                workspace_manager,
+                "python -c \"import bs4, docx, httpx, lxml, matplotlib, "
+                "numpy, openpyxl, pandas, PIL, pypdf, reportlab, requests, "
+                "scipy, seaborn, sklearn, yaml; "
+                "print('common-libs-ok')\"",
+                60,
+            )
+            if not common.ok or "common-libs-ok" not in common.stdout:
+                raise RuntimeError(
+                    common.stderr
+                    or "sandbox common Python libraries are unavailable"
+                )
+        if config.project_venv:
+            venv_probe = manager.run_command(
+                session_id,
+                workspace_manager,
+                "test \"$(command -v python)\" = "
+                "\"/opt/sjtuclaw/project-venv/bin/python\" && "
+                "test \"$(command -v pip)\" = "
+                "\"/opt/sjtuclaw/project-venv/bin/pip\" && "
+                "test -z \"${PIP_PREFIX+x}\" && "
+                "pip --version >/dev/null",
+                60,
+            )
+            if not venv_probe.ok:
+                raise RuntimeError(
+                    venv_probe.stderr
+                    or "project venv command routing failed"
+                )
+            install_probe = manager.run_command(
+                session_id,
+                workspace_manager,
+                "python - <<'PY'\n"
+                "from pathlib import Path\n"
+                "from zipfile import ZIP_DEFLATED, ZipFile\n"
+                "wheel = Path('/tmp/sjtuclaw_probe-0.0.1-"
+                "py3-none-any.whl')\n"
+                "with ZipFile(wheel, 'w', ZIP_DEFLATED) as archive:\n"
+                "    archive.writestr("
+                "'sjtuclaw_probe/__init__.py', "
+                "\"VALUE = 20260729\\n\\ndef main():\\n"
+                "    print('project-cli-persisted')\\n\")\n"
+                "    archive.writestr("
+                "'sjtuclaw_probe-0.0.1.dist-info/METADATA', "
+                "'Metadata-Version: 2.1\\nName: sjtuclaw-probe\\n"
+                "Version: 0.0.1\\n')\n"
+                "    archive.writestr("
+                "'sjtuclaw_probe-0.0.1.dist-info/WHEEL', "
+                "'Wheel-Version: 1.0\\nGenerator: SJTUClaw smoke\\n"
+                "Root-Is-Purelib: true\\nTag: py3-none-any\\n')\n"
+                "    archive.writestr("
+                "'sjtuclaw_probe-0.0.1.dist-info/entry_points.txt', "
+                "'[console_scripts]\\nsjtuclaw-probe="
+                "sjtuclaw_probe:main\\n')\n"
+                "    archive.writestr("
+                "'sjtuclaw_probe-0.0.1.dist-info/RECORD', '')\n"
+                "PY\n"
+                "pip install --no-deps "
+                "/tmp/sjtuclaw_probe-0.0.1-py3-none-any.whl",
+                120,
+            )
+            if not install_probe.ok:
+                raise RuntimeError(
+                    install_probe.stderr
+                    or "could not install local project package probe"
+                )
+            manager.close_session(session_id)
+            manager.new_shell(session_id, workspace_manager)
+            persisted = manager.run_command(
+                session_id,
+                workspace_manager,
+                "python -c \"import sjtuclaw_probe as probe; "
+                "assert probe.VALUE == 20260729; "
+                "print('project-venv-persisted')\" && "
+                "test \"$(command -v sjtuclaw-probe)\" = "
+                "\"/opt/sjtuclaw/project-venv/bin/sjtuclaw-probe\" && "
+                "sjtuclaw-probe",
+                60,
+            )
+            if (
+                not persisted.ok
+                or "project-venv-persisted" not in persisted.stdout
+                or "project-cli-persisted" not in persisted.stdout
+            ):
+                raise RuntimeError(
+                    persisted.stderr
+                    or "project venv did not persist across microVM restart"
+                )
+            removed = manager.run_command(
+                session_id,
+                workspace_manager,
+                "pip uninstall -y sjtuclaw-probe >/dev/null",
+                60,
+            )
+            if not removed.ok:
+                raise RuntimeError(
+                    removed.stderr
+                    or "could not clean up project package probe"
+                )
+        else:
+            persisted_file = manager.run_command(
+                session_id,
+                workspace_manager,
+                "printf \"print('mount-persisted')\\n\" > "
+                "/workspace/.sjtuclaw-mount-probe.py",
+                60,
+            )
+            if not persisted_file.ok:
+                raise RuntimeError(
+                    persisted_file.stderr
+                    or "could not write persistent mount probe"
+                )
+            manager.close_session(session_id)
+            manager.new_shell(session_id, workspace_manager)
+            persisted_file = manager.run_command(
+                session_id,
+                workspace_manager,
+                "python /workspace/.sjtuclaw-mount-probe.py",
+                60,
+            )
+            if (
+                not persisted_file.ok
+                or "mount-persisted" not in persisted_file.stdout
+            ):
+                raise RuntimeError(
+                    persisted_file.stderr
+                    or "workspace file did not survive microVM restart"
+                )
         binary = manager.run_command(
             session_id,
             workspace_manager,

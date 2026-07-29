@@ -67,7 +67,12 @@ from claw.pi import (
 )
 from claw.memory.store import MemoryStore, MemoryStoreError
 from claw.prompts import load_soul, load_system_prompt
-from claw.session.store import SessionStore, SessionStoreError
+from claw.session.store import (
+    AUTO_MODE_METADATA_KEY,
+    SANDBOX_MODE_METADATA_KEY,
+    SessionStore,
+    SessionStoreError,
+)
 from claw.session.title import auto_title_if_first_turn
 from claw.skills.registry import SkillRegistry
 from claw.skills.management import (
@@ -205,6 +210,25 @@ _memory_store = MemoryStore(MEMORY_DIR)
 _compact_cfg = load_compaction_config()
 _workspace_manager = WorkspaceManager()
 _sandbox_manager = SandboxManager(load_sandbox_config())
+_sandbox_manager.set_session_state_store(
+    loader=lambda sid: (
+        _session_store.get_metadata_flag(
+            sid,
+            SANDBOX_MODE_METADATA_KEY,
+        )
+        if _session_store.exists(sid)
+        else None
+    ),
+    saver=lambda sid, enabled: (
+        _session_store.set_metadata_flag(
+            sid,
+            SANDBOX_MODE_METADATA_KEY,
+            enabled,
+        )
+        if _session_store.exists(sid)
+        else None
+    ),
+)
 _sandbox_manager.set_agent_backend_provider(
     lambda sid: get_session_backend(_session_store, sid)
 )
@@ -620,8 +644,22 @@ app.add_middleware(RequestLoggingMiddleware)
 # Web UI is served at the end of the file (after all API routes).
 _WEB_DIR = web_dir()
 
-# Per-session AUTO mode flag (in-memory, resets on restart)
-_auto_mode: dict[str, bool] = {}
+def _load_persisted_auto_modes(store: SessionStore) -> dict[str, bool]:
+    """Restore enabled AUTO preferences without copying disabled entries."""
+    return {
+        summary.session_id: True
+        for summary in store.list_summaries()
+        if store.get_metadata_flag(
+            summary.session_id,
+            AUTO_MODE_METADATA_KEY,
+        )
+        is True
+    }
+
+
+# Hot-path cache backed by session metadata.  Unlike UNLIMITED, AUTO survives
+# a process restart but is never copied to a forked session.
+_auto_mode: dict[str, bool] = _load_persisted_auto_modes(_session_store)
 
 
 def _session_sandbox_mode(session_id: str) -> bool:
@@ -1545,7 +1583,6 @@ def _execute_slash_command(
         return "当前没有正在运行的任务"
 
     def _exit_impl() -> str:
-        _auto_mode.pop(sid, None)
         _workspace_manager.set_unlimited(sid, False)
         return "bye."
 
@@ -1558,11 +1595,17 @@ def _execute_slash_command(
                 "sjtuclaw": "SJTUClaw",
             }.get(current, current)
             return f"当前 session 的 Agent 后端：{label}。"
-        if target in {"pi", "claude"} and _sandbox_manager.required:
-            return (
-                "[错误] required sandbox 模式当前只覆盖 SJTUClaw 原生后端；"
-                "为避免外部 Agent 绕过 microVM，已拒绝切换。"
-            )
+        if target in {"pi", "claude"}:
+            if _sandbox_manager.required:
+                return (
+                    "[错误] required sandbox 模式当前只覆盖 "
+                    "SJTUClaw 原生后端；已拒绝切换。"
+                )
+            if _sandbox_manager.is_session_explicitly_enabled(sid):
+                return (
+                    "[错误] 当前 session 已要求使用 sandbox，而 sandbox "
+                    "目前只覆盖 SJTUClaw 原生后端；请先使用 /sandbox off。"
+                )
         if target == current:
             if target == "pi":
                 try:

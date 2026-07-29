@@ -30,6 +30,9 @@ from claw.sandbox.config import SandboxConfig
 logger = logging.getLogger(__name__)
 
 GUEST_WORKSPACE = "/workspace"
+GUEST_PROJECT_VENV = f"{GUEST_WORKSPACE}/.venv"
+GUEST_RUNTIME_VENV = "/opt/sjtuclaw/project-venv"
+_GUEST_PROJECT_ENV_SYNC = "/opt/sjtuclaw/project_env_sync.py"
 _MAX_OUTPUT_BYTES = 64 * 1024
 _STREAM_CAPTURE_BYTES = _MAX_OUTPUT_BYTES + 4 * 1024
 _STREAM_TAIL_BYTES = 4 * 1024
@@ -246,6 +249,24 @@ class MicrosandboxBackend:
         config: SandboxConfig,
     ) -> Any:
         msb = self._msb
+        stat_mode = config.stat_virtualization
+        host_permissions = msb.HostPermissions.PRIVATE
+        if stat_mode == "auto":
+            # microsandbox's metadata sidecar is not currently compatible
+            # with files created inside Windows host-directory mounts.  Keep
+            # the stronger virtualization on POSIX hosts. On Windows, use the
+            # relaxed overlay and mirror ordinary rwx bits so guest-created
+            # files and project console scripts retain usable permissions.
+            if os.name == "nt":
+                stat_mode = "relaxed"
+                host_permissions = msb.HostPermissions.MIRROR
+            else:
+                stat_mode = "strict"
+        stat_virtualization = {
+            "strict": msb.StatVirtualization.STRICT,
+            "relaxed": msb.StatVirtualization.RELAXED,
+            "off": msb.StatVirtualization.OFF,
+        }[stat_mode]
         if host_workspace is None:
             mount = msb.MountConfig(
                 kind=msb.MountKind.NAMED,
@@ -255,8 +276,8 @@ class MicrosandboxBackend:
                 quota_mib=config.workspace_quota_mib,
                 nosuid=True,
                 nodev=True,
-                stat_virtualization=msb.StatVirtualization.STRICT,
-                host_permissions=msb.HostPermissions.PRIVATE,
+                stat_virtualization=stat_virtualization,
+                host_permissions=host_permissions,
             )
         else:
             mount = msb.MountConfig(
@@ -265,8 +286,8 @@ class MicrosandboxBackend:
                 quota_mib=config.workspace_quota_mib,
                 nosuid=True,
                 nodev=True,
-                stat_virtualization=msb.StatVirtualization.STRICT,
-                host_permissions=msb.HostPermissions.PRIVATE,
+                stat_virtualization=stat_virtualization,
+                host_permissions=host_permissions,
             )
 
         network = (
@@ -540,6 +561,8 @@ class SandboxManager:
         self._lock = threading.RLock()
         self._session_locks: dict[str, threading.RLock] = {}
         self._agent_backend_provider: Callable[[str], str] | None = None
+        self._session_state_loader: Callable[[str], bool | None] | None = None
+        self._session_state_saver: Callable[[str, bool], None] | None = None
         self._availability: bool | None = None
         install_seed = str(DATA_DIR.resolve()).encode("utf-8", errors="replace")
         self._install_id = hashlib.sha256(install_seed).hexdigest()[:10]
@@ -588,11 +611,68 @@ class SandboxManager:
 
     def is_session_enabled(self, session_id: str) -> bool:
         """Return the session's explicit state or the configured default."""
+        preference = self.session_preference(session_id)
+        if self.required:
+            return True
+        return (
+            preference
+            if preference is not None
+            else self.config.enabled
+        )
+
+    def session_preference(self, session_id: str) -> bool | None:
+        """Return the explicit persisted state, if this session has one."""
         with self._lock:
-            return self._session_enabled.get(
-                session_id,
-                self.config.enabled,
-            )
+            if session_id in self._session_enabled:
+                return self._session_enabled[session_id]
+            loader = self._session_state_loader
+        if loader is None:
+            return None
+        try:
+            preference = loader(session_id)
+        except Exception as exc:
+            raise SandboxError(
+                f"读取 session sandbox 状态失败: {exc}"
+            ) from exc
+        if preference is None:
+            return None
+        if not isinstance(preference, bool):
+            raise SandboxError("持久化的 session sandbox 状态不是布尔值")
+        with self._lock:
+            self._session_enabled.setdefault(session_id, preference)
+            return self._session_enabled[session_id]
+
+    def is_session_explicitly_enabled(self, session_id: str) -> bool:
+        """Return whether the user explicitly enabled this session."""
+        return self.session_preference(session_id) is True
+
+    def set_session_state_store(
+        self,
+        *,
+        loader: Callable[[str], bool | None] | None,
+        saver: Callable[[str, bool], None] | None,
+    ) -> None:
+        """Configure persistence hooks for per-session sandbox preferences."""
+        with self._lock:
+            self._session_state_loader = loader
+            self._session_state_saver = saver
+            self._session_enabled.clear()
+
+    def _persist_session_preference(
+        self,
+        session_id: str,
+        enabled: bool,
+    ) -> None:
+        with self._lock:
+            saver = self._session_state_saver
+        if saver is None:
+            return
+        try:
+            saver(session_id, enabled)
+        except Exception as exc:
+            raise SandboxError(
+                f"保存 session sandbox 状态失败: {exc}"
+            ) from exc
 
     def set_session_enabled(
         self,
@@ -618,6 +698,7 @@ class SandboxManager:
                     "microsandbox SDK/运行时不可用；"
                     "请先安装 sandbox 可选依赖并检查虚拟化环境。"
                 )
+            self._persist_session_preference(session_id, True)
             with self._lock:
                 self._session_enabled[session_id] = True
             return
@@ -629,6 +710,7 @@ class SandboxManager:
         # Stop first so a failure cannot report the session as disabled while
         # its old microVM is still alive.
         self.close_session(session_id)
+        self._persist_session_preference(session_id, False)
         with self._lock:
             self._session_enabled[session_id] = False
 
@@ -662,28 +744,39 @@ class SandboxManager:
 
     def should_use(self, session_id: str, workspace_manager: Any) -> bool:
         """Return whether native tools must route through microsandbox."""
-        if not self.is_session_enabled(session_id):
+        preference = self.session_preference(session_id)
+        explicitly_enabled = preference is True
+        enabled = (
+            True
+            if self.required
+            else preference
+            if preference is not None
+            else self.config.enabled
+        )
+        if not enabled:
             return False
         agent_backend = self._agent_backend(session_id)
         if agent_backend != "sjtuclaw":
-            if self.required:
+            if self.required or explicitly_enabled:
                 raise SandboxError(
-                    "required sandbox 模式仅允许 SJTUClaw 原生后端；"
+                    "当前 session 已要求使用 sandbox，但 sandbox "
+                    "仅覆盖 SJTUClaw 原生后端；"
                     f"当前后端 {agent_backend} 尚未纳入 microVM。"
                 )
             return False
         if workspace_manager.is_unlimited(session_id):
-            if self.required:
+            if self.required or explicitly_enabled:
                 raise SandboxError(
-                    "required sandbox 模式与 UNLIMITED 不兼容；"
+                    "当前 session 已要求使用 sandbox，不能与 UNLIMITED 共用；"
                     "请先关闭 /unlimited。"
                 )
             return False
         if self.available:
             return True
-        if self.required:
+        if self.required or explicitly_enabled:
             raise SandboxError(
-                "SANDBOX_MODE=required，但 microsandbox SDK/运行时不可用；"
+                "当前 session 已要求使用 sandbox，但 "
+                "microsandbox SDK/运行时不可用；"
                 "已拒绝回退到宿主执行。"
             )
         return False
@@ -693,11 +786,13 @@ class SandboxManager:
             live = session_id in self._sessions
         host = workspace_manager.get(session_id)
         agent_backend = self._agent_backend(session_id)
+        preference = self.session_preference(session_id)
         enabled = self.is_session_enabled(session_id)
         available = self.available
         return {
             "mode": self.config.mode,
             "enabled": enabled,
+            "preference": preference,
             "effective": (
                 enabled
                 and available
@@ -711,9 +806,14 @@ class SandboxManager:
             "workspaceKind": "host-mounted" if host is not None else "sandbox-private",
             "hostWorkspace": str(host) if host is not None else None,
             "guestWorkspace": GUEST_WORKSPACE,
+            "projectVenv": (
+                GUEST_PROJECT_VENV if self.config.project_venv else None
+            ),
+            "pipIndexUrl": self.config.pip_index_url or None,
             "image": self.config.image,
             "network": self.config.network,
             "security": self.config.security,
+            "statVirtualization": self.config.stat_virtualization,
         }
 
     def _backend_instance(self) -> SandboxBackend:
@@ -735,6 +835,126 @@ class SandboxManager:
         # VM names prevent one process's replace=True startup from killing the
         # other's live VM; the deterministic volume remains session-scoped.
         return f"{prefix}-{os.getpid()}", f"{prefix}-workspace"
+
+    def _bootstrap_project_venv(
+        self,
+        backend: SandboxBackend,
+        session: _SessionSandbox,
+    ) -> None:
+        """Create a runtime venv backed by a persistent dependency store.
+
+        A CPython venv stored directly on a microsandbox Windows passthrough
+        volume cannot be reopened reliably after a microVM restart (its
+        ``pyvenv.cfg`` returns EACCES). Keep the executable venv on the Linux
+        rootfs and persist only project packages/scripts under
+        ``/workspace/.venv``. A small sync helper restores packages into the
+        runtime venv on boot and saves changes after shell commands, keeping
+        normal ``python`` and ``pip`` behavior (including console scripts).
+        """
+        if not self.config.project_venv:
+            return
+        project = shlex.quote(GUEST_PROJECT_VENV)
+        runtime = shlex.quote(GUEST_RUNTIME_VENV)
+        command = (
+            "# SJTUCLAW_PROJECT_VENV_BOOTSTRAP\n"
+            "set -eu\n"
+            f"project={project}\n"
+            f"runtime={runtime}\n"
+            'marker="$project/.sjtuclaw-managed"\n'
+            'if [ -d "$project" ] && [ ! -f "$marker" ] '
+            '&& [ -n "$(ls -A "$project" 2>/dev/null)" ]; then\n'
+            '  echo "现有 /workspace/.venv 不是 SJTUClaw 管理的项目依赖'
+            '目录；请移动、删除或重命名后重试。" >&2\n'
+            "  exit 73\n"
+            "fi\n"
+            'if [ -f "$marker" ] '
+            '&& ! grep -qx "layout=sync-v1" "$marker"; then\n'
+            '  echo "现有 /workspace/.venv 使用了不兼容的 SJTUClaw '
+            '布局；请删除或重命名后重试。" >&2\n'
+            "  exit 73\n"
+            "fi\n"
+            'if [ -f "$marker" ]; then\n'
+            # Refresh the Windows passthrough backend's per-VM metadata view
+            # before Python imports files persisted by the previous VM.
+            '  chmod -R u+rwX,go+rX "$project"\n'
+            "fi\n"
+            'python_bin="$(command -v python3 || command -v python || true)"\n'
+            'if [ -z "$python_bin" ]; then\n'
+            '  echo "当前 sandbox 镜像没有 Python，无法创建项目 .venv。" >&2\n'
+            "  exit 72\n"
+            "fi\n"
+            'rm -rf "$runtime"\n'
+            'mkdir -p "$(dirname "$runtime")" "$project/bin"\n'
+            '"$python_bin" -m venv --without-pip '
+            '--system-site-packages "$runtime"\n'
+            'for pip_name in pip pip3; do\n'
+            '  printf \'#!/bin/sh\\nexec "$(dirname "$0")/python" '
+            '-m pip "$@"\\n\' > "$runtime/bin/$pip_name"\n'
+            '  chmod 755 "$runtime/bin/$pip_name"\n'
+            "done\n"
+            f'"$runtime/bin/python" {_GUEST_PROJECT_ENV_SYNC} '
+            'restore "$project" "$runtime"\n'
+            'printf "layout=sync-v1\\n" > "$marker"\n'
+            '"$runtime/bin/python" -m pip --version >/dev/null\n'
+        )
+        try:
+            prepared = backend.shell(
+                session.sandbox,
+                "mkdir -p -- /opt/sjtuclaw",
+                cwd=GUEST_WORKSPACE,
+                timeout=30,
+            )
+            if int(getattr(prepared, "exit_code", 1)) != 0:
+                raise SandboxError("无法创建 sandbox 项目环境运行目录")
+            helper_source = (
+                Path(__file__)
+                .with_name("project_env_sync.py")
+                .read_bytes()
+            )
+            backend.write(
+                session.sandbox,
+                _GUEST_PROJECT_ENV_SYNC,
+                helper_source,
+            )
+            output = backend.shell(
+                session.sandbox,
+                command,
+                cwd=GUEST_WORKSPACE,
+                timeout=180,
+            )
+        except Exception as exc:
+            raise SandboxError(f"初始化项目 Python .venv 失败: {exc}") from exc
+        exit_code = int(getattr(output, "exit_code", 1))
+        if exit_code == 0 and not bool(
+            getattr(output, "output_limited", False)
+        ):
+            return
+        stderr = bytes(getattr(output, "stderr_bytes", b"")).decode(
+            "utf-8",
+            errors="replace",
+        ).strip()
+        detail = stderr or f"命令退出码 {exit_code}"
+        raise SandboxError(f"初始化项目 Python .venv 失败: {detail}")
+
+    def _project_environment(self) -> str:
+        """Return POSIX exports applied to every sandbox shell command."""
+        lines = ["export PIP_DISABLE_PIP_VERSION_CHECK=1"]
+        if self.config.project_venv:
+            lines.extend(
+                [
+                    f"export VIRTUAL_ENV={shlex.quote(GUEST_RUNTIME_VENV)}",
+                    "export SJTUCLAW_PROJECT_ENV="
+                    f"{shlex.quote(GUEST_PROJECT_VENV)}",
+                    'unset PIP_PREFIX PIP_TARGET PYTHONUSERBASE',
+                    'export PATH="$VIRTUAL_ENV/bin:$PATH"',
+                ]
+            )
+        if self.config.pip_index_url:
+            lines.append(
+                "export PIP_INDEX_URL="
+                f"{shlex.quote(self.config.pip_index_url)}"
+            )
+        return "\n".join(lines)
 
     def _ensure(self, session_id: str, workspace_manager: Any) -> _SessionSandbox:
         if not self.should_use(session_id, workspace_manager):
@@ -773,6 +993,17 @@ class SandboxManager:
                 volume_name=volume_name,
                 host_workspace=host,
             )
+            try:
+                self._bootstrap_project_venv(backend, created)
+            except Exception:
+                try:
+                    backend.stop(created.sandbox, created.name)
+                except Exception:
+                    logger.exception(
+                        "项目 .venv 初始化失败后停止 sandbox 失败: %s",
+                        created.name,
+                    )
+                raise
             with self._lock:
                 self._sessions[session_id] = created
             return created
@@ -839,6 +1070,14 @@ class SandboxManager:
             "workspace": GUEST_WORKSPACE,
             "cwd": cwd,
             "shell": "/bin/sh (microsandbox)",
+            "python": (
+                f"{GUEST_RUNTIME_VENV}/bin/python"
+                if self.config.project_venv
+                else "image default"
+            ),
+            "projectVenv": (
+                GUEST_PROJECT_VENV if self.config.project_venv else None
+            ),
             "workspaceKind": (
                 "host-mounted"
                 if session.host_workspace is not None
@@ -857,9 +1096,21 @@ class SandboxManager:
         marker = f"__SJTUCLAW_CWD_{uuid.uuid4().hex}__"
         with session.lock:
             script = (
+                f"{self._project_environment()}\n"
                 f"{command}\n"
                 "__sjtuclaw_code=$?\n"
-                f"printf '\\n{marker}%s\\n' \"$PWD\"\n"
+                + (
+                    f'"$VIRTUAL_ENV/bin/python" {_GUEST_PROJECT_ENV_SYNC} '
+                    'save "$SJTUCLAW_PROJECT_ENV" "$VIRTUAL_ENV"\n'
+                    "__sjtuclaw_sync_code=$?\n"
+                    'if [ "$__sjtuclaw_code" -eq 0 ] '
+                    '&& [ "$__sjtuclaw_sync_code" -ne 0 ]; then\n'
+                    "  __sjtuclaw_code=$__sjtuclaw_sync_code\n"
+                    "fi\n"
+                    if self.config.project_venv
+                    else ""
+                )
+                + f"printf '\\n{marker}%s\\n' \"$PWD\"\n"
                 "exit $__sjtuclaw_code"
             )
             try:

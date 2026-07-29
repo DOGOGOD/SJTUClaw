@@ -32,6 +32,19 @@ def _integer(
     return value
 
 
+def _boolean(name: str, default: bool) -> bool:
+    raw = setting_value(name, "").strip().lower()
+    if not raw:
+        return default
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    raise SandboxConfigError(
+        f"{name} 必须是 true/false、yes/no、on/off 或 1/0"
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class SandboxConfig:
     """Effective sandbox settings.
@@ -49,7 +62,10 @@ class SandboxConfig:
     idle_timeout_s: int = 60 * 60
     network: str = "public"
     security: str = "restricted"
+    stat_virtualization: str = "auto"
     workspace_quota_mib: int = 4096
+    project_venv: bool = True
+    pip_index_url: str = "https://pypi.tuna.tsinghua.edu.cn/simple"
 
     @property
     def enabled(self) -> bool:
@@ -81,9 +97,25 @@ def load_sandbox_config() -> SandboxConfig:
             "SANDBOX_SECURITY 仅支持 restricted 或 default"
         )
 
+    stat_virtualization = (
+        setting_value("SANDBOX_STAT_VIRTUALIZATION", "auto")
+        .strip()
+        .lower()
+        or "auto"
+    )
+    if stat_virtualization not in {"auto", "strict", "relaxed", "off"}:
+        raise SandboxConfigError(
+            "SANDBOX_STAT_VIRTUALIZATION 仅支持 auto、strict、relaxed 或 off"
+        )
+
     image = setting_value("SANDBOX_IMAGE", "python:3.12-bookworm").strip()
     if not image:
         raise SandboxConfigError("SANDBOX_IMAGE 不能为空")
+
+    pip_index_url = setting_value(
+        "SANDBOX_PIP_INDEX_URL",
+        "https://pypi.tuna.tsinghua.edu.cn/simple",
+    ).strip()
 
     return SandboxConfig(
         mode=mode,
@@ -96,7 +128,10 @@ def load_sandbox_config() -> SandboxConfig:
         idle_timeout_s=_integer("SANDBOX_IDLE_TIMEOUT_S", 60 * 60),
         network=network,
         security=security,
+        stat_virtualization=stat_virtualization,
         workspace_quota_mib=_integer(
             "SANDBOX_WORKSPACE_QUOTA_MIB", 4096, minimum=64
         ),
+        project_venv=_boolean("SANDBOX_PROJECT_VENV", True),
+        pip_index_url=pip_index_url,
     )

@@ -38,7 +38,7 @@ from claw.pi import (
 from claw.memory.reflection import ReflectionManager
 from claw.memory.store import MemoryStore
 from claw.prompts import PromptLoadError, load_soul, load_system_prompt
-from claw.session.store import SessionStore
+from claw.session.store import SANDBOX_MODE_METADATA_KEY, SessionStore
 from claw.skills.registry import SkillRegistry
 from claw.tools.base import ToolRegistry
 from claw.utils import default_timezone_name, force_utf8_stdio
@@ -88,6 +88,25 @@ def main() -> int:
     memory_store = MemoryStore(MEMORY_DIR)
     workspace_manager = WorkspaceManager()
     sandbox_manager = SandboxManager(load_sandbox_config())
+    sandbox_manager.set_session_state_store(
+        loader=lambda sid: (
+            session_store.get_metadata_flag(
+                sid,
+                SANDBOX_MODE_METADATA_KEY,
+            )
+            if session_store.exists(sid)
+            else None
+        ),
+        saver=lambda sid, enabled: (
+            session_store.set_metadata_flag(
+                sid,
+                SANDBOX_MODE_METADATA_KEY,
+                enabled,
+            )
+            if session_store.exists(sid)
+            else None
+        ),
+    )
     sandbox_manager.set_agent_backend_provider(
         lambda sid: get_session_backend(session_store, sid)
     )

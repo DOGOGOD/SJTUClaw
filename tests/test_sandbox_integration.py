@@ -14,6 +14,11 @@ from claw.sandbox.runtime import (
     _AsyncBridge,
     _BoundedCapture,
 )
+from claw.session.store import (
+    AUTO_MODE_METADATA_KEY,
+    SANDBOX_MODE_METADATA_KEY,
+    SessionStore,
+)
 from claw.tools import register_all_tools
 from claw.tools.base import ToolRegistry
 from claw.tools.base import is_workspace_violation
@@ -36,6 +41,7 @@ class FakeBackend:
         self.created: list[dict] = []
         self.stopped: list[str] = []
         self.removed_volumes: list[str] = []
+        self.shell_commands: list[str] = []
         self.closed = False
         self.alive_value = True
         self.read_limits: list[int] = []
@@ -62,6 +68,7 @@ class FakeBackend:
 
     def shell(self, sandbox, command, *, cwd, timeout):
         del timeout
+        self.shell_commands.append(command)
         marker_match = re.search(r"(__SJTUCLAW_CWD_[0-9a-f]+__)", command)
         if command.startswith("mkdir -p -- "):
             target = command.removeprefix("mkdir -p -- ").strip().strip("'")
@@ -202,6 +209,43 @@ def test_sandbox_config_defaults_to_off(monkeypatch):
 
     assert config.mode == "off"
     assert config.enabled is False
+    assert config.project_venv is True
+    assert config.stat_virtualization == "auto"
+    assert config.pip_index_url == (
+        "https://pypi.tuna.tsinghua.edu.cn/simple"
+    )
+
+
+def test_sandbox_config_rejects_invalid_project_venv_flag(monkeypatch):
+    import claw.sandbox.config as sandbox_config
+
+    monkeypatch.setattr(
+        sandbox_config,
+        "setting_value",
+        lambda name, default="": (
+            "sometimes" if name == "SANDBOX_PROJECT_VENV" else default
+        ),
+    )
+
+    with pytest.raises(ValueError, match="SANDBOX_PROJECT_VENV"):
+        sandbox_config.load_sandbox_config()
+
+
+def test_sandbox_config_rejects_invalid_stat_virtualization(monkeypatch):
+    import claw.sandbox.config as sandbox_config
+
+    monkeypatch.setattr(
+        sandbox_config,
+        "setting_value",
+        lambda name, default="": (
+            "sometimes"
+            if name == "SANDBOX_STAT_VIRTUALIZATION"
+            else default
+        ),
+    )
+
+    with pytest.raises(ValueError, match="SANDBOX_STAT_VIRTUALIZATION"):
+        sandbox_config.load_sandbox_config()
 
 
 def test_unbound_session_gets_private_persistent_workspace():
@@ -251,6 +295,89 @@ def test_stopped_microvm_is_recreated_with_the_same_private_volume():
     assert len(backend.created) == 2
     assert backend.created[1]["volume_name"] == volume
     assert backend.stopped
+
+
+def test_project_venv_is_bootstrapped_and_used_by_default_shell():
+    backend = FakeBackend()
+    manager = make_manager(backend)
+    workspace = FakeWorkspaceManager()
+
+    shell = manager.new_shell("s1", workspace)
+    result = manager.run_command("s1", workspace, "python -V", 10)
+
+    bootstrap = next(
+        command
+        for command in backend.shell_commands
+        if "SJTUCLAW_PROJECT_VENV_BOOTSTRAP" in command
+    )
+    command = backend.shell_commands[-1]
+    assert "SJTUCLAW_PROJECT_VENV_BOOTSTRAP" in bootstrap
+    assert "-m venv --without-pip --system-site-packages" in bootstrap
+    assert "project_env_sync.py" in bootstrap
+    assert "layout=sync-v1" in bootstrap
+    assert shell["projectVenv"] == "/workspace/.venv"
+    assert shell["python"] == "/opt/sjtuclaw/project-venv/bin/python"
+    assert "export VIRTUAL_ENV=/opt/sjtuclaw/project-venv" in command
+    assert "export SJTUCLAW_PROJECT_ENV=/workspace/.venv" in command
+    assert "unset PIP_PREFIX PIP_TARGET PYTHONUSERBASE" in command
+    assert 'export PATH="$VIRTUAL_ENV/bin:$PATH"' in command
+    assert "project_env_sync.py" in command
+    assert " save " in command
+    assert "pypi.tuna.tsinghua.edu.cn/simple" in command
+    assert result.ok
+
+
+def test_project_venv_can_be_disabled_for_non_python_images():
+    backend = FakeBackend()
+    manager = SandboxManager(
+        SandboxConfig(
+            mode="required",
+            image="alpine:3.21",
+            project_venv=False,
+        ),
+        backend=backend,
+    )
+    workspace = FakeWorkspaceManager()
+
+    shell = manager.new_shell("s1", workspace)
+    manager.run_command("s1", workspace, "true", 10)
+
+    assert shell["projectVenv"] is None
+    assert shell["python"] == "image default"
+    assert not any(
+        "SJTUCLAW_PROJECT_VENV_BOOTSTRAP" in command
+        for command in backend.shell_commands
+    )
+    assert "VIRTUAL_ENV" not in backend.shell_commands[-1]
+
+
+def test_project_venv_bootstrap_failure_stops_new_microvm():
+    class VenvFailBackend(FakeBackend):
+        def shell(self, sandbox, command, *, cwd, timeout):
+            if "SJTUCLAW_PROJECT_VENV_BOOTSTRAP" in command:
+                self.shell_commands.append(command)
+                return SimpleNamespace(
+                    exit_code=72,
+                    stdout_bytes=b"",
+                    stderr_bytes=b"python missing",
+                    output_limited=False,
+                )
+            return super().shell(
+                sandbox,
+                command,
+                cwd=cwd,
+                timeout=timeout,
+            )
+
+    backend = VenvFailBackend()
+    manager = make_manager(backend)
+    workspace = FakeWorkspaceManager()
+
+    with pytest.raises(SandboxError, match="python missing"):
+        manager.new_shell("s1", workspace)
+
+    assert backend.stopped
+    assert manager.status("s1", workspace)["running"] is False
 
 
 @pytest.mark.parametrize(
@@ -325,6 +452,89 @@ def test_sandbox_on_overrides_global_off_for_only_one_session():
     assert manager.status("s2", workspace)["effective"] is False
 
 
+def test_explicit_sandbox_state_survives_restart_and_fails_closed(
+    tmp_path,
+    monkeypatch,
+):
+    store = SessionStore(tmp_path / "sessions")
+    store.create_session(session_id="s1")
+    workspace = FakeWorkspaceManager()
+
+    first = make_manager(FakeBackend(), mode="off")
+    first.set_session_state_store(
+        loader=lambda sid: store.get_metadata_flag(
+            sid,
+            SANDBOX_MODE_METADATA_KEY,
+        ),
+        saver=lambda sid, enabled: store.set_metadata_flag(
+            sid,
+            SANDBOX_MODE_METADATA_KEY,
+            enabled,
+        ),
+    )
+    first.set_session_enabled("s1", True, workspace)
+
+    assert store.get_metadata_flag(
+        "s1",
+        SANDBOX_MODE_METADATA_KEY,
+    ) is True
+
+    restarted = SandboxManager(SandboxConfig(mode="off"))
+    restarted.set_session_state_store(
+        loader=lambda sid: store.get_metadata_flag(
+            sid,
+            SANDBOX_MODE_METADATA_KEY,
+        ),
+        saver=lambda sid, enabled: store.set_metadata_flag(
+            sid,
+            SANDBOX_MODE_METADATA_KEY,
+            enabled,
+        ),
+    )
+    monkeypatch.setattr(restarted, "sdk_available", lambda: False)
+
+    assert restarted.is_session_enabled("s1") is True
+    assert restarted.is_session_explicitly_enabled("s1") is True
+    with pytest.raises(SandboxError, match="拒绝回退到宿主执行"):
+        restarted.should_use("s1", workspace)
+
+
+def test_explicit_sandbox_off_overrides_auto_mode_after_restart(tmp_path):
+    store = SessionStore(tmp_path / "sessions")
+    store.create_session(session_id="s1")
+    workspace = FakeWorkspaceManager()
+
+    first = make_manager(FakeBackend(), mode="auto")
+    first.set_session_state_store(
+        loader=lambda sid: store.get_metadata_flag(
+            sid,
+            SANDBOX_MODE_METADATA_KEY,
+        ),
+        saver=lambda sid, enabled: store.set_metadata_flag(
+            sid,
+            SANDBOX_MODE_METADATA_KEY,
+            enabled,
+        ),
+    )
+    first.set_session_enabled("s1", False, workspace)
+
+    restarted = make_manager(FakeBackend(), mode="auto")
+    restarted.set_session_state_store(
+        loader=lambda sid: store.get_metadata_flag(
+            sid,
+            SANDBOX_MODE_METADATA_KEY,
+        ),
+        saver=lambda sid, enabled: store.set_metadata_flag(
+            sid,
+            SANDBOX_MODE_METADATA_KEY,
+            enabled,
+        ),
+    )
+
+    assert restarted.is_session_enabled("s1") is False
+    assert restarted.should_use("s1", workspace) is False
+
+
 def test_purge_removes_explicit_sandbox_volume_after_off_mode_restart(
     monkeypatch,
 ):
@@ -370,6 +580,56 @@ def test_gateway_new_session_defaults_sandbox_off(monkeypatch, tmp_path):
 
     assert response["sandboxMode"] is False
     assert manager.is_session_enabled(response["sessionId"]) is False
+
+
+def test_gateway_restores_persisted_auto_modes(tmp_path):
+    from claw.gateway import server
+
+    store = SessionStore(tmp_path / "sessions")
+    store.create_session(session_id="enabled")
+    store.create_session(session_id="disabled")
+    store.set_metadata_flag("enabled", AUTO_MODE_METADATA_KEY, True)
+    store.set_metadata_flag("disabled", AUTO_MODE_METADATA_KEY, False)
+
+    assert server._load_persisted_auto_modes(store) == {"enabled": True}
+
+
+def test_explicit_sandbox_blocks_switch_to_external_backend(
+    monkeypatch,
+    tmp_path,
+):
+    from claw.gateway import server
+    from claw.pi import get_session_backend
+    import claw.pi as pi_module
+
+    store = SessionStore(tmp_path / "sessions")
+    store.create_session(session_id="s1")
+    manager = make_manager(FakeBackend(), mode="off")
+    manager.set_session_state_store(
+        loader=lambda sid: store.get_metadata_flag(
+            sid,
+            SANDBOX_MODE_METADATA_KEY,
+        ),
+        saver=lambda sid, enabled: store.set_metadata_flag(
+            sid,
+            SANDBOX_MODE_METADATA_KEY,
+            enabled,
+        ),
+    )
+    manager.set_agent_backend_provider(
+        lambda sid: get_session_backend(store, sid)
+    )
+    manager.set_session_enabled("s1", True, FakeWorkspaceManager())
+
+    monkeypatch.setattr(server, "_session_store", store)
+    monkeypatch.setattr(server, "_sandbox_manager", manager)
+    monkeypatch.setattr(server, "_session_turn_active", lambda _sid: False)
+    monkeypatch.setattr(pi_module, "load_pi_config", lambda: object())
+
+    result = server._execute_slash_command("/pi on", "s1")
+
+    assert "请先使用 /sandbox off" in result
+    assert get_session_backend(store, "s1") == "sjtuclaw"
 
 
 def test_cli_sandbox_on_and_off_change_only_current_session():
@@ -479,6 +739,8 @@ def test_shell_tool_reports_hard_output_limit_and_bounds_response():
                 cwd=cwd,
                 timeout=timeout,
             )
+            if "SJTUCLAW_PROJECT_VENV_BOOTSTRAP" in command:
+                return result
             marker_tail = result.stdout_tail_bytes
             result.stdout_bytes = b"x" * (70 * 1024)
             result.stdout_tail_bytes = marker_tail

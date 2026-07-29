@@ -24,7 +24,12 @@ from claw.llm.client import LLMClient
 from claw.memory.reflection import is_valid_reflection_time
 from claw.memory.store import MemoryStore, MemoryStoreError
 from claw.sandbox import SandboxError
-from claw.session.store import SessionNotFoundError, SessionStore, SessionStoreError
+from claw.session.store import (
+    AUTO_MODE_METADATA_KEY,
+    SessionNotFoundError,
+    SessionStore,
+    SessionStoreError,
+)
 from claw.tools.base import ToolRegistry
 from claw.utils import default_timezone_name
 from claw.workspace.manager import WorkspaceManager, WorkspaceError
@@ -258,9 +263,9 @@ class RuntimeState:
         if self.auto_mode:
             self.auto_modes[self.current_session_id] = True
         else:
-            self.auto_mode = self.auto_modes.get(
+            self.auto_mode = _load_auto_mode(
                 self.current_session_id,
-                False,
+                self,
             )
 
 
@@ -609,17 +614,42 @@ def _delete_session(session_id: str, state: RuntimeState) -> str:
 
 
 def _activate_session(session_id: str, state: RuntimeState) -> None:
-    """Switch session and restore only that session's AUTO mode."""
+    """Switch session and restore only that session's persisted AUTO mode."""
     state.current_session_id = session_id
-    state.auto_mode = state.auto_modes.get(session_id, False)
+    state.auto_mode = _load_auto_mode(session_id, state)
 
 
 def _set_auto_mode(state: RuntimeState, enabled: bool) -> None:
+    if state.session_store.exists(state.current_session_id):
+        state.session_store.set_metadata_flag(
+            state.current_session_id,
+            AUTO_MODE_METADATA_KEY,
+            enabled,
+        )
     state.auto_mode = enabled
     if enabled:
         state.auto_modes[state.current_session_id] = True
     else:
         state.auto_modes.pop(state.current_session_id, None)
+
+
+def _load_auto_mode(session_id: str, state: RuntimeState) -> bool:
+    if state.auto_modes.get(session_id) is True:
+        return True
+    if not state.session_store.exists(session_id):
+        return False
+    enabled = (
+        state.session_store.get_metadata_flag(
+            session_id,
+            AUTO_MODE_METADATA_KEY,
+        )
+        is True
+    )
+    if enabled:
+        state.auto_modes[session_id] = True
+    else:
+        state.auto_modes.pop(session_id, None)
+    return enabled
 
 
 def _format_session_list(state: RuntimeState) -> str:
@@ -1010,6 +1040,11 @@ def _handle_sandbox_command(args: list[str], state: RuntimeState) -> str:
     if sub in {"status", "show"}:
         status = manager.status(sid, state.workspace_manager)
         enabled = "已开启" if status["enabled"] else "已关闭"
+        state_source = (
+            "session 持久设置"
+            if status.get("preference") is not None
+            else "配置默认值"
+        )
         availability = (
             "运行环境可用" if status["available"] else "运行环境不可用"
         )
@@ -1023,14 +1058,21 @@ def _handle_sandbox_command(args: list[str], state: RuntimeState) -> str:
             if status["workspaceKind"] == "host-mounted"
             else "sandbox 私有 workspace"
         )
+        python_environment = (
+            f"项目依赖: {status['projectVenv']}（自动同步，复用镜像通用库）\n"
+            if status.get("projectVenv")
+            else "项目依赖: 使用镜像默认环境\n"
+        )
         return (
-            f"Sandbox 状态: {enabled}（配置默认值 {status['mode']}，"
+            f"Sandbox 状态: {enabled}（{state_source}，"
+            f"配置模式 {status['mode']}，"
             f"{availability}，{running}，"
             f"{'当前生效' if status['effective'] else '当前未生效'}）\n"
             f"Agent 后端: {status['agentBackend']}（"
             f"{'已覆盖' if status['covered'] else '未覆盖'}）\n"
             f"Workspace: {kind} → {status['guestWorkspace']}\n"
             f"镜像: {status['image']}\n"
+            f"{python_environment}"
             f"网络: {status['network']}；安全策略: {status['security']}"
         )
     try:
@@ -1044,10 +1086,13 @@ def _handle_sandbox_command(args: list[str], state: RuntimeState) -> str:
     if sub == "on":
         return (
             "当前 session 的 sandbox 已开启。"
-            "原生文件和 Shell 工具将在隔离 microVM 中运行。"
+            "原生文件和 Shell 工具将在隔离 microVM 中运行；"
+            "该状态会随 session 持久保存；首次启动会创建运行 venv，"
+            "并使用 /workspace/.venv 持久化项目依赖。"
         )
     return (
         "当前 session 的 sandbox 已关闭，已停止其 microVM。"
+        "该状态会随 session 持久保存；"
         "其他 session 的 sandbox 状态不受影响。"
     )
 
@@ -1587,7 +1632,7 @@ def _handle_auto_command(
                 "- `/auto status`：查看当前状态\n\n"
                 "> AUTO 模式会自动批准 workspace 内的结构化文件写入；"
                 "Shell 命令始终需要明确审批。UNLIMITED 模式下所有危险操作"
-                "也仍需用户明确审批。"
+                "也仍需用户明确审批。AUTO 状态会随当前 session 持久保存。"
             )
         return (
             f"AUTO 模式当前{state_text}。\n\n"
@@ -1597,15 +1642,28 @@ def _handle_auto_command(
             "  /auto status  查看当前状态\n\n"
             "AUTO 模式会自动批准 workspace 内的结构化文件写入；"
             "Shell 命令始终需要明确审批。UNLIMITED 模式下所有危险操作"
-            "也仍需用户明确审批。"
+            "也仍需用户明确审批。AUTO 状态会随当前 session 持久保存。"
         )
 
     if sub in ("on", "enable", "1"):
-        _set_auto_mode(state, True)
-        return "AUTO 模式已开启。workspace 内的结构化文件写入可自动执行；Shell 命令仍需逐一审批。"
+        try:
+            _set_auto_mode(state, True)
+        except (SessionStoreError, OSError) as exc:
+            return f"[错误] AUTO 状态保存失败: {exc}"
+        return (
+            "AUTO 模式已开启并保存到当前 session。"
+            "workspace 内的结构化文件写入可自动执行；"
+            "Shell 命令仍需逐一审批。"
+        )
     elif sub in ("off", "disable", "0"):
-        _set_auto_mode(state, False)
-        return "AUTO 模式已关闭。Agent 的写操作恢复逐次审批；Shell 命令始终需要审批。"
+        try:
+            _set_auto_mode(state, False)
+        except (SessionStoreError, OSError) as exc:
+            return f"[错误] AUTO 状态保存失败: {exc}"
+        return (
+            "AUTO 模式已关闭并保存到当前 session。"
+            "Agent 的写操作恢复逐次审批；Shell 命令始终需要审批。"
+        )
 
     return (
         f"未知的 AUTO 子指令：{sub}\n"

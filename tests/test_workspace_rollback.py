@@ -14,7 +14,11 @@ from claw.cli.commands import RuntimeState, handle_command
 from claw.config import CompactionConfig
 from claw.context.compaction_worker import CompactionWorker
 from claw.llm.protocol import AgentResponse, ToolCallRequest
-from claw.session.store import SessionStore
+from claw.session.store import (
+    AUTO_MODE_METADATA_KEY,
+    SANDBOX_MODE_METADATA_KEY,
+    SessionStore,
+)
 from claw.tools.base import Tool, ToolRegistry, ToolResult
 from claw.workspace.manager import WorkspaceManager
 from claw.workspace.rollback import RollbackError, WorkspaceRollbackManager
@@ -69,6 +73,21 @@ def test_no_workspace_disables_rollback(rollback_env):
     assert rollback.status(session.session_id)["enabled"] is False
     with pytest.raises(RollbackError, match="未设置 workspace"):
         rollback.preview(session.session_id)
+
+
+def test_rollback_preserves_current_runtime_mode_preferences(rollback_env):
+    sessions, session, _, _, rollback = rollback_env
+    snapshot = session.to_snapshot_dict()
+    snapshot.setdefault("metadata", {})[AUTO_MODE_METADATA_KEY] = False
+    snapshot["metadata"][SANDBOX_MODE_METADATA_KEY] = False
+    session.metadata[AUTO_MODE_METADATA_KEY] = True
+    session.metadata[SANDBOX_MODE_METADATA_KEY] = True
+
+    rollback._restore_session(session, snapshot)
+    sessions.save(session)
+
+    assert session.metadata[AUTO_MODE_METADATA_KEY] is True
+    assert session.metadata[SANDBOX_MODE_METADATA_KEY] is True
 
 
 def test_invalid_rollback_target_is_a_user_error(rollback_env):

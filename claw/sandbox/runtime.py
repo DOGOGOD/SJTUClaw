@@ -15,6 +15,7 @@ import os
 import posixpath
 import re
 import shlex
+import struct
 import subprocess
 import threading
 import uuid
@@ -25,7 +26,9 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Coroutine, Protocol
 
 from claw.config import DATA_DIR
+from claw.paths import is_frozen
 from claw.sandbox.config import SandboxConfig
+from claw.utils import atomic_write
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +42,9 @@ _STREAM_TAIL_BYTES = 4 * 1024
 _MAX_STREAM_BYTES = 8 * 1024 * 1024
 _WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:[\\/]")
 _INVALID_EXPORT_CHARS_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_IMAGE_SUBSYSTEM_WINDOWS_GUI = 2
+_IMAGE_SUBSYSTEM_WINDOWS_CUI = 3
+_PE_SUBSYSTEM_RELATIVE_OFFSET = 68
 _WINDOWS_RESERVED_NAMES = {
     "CON", "PRN", "AUX", "NUL",
     *(f"COM{index}" for index in range(1, 10)),
@@ -48,6 +54,118 @@ _WINDOWS_RESERVED_NAMES = {
 
 class SandboxError(RuntimeError):
     """A user-actionable sandbox error."""
+
+
+def _pe_subsystem_offset(image: bytes | bytearray) -> int:
+    """Return the PE optional-header subsystem field offset."""
+    if len(image) < 64 or image[:2] != b"MZ":
+        raise SandboxError("microsandbox 的 msb.exe 不是有效的 Windows PE 文件")
+    pe_offset = struct.unpack_from("<I", image, 0x3C)[0]
+    if pe_offset + 24 > len(image) or image[pe_offset:pe_offset + 4] != b"PE\0\0":
+        raise SandboxError("microsandbox 的 msb.exe 缺少有效的 PE 文件头")
+    optional_size = struct.unpack_from("<H", image, pe_offset + 20)[0]
+    optional_offset = pe_offset + 24
+    subsystem_offset = optional_offset + _PE_SUBSYSTEM_RELATIVE_OFFSET
+    if optional_size < _PE_SUBSYSTEM_RELATIVE_OFFSET + 2:
+        raise SandboxError("microsandbox 的 msb.exe PE 可选头不完整")
+    if subsystem_offset + 2 > len(image):
+        raise SandboxError("microsandbox 的 msb.exe PE 子系统字段越界")
+    magic = struct.unpack_from("<H", image, optional_offset)[0]
+    if magic not in {0x10B, 0x20B}:
+        raise SandboxError("microsandbox 的 msb.exe PE 格式不受支持")
+    return subsystem_offset
+
+
+def _prepare_windows_gui_msb(
+    source: Path,
+    *,
+    cache_dir: Path | None = None,
+) -> Path:
+    """Cache a GUI-subsystem copy of msb.exe for the frozen desktop app.
+
+    microsandbox 0.6.x bundles ``msb.exe`` as a console application. Windows
+    therefore opens a terminal every time the native SDK launches it from our
+    windowed executable. The SDK already communicates over redirected handles,
+    so a GUI-subsystem copy preserves its protocol while preventing automatic
+    console allocation.
+    """
+    try:
+        original = source.read_bytes()
+    except OSError as exc:
+        raise SandboxError(f"无法读取 microsandbox 运行文件: {source}") from exc
+
+    subsystem_offset = _pe_subsystem_offset(original)
+    subsystem = struct.unpack_from("<H", original, subsystem_offset)[0]
+    if subsystem == _IMAGE_SUBSYSTEM_WINDOWS_GUI:
+        return source
+    if subsystem != _IMAGE_SUBSYSTEM_WINDOWS_CUI:
+        raise SandboxError(
+            f"microsandbox 的 msb.exe 使用未知的 PE 子系统类型: {subsystem}"
+        )
+
+    digest = hashlib.sha256(original).hexdigest()[:16]
+    target_dir = cache_dir or (DATA_DIR / "runtime" / "microsandbox")
+    runtime_root = target_dir / digest
+    target = runtime_root / "bin" / "msb.exe"
+    bundled_libkrunfw = source.parent.parent / "lib" / "libkrunfw.dll"
+    target_libkrunfw = runtime_root / "lib" / "libkrunfw.dll"
+    try:
+        libkrunfw = bundled_libkrunfw.read_bytes()
+    except OSError as exc:
+        raise SandboxError(
+            f"无法读取 microsandbox 虚拟机运行库: {bundled_libkrunfw}"
+        ) from exc
+
+    target_valid = False
+    if target.is_file() and target_libkrunfw.is_file():
+        try:
+            cached = target.read_bytes()
+            cached_offset = _pe_subsystem_offset(cached)
+            target_valid = (
+                struct.unpack_from("<H", cached, cached_offset)[0]
+                == _IMAGE_SUBSYSTEM_WINDOWS_GUI
+                and target_libkrunfw.stat().st_size == len(libkrunfw)
+            )
+        except (OSError, SandboxError):
+            pass
+    if target_valid:
+        return target
+
+    patched = bytearray(original)
+    struct.pack_into(
+        "<H",
+        patched,
+        subsystem_offset,
+        _IMAGE_SUBSYSTEM_WINDOWS_GUI,
+    )
+    try:
+        atomic_write(target, bytes(patched))
+        atomic_write(target_libkrunfw, libkrunfw)
+    except OSError as exc:
+        raise SandboxError(
+            f"无法创建无终端窗口的 microsandbox 运行文件: {target}"
+        ) from exc
+    return target
+
+
+def _configure_frozen_windows_microsandbox(_msb: Any) -> None:
+    """Point the native SDK at a no-console runtime in frozen Windows builds."""
+    if os.name != "nt" or not is_frozen() or os.getenv("MSB_PATH", "").strip():
+        return
+
+    from microsandbox._runtime import msb_path
+
+    bundled_msb = msb_path()
+    gui_msb = _prepare_windows_gui_msb(bundled_msb)
+    cached_libkrunfw = gui_msb.parent.parent / "lib" / "libkrunfw.dll"
+    # microsandbox's Python package initializes the native runtime path during
+    # import. Its setter is backed by a write-once cell, so trying to replace
+    # that path here is silently ignored. The native resolver checks these
+    # environment overrides on every resolution and gives them highest
+    # precedence, including after the package has already been imported.
+    os.environ["MSB_PATH"] = str(gui_msb)
+    if not os.getenv("MSB_LIBKRUNFW_PATH", "").strip():
+        os.environ["MSB_LIBKRUNFW_PATH"] = str(cached_libkrunfw)
 
 
 @dataclass(frozen=True, slots=True)
@@ -223,6 +341,14 @@ class MicrosandboxBackend:
             raise SandboxError(
                 "microsandbox 不可用。请安装 SJTUClaw 的 sandbox 可选依赖，"
                 "并确认 Windows Hypervisor Platform 已启用。"
+            ) from exc
+        try:
+            _configure_frozen_windows_microsandbox(msb)
+        except Exception as exc:
+            if isinstance(exc, SandboxError):
+                raise
+            raise SandboxError(
+                f"配置 microsandbox Windows 运行文件失败: {exc}"
             ) from exc
         self._msb = msb
         self._bridge = _AsyncBridge()
@@ -575,9 +701,16 @@ class SandboxManager:
                 return False
             from microsandbox._runtime import msb_path
 
-            executable = msb_path()
+            override = os.getenv("MSB_PATH", "").strip()
+            executable = (
+                Path(override).expanduser()
+                if override
+                else msb_path()
+            )
             if not executable.is_file():
                 return False
+            if os.name == "nt" and is_frozen() and not override:
+                executable = _prepare_windows_gui_msb(executable)
             completed = subprocess.run(
                 [str(executable), "doctor"],
                 stdin=subprocess.DEVNULL,

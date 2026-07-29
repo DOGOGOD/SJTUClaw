@@ -562,6 +562,47 @@ def test_gateway_sandbox_badge_state_is_session_scoped(monkeypatch):
     assert server._session_sandbox_mode("s2") is True
 
 
+def test_gateway_passes_effective_sandbox_to_agent_turn(monkeypatch, tmp_path):
+    import asyncio
+
+    from claw.gateway import server
+    from claw.gateway.server import ChatRequest
+
+    store = SessionStore(tmp_path / "sessions")
+    session = store.create_session(session_id="sandbox-auto")
+    store.save(session)
+    captured = {}
+
+    def fake_run_agent_turn(session_id, message, **kwargs):
+        captured.update(kwargs)
+        current = store.get(session_id)
+        current.append_message("user", message)
+        current.append_message("assistant", "done")
+        store.save(current)
+        return "done"
+
+    monkeypatch.setattr(server, "_session_store", store)
+    monkeypatch.setattr(server, "_workspace_manager", FakeWorkspaceManager())
+    monkeypatch.setattr(server, "_auto_mode", {session.session_id: True})
+    monkeypatch.setattr(server, "_llm_ready", lambda _sid: True)
+    monkeypatch.setattr(server, "_session_sandbox_mode", lambda _sid: True)
+    monkeypatch.setattr(server, "_session_backend", lambda _sid: "sjtuclaw")
+    monkeypatch.setattr(server, "_session_pi_mode", lambda _sid: False)
+    monkeypatch.setattr(server, "list_downloads", lambda: [])
+    monkeypatch.setattr(server, "auto_title_if_first_turn", lambda *args: None)
+    monkeypatch.setattr(server, "run_agent_turn", fake_run_agent_turn)
+
+    response = asyncio.run(
+        server.handle_chat(
+            ChatRequest(sessionId=session.session_id, message="run tests")
+        )
+    )
+
+    assert response["reply"] == "done"
+    assert captured["auto_mode"] is True
+    assert captured["sandbox_enabled"] is True
+
+
 def test_gateway_new_session_defaults_sandbox_off(monkeypatch, tmp_path):
     from claw.gateway import server
     from claw.session.store import SessionStore
@@ -667,6 +708,45 @@ def test_cli_sandbox_status_does_not_claim_on_demand_start_when_ineffective():
     assert "当前未生效" in result
     assert "未运行" in result
     assert "按需启动" not in result
+
+
+def test_cli_passes_effective_sandbox_to_agent_turn(monkeypatch, tmp_path):
+    from claw.cli import repl
+    from claw.cli.commands import RuntimeState
+
+    store = SessionStore(tmp_path / "sessions")
+    session = store.create_session(session_id="cli-sandbox-auto")
+    store.save(session)
+    manager = make_manager(FakeBackend(), mode="auto")
+    workspace = FakeWorkspaceManager()
+    captured = {}
+
+    def fake_run_agent_turn(_session_id, _message, **kwargs):
+        captured.update(kwargs)
+        return "done"
+
+    monkeypatch.setattr(repl, "run_agent_turn", fake_run_agent_turn)
+    monkeypatch.setattr(repl, "_maybe_auto_title", lambda *_args: None)
+    state = RuntimeState(
+        session_store=store,
+        memory_store=SimpleNamespace(),
+        llm_client=SimpleNamespace(),
+        current_session_id=session.session_id,
+        workspace_manager=workspace,
+        sandbox_manager=manager,
+        auto_mode=True,
+    )
+
+    repl._handle_chat_turn(
+        "run tests",
+        state,
+        state.llm_client,
+        SimpleNamespace(),
+        SimpleNamespace(),
+    )
+
+    assert captured["auto_mode"] is True
+    assert captured["sandbox_enabled"] is True
 
 
 def test_required_mode_rejects_session_sandbox_off():

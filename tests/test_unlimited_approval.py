@@ -8,6 +8,7 @@ Covers:
   * unlimited + auto_mode + shell tool -> approval required (forced)
   * unlimited + auto_mode + relative path -> approval required
   * non-unlimited + auto_mode + relative path -> auto-approved
+  * microsandbox + auto_mode + shell tool -> auto-approved
 - /unlimited command registration and behavior
 """
 
@@ -290,10 +291,10 @@ class TestApprovalGateEnforcement:
         assert len(tracker.calls) == 1
         assert tracker.calls[0].tool_name == "run_command"
 
-    def test_sandboxed_auto_mode_shell_tool_requires_approval(
+    def test_host_workspace_auto_mode_shell_tool_requires_approval(
         self, store, context_builder
     ):
-        """AUTO must not bypass approval for arbitrary shell interpreters."""
+        """AUTO must not bypass approval for a host shell."""
         session = store.create_session(session_id="auto-shell")
         store.save(session)
 
@@ -327,6 +328,88 @@ class TestApprovalGateEnforcement:
 
         assert len(tracker.calls) == 1
         assert tracker.calls[0].tool_name == "run_command"
+
+    def test_microsandbox_auto_mode_shell_tool_is_auto_approved(
+        self, store, context_builder
+    ):
+        """AUTO skips approval when shell execution is guaranteed in microVM."""
+        session = store.create_session(session_id="auto-microsandbox-shell")
+        store.save(session)
+
+        tools = {"run_command": _FakeTool("run_command", safety_level="shell")}
+        registry = _FakeToolRegistry(tools)
+        executed = []
+        original_execute = registry.execute_by_name
+
+        def tracking_execute(name, args):
+            executed.append((name, args))
+            return original_execute(name, args)
+
+        registry.execute_by_name = tracking_execute
+        tool_call = MagicMock()
+        tool_call.name = "run_command"
+        tool_call.args = {"command": "echo hello"}
+        client = _FakeLLMClient([
+            _FakeLLMResponse(is_tool_call=True, tool_calls=[tool_call]),
+            _FakeLLMResponse(final="done"),
+        ])
+        tracker = _ApprovalCallTracker(decision="approved")
+
+        run_agent_turn(
+            "auto-microsandbox-shell",
+            "test",
+            session_store=store,
+            context_builder=context_builder,
+            tool_registry=registry,
+            llm_client=client,
+            approval_handler=tracker,
+            auto_mode=True,
+            sandbox_enabled=True,
+            unlimited_mode=False,
+        )
+
+        assert tracker.calls == []
+        assert executed == [("run_command", {"command": "echo hello"})]
+
+    def test_microsandbox_auto_mode_needs_no_approval_channel(
+        self, store, context_builder
+    ):
+        """An auto-approved microVM command does not require a callback."""
+        session = store.create_session(session_id="auto-microsandbox-no-handler")
+        store.save(session)
+
+        tools = {"run_command": _FakeTool("run_command", safety_level="shell")}
+        registry = _FakeToolRegistry(tools)
+        executed = []
+        original_execute = registry.execute_by_name
+
+        def tracking_execute(name, args):
+            executed.append((name, args))
+            return original_execute(name, args)
+
+        registry.execute_by_name = tracking_execute
+        tool_call = MagicMock()
+        tool_call.name = "run_command"
+        tool_call.args = {"command": "pwd"}
+        client = _FakeLLMClient([
+            _FakeLLMResponse(is_tool_call=True, tool_calls=[tool_call]),
+            _FakeLLMResponse(final="done"),
+        ])
+
+        run_agent_turn(
+            "auto-microsandbox-no-handler",
+            "test",
+            session_store=store,
+            context_builder=context_builder,
+            tool_registry=registry,
+            llm_client=client,
+            approval_handler=None,
+            auto_mode=True,
+            sandbox_enabled=True,
+            unlimited_mode=False,
+        )
+
+        assert executed == [("run_command", {"command": "pwd"})]
 
     def test_unlimited_auto_mode_relative_path_requires_approval(
         self, store, context_builder

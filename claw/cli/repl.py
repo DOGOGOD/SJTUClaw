@@ -379,6 +379,14 @@ def _handle_chat_turn(
             skill_name=skill_name,
             compaction_worker=state.compaction_worker,
             auto_mode=state.auto_mode,
+            sandbox_enabled=(
+                state.sandbox_manager is not None
+                and state.workspace_manager is not None
+                and state.sandbox_manager.is_session_effective(
+                    state.current_session_id,
+                    state.workspace_manager,
+                )
+            ),
             unlimited_mode=(
                 state.workspace_manager.is_unlimited(state.current_session_id)
                 if state.workspace_manager else False

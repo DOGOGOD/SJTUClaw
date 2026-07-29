@@ -33,7 +33,7 @@
 ## 输出位置
 
 - 桌面应用目录版：`dist\SJTUClaw\SJTUClaw.exe`
-- 安装向导：`dist\installer\SJTUClaw-Setup-0.1.0.exe`
+- 安装向导：`dist\installer\SJTUClaw-Setup-0.5.0.exe`
 
 ## 运行时数据
 

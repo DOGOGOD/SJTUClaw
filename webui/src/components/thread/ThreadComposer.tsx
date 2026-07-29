@@ -201,7 +201,12 @@ export function ThreadComposer({
 
   const handleStop = useCallback(async () => {
     if (!onStop) return;
-    try { await onStop(); } catch {}
+    setSendError("");
+    try {
+      await onStop();
+    } catch (error) {
+      setSendError(error instanceof Error ? error.message : "停止任务失败，请重试。");
+    }
   }, [onStop]);
 
   const handleKeyDown = useCallback(
@@ -333,7 +338,15 @@ export function ThreadComposer({
   const handleWsUnset = async () => {
     if (!sessionId) return;
     const sid = sessionId;
-    try { await unsetWorkspace(sid); setWsPath(""); setWsDisplay(""); setWsError(""); setShowWsPicker(false); } catch {}
+    try {
+      await unsetWorkspace(sid);
+      setWsPath("");
+      setWsDisplay("");
+      setWsError("");
+      setShowWsPicker(false);
+    } catch (error) {
+      setWsError(error instanceof Error ? error.message : "取消 workspace 失败，请重试。");
+    }
   };
 
   const hasContent = value.trim().length > 0 || pendingAttachments.length > 0;

@@ -32,6 +32,16 @@ logger = logging.getLogger(__name__)
 
 SESSION_BACKEND_KEY = "agent_backend"
 _VALID_AGENT_BACKENDS = frozenset({"sjtuclaw", "pi", "claude"})
+_IS_WINDOWS = os.name == "nt"
+
+
+def _subprocess_creation_flags() -> int:
+    if not _IS_WINDOWS:
+        return 0
+    return (
+        getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    )
 
 
 class PiError(RuntimeError):
@@ -371,6 +381,8 @@ class PiAgentClient(LLMClient):
             encoding="utf-8",
             errors="replace",
             bufsize=1,
+            creationflags=_subprocess_creation_flags(),
+            start_new_session=not _IS_WINDOWS,
         )
         stderr: list[str] = []
         threading.Thread(target=self._collect_stderr, args=(proc, stderr), daemon=True).start()
@@ -544,8 +556,20 @@ class PiAgentClient(LLMClient):
                  event_callback, cancel_event, on_prompt_accepted=None) -> str:
         env = self._child_env(config)
 
-        proc = subprocess.Popen(list(command), cwd=str(config.cwd), env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", bufsize=1)
+        proc = subprocess.Popen(
+            list(command),
+            cwd=str(config.cwd),
+            env=env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            creationflags=_subprocess_creation_flags(),
+            start_new_session=not _IS_WINDOWS,
+        )
         stderr: list[str] = []
         threading.Thread(target=self._collect_stderr, args=(proc, stderr), daemon=True).start()
         stdout_events: queue.Queue[str | None] = queue.Queue()

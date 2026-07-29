@@ -112,9 +112,7 @@ describe("ThreadViewport user messages", () => {
 
     expect(view.getByRole("img", { name: "heart.png" }).getAttribute("src"))
       .toBe("/downloads/dl_demo");
-    const preview = view.getByRole("img", { name: "heart.png" }).closest("a");
-    expect(preview?.getAttribute("href")).toBe("/downloads/dl_demo");
-    expect(preview?.getAttribute("target")).toBe("_blank");
+    expect(view.getByRole("img", { name: "heart.png" }).closest("a")).toBeNull();
     const download = view.getByRole("link", { name: "下载 heart.png" });
     expect(download.getAttribute("href")).toBe("/downloads/dl_demo?download=1");
     expect(download.getAttribute("download")).toBe("heart.png");
@@ -133,12 +131,30 @@ describe("ThreadViewport user messages", () => {
     );
 
     const image = view.getByRole("img", { name: "heart.png" });
-    const preview = image.closest("a");
-    expect(preview?.getAttribute("href")).toBe("/downloads/dl_generated");
-    expect(preview?.getAttribute("target")).toBe("_blank");
+    expect(image.closest("a")).toBeNull();
     const download = view.getByRole("link", { name: "下载 heart.png" });
     expect(download.getAttribute("href")).toBe("/downloads/dl_generated?download=1");
     expect(download.getAttribute("download")).toBe("heart.png");
+  });
+
+  it("keeps a failed image inside the chat instead of opening an error page", () => {
+    const view = render(
+      <ThreadViewport
+        messages={[{
+          role: "assistant",
+          content: "![heart.png](/downloads/dl_missing)",
+        }]}
+        loading={false}
+        sessionId="session-a"
+      />
+    );
+
+    fireEvent.error(view.getByRole("img", { name: "heart.png" }));
+
+    expect(view.getByRole("status").textContent).toContain("图片暂时无法显示");
+    expect(view.queryByRole("link", { name: /无法显示/ })).toBeNull();
+    fireEvent.click(view.getByRole("button", { name: "重试" }));
+    expect(view.getByRole("img", { name: "heart.png" })).toBeTruthy();
   });
 
   it("deduplicates image and link markdown for the same download", () => {

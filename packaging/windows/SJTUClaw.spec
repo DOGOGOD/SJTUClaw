@@ -3,6 +3,7 @@
 import importlib.util
 from pathlib import Path
 
+from PyInstaller import compat
 from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 
@@ -18,6 +19,31 @@ def add_tree(name: str):
 datas = []
 binaries = []
 hiddenimports = []
+
+# Conda keeps Python's shared runtime dependencies in Library/bin. PyInstaller
+# does not reliably discover that directory when invoked with an explicit
+# interpreter (or from a venv layered on Conda), which can leave Tkinter,
+# SQLite, TLS, and compression modules unusable in the frozen app.
+if compat.is_conda:
+    conda_library_bin = Path(compat.base_prefix) / "Library" / "bin"
+    conda_runtime_patterns = (
+        "ffi*.dll",
+        "libbz2*.dll",
+        "libcrypto*.dll",
+        "libexpat*.dll",
+        "liblzma*.dll",
+        "libmpdec*.dll",
+        "libssl*.dll",
+        "sqlite3.dll",
+        "tcl*.dll",
+        "tk*.dll",
+    )
+    for pattern in conda_runtime_patterns:
+        binaries += [
+            (str(runtime_dll), ".")
+            for runtime_dll in conda_library_bin.glob(pattern)
+        ]
+
 datas += add_tree("web")
 datas += add_tree("prompts")
 datas += add_tree("skills")
@@ -26,6 +52,12 @@ for pi_extension in ("permission_gate.ts", "sjtuclaw_provider.ts", "sjtuclaw_too
     source = ROOT / "claw" / "pi" / pi_extension
     if source.exists():
         datas.append((str(source), "claw/pi"))
+# This helper is copied into the guest sandbox by filesystem path. Python
+# modules inside PyInstaller's PYZ archive cannot be read with Path.read_bytes.
+project_env_sync = ROOT / "claw" / "sandbox" / "project_env_sync.py"
+if not project_env_sync.is_file():
+    raise RuntimeError("sandbox project_env_sync.py helper is missing")
+datas.append((str(project_env_sync), "claw/sandbox"))
 if (ROOT / ".env.example").exists():
     datas.append((str(ROOT / ".env.example"), "."))
 

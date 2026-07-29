@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+import time
+
 
 def test_download_registry_is_bounded(monkeypatch, tmp_path):
     from claw.tools import download
@@ -55,6 +58,73 @@ def test_download_registry_survives_reload(tmp_path):
 
         download.configure_download_registry(registry)
         assert download.get_download(download_id) == file_path.resolve()
+    finally:
+        download.configure_download_registry(None)
+
+
+def test_download_registry_refreshes_entry_created_by_another_process(tmp_path):
+    from claw.tools import download
+
+    registry = tmp_path / "downloads" / "registry.json"
+    file_path = tmp_path / "shared.png"
+    file_path.write_bytes(b"shared-image")
+    download_id = "dl_0123456789ab"
+    try:
+        download.configure_download_registry(registry)
+        registry.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "entries": [
+                        {
+                            "downloadId": download_id,
+                            "path": str(file_path.resolve()),
+                            "createdAt": time.time(),
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        assert download.get_download(download_id) == file_path.resolve()
+    finally:
+        download.configure_download_registry(None)
+
+
+def test_register_download_merges_entries_created_by_another_process(tmp_path):
+    from claw.tools import download
+
+    registry = tmp_path / "downloads" / "registry.json"
+    external_path = tmp_path / "external.txt"
+    external_path.write_text("external", encoding="utf-8")
+    local_path = tmp_path / "local.txt"
+    local_path.write_text("local", encoding="utf-8")
+    external_id = "dl_abcdef012345"
+    try:
+        download.configure_download_registry(registry)
+        registry.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "entries": [
+                        {
+                            "downloadId": external_id,
+                            "path": str(external_path.resolve()),
+                            "createdAt": time.time(),
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        local_id = download.register_download(local_path)
+        download.configure_download_registry(None)
+        download.configure_download_registry(registry)
+
+        assert download.get_download(external_id) == external_path.resolve()
+        assert download.get_download(local_id) == local_path.resolve()
     finally:
         download.configure_download_registry(None)
 

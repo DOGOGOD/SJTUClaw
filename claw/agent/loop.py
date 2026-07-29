@@ -359,6 +359,9 @@ def _run_agent_turn_unlocked(
     auto_mode: bool = False,
 
 
+    sandbox_enabled: bool = False,
+
+
     unlimited_mode: bool = False,
 
 
@@ -438,13 +441,19 @@ def _run_agent_turn_unlocked(
         auto_mode: if True, skip approval for structured write tools while the
 
 
-            workspace sandbox remains active. Shell tools still require an
+            workspace boundary remains active. Shell tools are also
 
 
-            explicit decision because arbitrary commands cannot be reliably
+            auto-approved when ``sandbox_enabled`` guarantees microVM
 
 
-            sandboxed with lexical path checks.
+            execution.
+
+
+        sandbox_enabled: whether native file and shell tools are effectively
+
+
+            routed through microsandbox for this session.
 
 
         unlimited_mode: if True, the session is in unlimited mode. All write
@@ -493,6 +502,7 @@ def _run_agent_turn_unlocked(
             skill_registry=skill_registry, skill_source=skill_source,
             skill_name=skill_name, auto_reason=auto_reason,
             compaction_worker=compaction_worker, auto_mode=auto_mode,
+            sandbox_enabled=sandbox_enabled,
             unlimited_mode=unlimited_mode, event_callback=event_callback,
             cancel_event=cancel_event, input_event=input_event,
             rollback_message_id=_rollback_message_id,
@@ -1228,10 +1238,27 @@ def _run_agent_turn_unlocked(
                 needs_approval = _needs_approval(tc.name)
 
 
+                shell_tool = needs_approval and _is_shell_tool(tc.name)
+
+
+                # AUTO may skip shell approval only when this exact turn is
+                # guaranteed to route native tools through microsandbox.
+                # UNLIMITED always wins and keeps explicit approval.
+                force_approval = unlimited_mode or (
+                    shell_tool and not sandbox_enabled
+                )
+                auto_approved = (
+                    needs_approval and auto_mode and not force_approval
+                )
+                requires_explicit_approval = (
+                    needs_approval and not auto_approved
+                )
+
+
                 # A channel without an interactive approval mechanism must
                 # always fail closed. Otherwise remote channels could bypass
-                # the approval gate simply by omitting the callback.
-                if needs_approval and approval_handler is None:
+                # an approval that is still required by omitting the callback.
+                if requires_explicit_approval and approval_handler is None:
 
 
                     result_content = json.dumps(
@@ -1278,7 +1305,7 @@ def _run_agent_turn_unlocked(
                     continue
 
 
-                if needs_approval and approval_handler is not None:
+                if needs_approval:
 
 
                     from claw.approval.manager import ApprovalStatus
@@ -1302,27 +1329,10 @@ def _run_agent_turn_unlocked(
                     # caused intermittent approval prompts in AUTO mode.
 
 
-                    # Shell can make broad or destructive changes inside its
-                    # allowed environment. A microsandbox supplies a strong
-                    # host-isolation boundary, but it does not turn every
-                    # command into an intended change (especially for a
-                    # writable mounted workspace or public network). Shell
-                    # tools therefore still require an explicit decision.
-
-
-                    shell_tool = _is_shell_tool(tc.name)
-
-
-                    force_approval = unlimited_mode or shell_tool
-
-
-
-
-
                     if force_approval:
 
 
-                        if shell_tool:
+                        if shell_tool and not sandbox_enabled:
 
 
                             logger.warning(
@@ -1331,7 +1341,7 @@ def _run_agent_turn_unlocked(
                                 "shell tool %s requires explicit approval; "
 
 
-                                "sandbox isolation does not replace intent approval",
+                                "microsandbox is not effective for this turn",
 
 
                                 tc.name,
@@ -1361,16 +1371,12 @@ def _run_agent_turn_unlocked(
 
 
 
-                    if auto_mode and not force_approval:
+                    if auto_approved:
 
 
-                        # AUTO mode: skip approval for structured writes
-
-
-                        # within workspace.  Workspace boundary is still
-
-
-                        # enforced by the tool handlers.
+                        # AUTO mode: skip approval within the enforced
+                        # workspace boundary. Shell is included only when
+                        # microsandbox routing is effective.
 
 
                         print(f"[auto] 自动批准 {tc.name}（AUTO 模式）")

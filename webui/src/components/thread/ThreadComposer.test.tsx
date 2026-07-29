@@ -132,6 +132,42 @@ describe("ThreadComposer keyboard interactions", () => {
     expect(composer.value).toBe("");
   });
 
+  it("reports an error when stopping the active task fails", async () => {
+    const onStop = vi.fn().mockRejectedValue(new Error("停止请求失败"));
+    const view = render(
+      <ThreadComposer
+        onSend={vi.fn().mockResolvedValue(undefined)}
+        onStop={onStop}
+        sessionId="session-a"
+        sending
+      />
+    );
+
+    fireEvent.click(view.getByTitle("停止生成"));
+
+    await waitFor(() => expect(view.getByRole("alert").textContent).toBe("停止请求失败"));
+  });
+
+  it("keeps the workspace visible and reports an error when unsetting fails", async () => {
+    vi.spyOn(api, "fetchWorkspace").mockResolvedValue({
+      ok: true,
+      sessionId: "session-a",
+      workspace: "C:\\project-one",
+      isSet: true,
+    });
+    vi.spyOn(api, "unsetWorkspace").mockRejectedValue(new Error("取消失败"));
+    const view = render(
+      <ThreadComposer onSend={vi.fn().mockResolvedValue(undefined)} sessionId="session-a" />
+    );
+
+    await waitFor(() => expect(view.getByTitle("project-one")).toBeTruthy());
+    fireEvent.click(view.getByTitle("project-one"));
+    fireEvent.click(view.getByRole("button", { name: "取消" }));
+
+    await waitFor(() => expect(view.getByRole("alert").textContent).toBe("取消失败"));
+    expect(view.getByTitle("project-one")).toBeTruthy();
+  });
+
   it("does not send while an input method is composing text", () => {
     const onSend = vi.fn().mockResolvedValue(undefined);
     const view = render(<ThreadComposer onSend={onSend} sessionId="session-a" />);

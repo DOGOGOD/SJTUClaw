@@ -199,19 +199,24 @@ function MessageImage({ src, alt, sessionId }: { src?: string; alt?: string; ses
   return (
     <span className="my-2 block">
       {failed ? (
-        <a href={resolved} target="_blank" rel="noreferrer">
-          无法显示图片：{alt || src}
-        </a>
+        <span className="inline-flex items-center gap-3 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive" role="status">
+          <span>图片暂时无法显示：{alt || src}</span>
+          <button
+            type="button"
+            className="rounded-md border border-destructive/30 px-2 py-1 font-medium hover:bg-destructive/10"
+            onClick={() => setFailed(false)}
+          >
+            重试
+          </button>
+        </span>
       ) : (
-        <a href={resolved} target="_blank" rel="noreferrer" className="block no-underline">
-          <img
-            src={resolved}
-            alt={alt || "消息图片"}
-            loading="lazy"
-            onError={() => setFailed(true)}
-            className="max-h-[520px] max-w-full rounded-xl border border-border/60 object-contain shadow-sm"
-          />
-        </a>
+        <img
+          src={resolved}
+          alt={alt || "消息图片"}
+          loading="lazy"
+          onError={() => setFailed(true)}
+          className="max-h-[520px] max-w-full rounded-xl border border-border/60 object-contain shadow-sm"
+        />
       )}
       {isDownload && (
         <a

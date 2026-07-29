@@ -22,6 +22,10 @@ function responseBackend(value: { agentBackend?: AgentBackend; piMode?: boolean 
   return value.agentBackend ?? (value.piMode ? "pi" : undefined);
 }
 
+function actionErrorMessage(error: unknown, fallback: string): string {
+  return error instanceof Error && error.message ? error.message : fallback;
+}
+
 function Shell() {
   const { theme, toggle: toggleTheme } = useTheme();
   const { refreshSelectedPet } = usePetSelection();
@@ -47,6 +51,7 @@ function Shell() {
   const [rollbackEnabled, setRollbackEnabled] = useState(false);
   const [rollingBack, setRollingBack] = useState(false);
   const [workspaceRefreshToken, setWorkspaceRefreshToken] = useState(0);
+  const [actionError, setActionError] = useState("");
   const freshlyCreatedSessionRef = useRef<string | null>(null);
 
   useEffect(() => {
@@ -185,8 +190,13 @@ function Shell() {
   }, [navigateToChat, sending]);
 
   const handleDeleteSession = useCallback(async (sessionId: string) => {
-    await deleteChat(sessionId);
-    if (activeSessionId === sessionId) navigateToChat(null);
+    setActionError("");
+    try {
+      await deleteChat(sessionId);
+      if (activeSessionId === sessionId) navigateToChat(null);
+    } catch (error) {
+      setActionError(actionErrorMessage(error, "删除对话失败，请重试。"));
+    }
   }, [deleteChat, activeSessionId, navigateToChat]);
 
   const handleRenameSession = useCallback(async (sessionId: string) => {
@@ -202,7 +212,13 @@ function Shell() {
       maxLength: 100,
     });
     if (!title?.trim()) return;
-    try { await renameSession(sessionId, title.trim()); await refreshSessions(); } catch {}
+    setActionError("");
+    try {
+      await renameSession(sessionId, title.trim());
+      await refreshSessions();
+    } catch (error) {
+      setActionError(actionErrorMessage(error, "重命名失败，请重试。"));
+    }
   }, [promptDialog, refreshSessions, sessions]);
 
   const handleSend = useCallback(async (message: string, attachments: File[] = []) => {
@@ -429,7 +445,14 @@ function Shell() {
 
   const handleApprove = useCallback(async () => {
     if (!pendingApproval) return;
-    try { await approveApproval(pendingApproval.approvalId); setPendingApproval(null); } catch (e) { console.error("Approve failed", e); }
+    setActionError("");
+    try {
+      await approveApproval(pendingApproval.approvalId);
+      setPendingApproval(null);
+    } catch (error) {
+      console.error("Approve failed", error);
+      setActionError(actionErrorMessage(error, "批准操作失败，请重试。"));
+    }
   }, [pendingApproval]);
 
   const handleRejectApproval = useCallback(async () => {
@@ -443,7 +466,14 @@ function Shell() {
       maxLength: 500,
     });
     if (reason === null) return;
-    try { await rejectApproval(pendingApproval.approvalId, reason); setPendingApproval(null); } catch (e) { console.error("Reject failed", e); }
+    setActionError("");
+    try {
+      await rejectApproval(pendingApproval.approvalId, reason);
+      setPendingApproval(null);
+    } catch (error) {
+      console.error("Reject failed", error);
+      setActionError(actionErrorMessage(error, "拒绝操作失败，请重试。"));
+    }
   }, [pendingApproval, promptDialog]);
 
   const handleToggleSidebar = useCallback(() => {
@@ -575,6 +605,23 @@ function Shell() {
               <Button size="sm" onClick={handleApprove} className="px-5">批准并执行</Button>
             </div>
           </div>
+        </div>
+      )}
+
+      {actionError && (
+        <div
+          className="fixed bottom-5 left-1/2 z-[220] flex max-w-[min(92vw,560px)] -translate-x-1/2 items-center gap-3 rounded-xl border border-destructive/35 bg-popover px-4 py-3 text-sm text-destructive shadow-xl"
+          role="alert"
+        >
+          <span>{actionError}</span>
+          <button
+            type="button"
+            className="shrink-0 rounded-md px-1.5 py-0.5 text-base leading-none hover:bg-destructive/10"
+            onClick={() => setActionError("")}
+            aria-label="关闭错误提示"
+          >
+            ×
+          </button>
         </div>
       )}
     </div>

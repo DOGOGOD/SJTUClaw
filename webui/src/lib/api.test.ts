@@ -34,9 +34,9 @@ describe("API request timeouts", () => {
 
   it("does not abort a long-running chat turn after 60 seconds", async () => {
     vi.useFakeTimers();
-    let requestSignal: AbortSignal | null = null;
+    const requestState: { signal: AbortSignal | null } = { signal: null };
     vi.spyOn(globalThis, "fetch").mockImplementation((_input, init) => {
-      requestSignal = init?.signal ?? null;
+      requestState.signal = init?.signal ?? null;
       return new Promise((resolve) => {
         setTimeout(() => resolve(jsonResponse({ ok: true, messages: [] })), 61_000);
       });
@@ -45,7 +45,7 @@ describe("API request timeouts", () => {
     const request = sendMessage({ sessionId: "session-a", message: "long task" });
 
     await vi.advanceTimersByTimeAsync(60_000);
-    expect(requestSignal?.aborted).toBe(false);
+    expect(requestState.signal?.aborted).toBe(false);
 
     await vi.advanceTimersByTimeAsync(1_000);
     await expect(request).resolves.toMatchObject({ ok: true });

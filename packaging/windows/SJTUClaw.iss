@@ -1,5 +1,5 @@
 #define MyAppName "SJTUClaw"
-#define MyAppVersion "0.1.0"
+#define MyAppVersion "0.5.0"
 #define MyAppPublisher "SJTUClaw"
 #define MyAppExeName "SJTUClaw.exe"
 

@@ -1020,6 +1020,7 @@ async def _qq_message_handler(
                 approval_handler=_qq_approval_handler,
                 compaction_worker=_compaction_worker,
                 auto_mode=_auto_mode.get(session_key, False),
+                sandbox_enabled=_session_sandbox_mode(session_key),
                 unlimited_mode=_workspace_manager.is_unlimited(session_key),
                 cancel_event=cancel_event,
                 rollback_manager=_rollback_manager,
@@ -1400,6 +1401,7 @@ async def handle_chat(req: ChatRequest):
                     approval_handler=_gateway_approval_handler,
                     compaction_worker=_compaction_worker,
                     auto_mode=_auto_mode.get(sid, False),
+                    sandbox_enabled=_session_sandbox_mode(sid),
                     unlimited_mode=_workspace_manager.is_unlimited(sid),
                     event_callback=lambda event: _pet_state.handle_event(sid, event),
                     cancel_event=cancel_event,
@@ -1747,6 +1749,7 @@ async def _run_explicit_skill_command(
                     skill_name=skill_name,
                     compaction_worker=_compaction_worker,
                     auto_mode=_auto_mode.get(session_id, False),
+                    sandbox_enabled=_session_sandbox_mode(session_id),
                     unlimited_mode=_workspace_manager.is_unlimited(session_id),
                     event_callback=lambda event: _pet_state.handle_event(
                         session_id, event
@@ -3678,6 +3681,7 @@ async def handle_chat_stream(req: ChatRequest):
                 approval_handler=_gateway_approval_handler,
                 compaction_worker=_compaction_worker,
                 auto_mode=_auto_mode.get(sid, False),
+                sandbox_enabled=_session_sandbox_mode(sid),
                 unlimited_mode=_workspace_manager.is_unlimited(sid),
                 event_callback=_event_callback,
                 cancel_event=cancel_event,

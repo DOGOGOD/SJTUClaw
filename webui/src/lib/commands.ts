@@ -6,6 +6,7 @@ const SLASH_COMMANDS = new Set([
   "/cron",
   "/pet",
   "/workspace",
+  "/sandbox",
   "/rollback",
   "/approve",
   "/reject",

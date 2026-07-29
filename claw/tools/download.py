@@ -17,8 +17,11 @@ import threading
 import time
 import uuid
 from collections import OrderedDict
+from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any, Callable, Iterator
+
+from filelock import FileLock
 
 from claw.config import DATA_DIR
 from claw.tools.base import Tool, ToolResult
@@ -40,6 +43,18 @@ _downloads: OrderedDict[str, tuple[Path, float]] = OrderedDict()
 _downloads_lock = threading.Lock()
 _download_registry_path: Path | None = None
 _DOWNLOAD_ID_RE = re.compile(r"^dl_[0-9a-f]{12}$")
+
+
+@contextmanager
+def _registry_file_lock_locked() -> Iterator[None]:
+    """Serialize registry read-modify-write cycles across Gateway processes."""
+    registry_path = _download_registry_path
+    if registry_path is None:
+        yield
+        return
+    registry_path.parent.mkdir(parents=True, exist_ok=True)
+    with FileLock(str(registry_path) + ".lock", timeout=10):
+        yield
 
 
 def _prune_downloads_locked(now: float) -> bool:
@@ -116,6 +131,57 @@ def _persist_downloads_locked() -> None:
             pass
 
 
+def _reload_downloads_locked(now: float) -> bool:
+    """Refresh memory from disk and return whether disk needs normalization."""
+    registry_path = _download_registry_path
+    if registry_path is None:
+        return False
+    try:
+        payload = json.loads(registry_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        payload = {}
+    except (OSError, json.JSONDecodeError):
+        logger.exception(
+            "无法读取下载注册表，继续使用当前内存副本: %s",
+            registry_path,
+        )
+        return False
+
+    entries = payload.get("entries") if isinstance(payload, dict) else []
+    normalized: OrderedDict[str, tuple[Path, float]] = OrderedDict()
+    needs_persist = not isinstance(entries, list)
+    if isinstance(entries, list):
+        for item in entries:
+            if not isinstance(item, dict):
+                needs_persist = True
+                continue
+            download_id = str(item.get("downloadId") or "")
+            raw_path = str(item.get("path") or "")
+            try:
+                created_at = float(item.get("createdAt"))
+                path = Path(raw_path)
+            except (TypeError, ValueError, OSError):
+                needs_persist = True
+                continue
+            valid_id = bool(_DOWNLOAD_ID_RE.fullmatch(download_id))
+            is_absolute = path.is_absolute()
+            is_current = 0 <= now - created_at < _DOWNLOAD_TTL_S
+            if valid_id and is_absolute and path.is_file() and is_current:
+                normalized[download_id] = (path.resolve(), created_at)
+                continue
+            needs_persist = True
+            if (
+                valid_id
+                and is_absolute
+                and now - created_at >= _DOWNLOAD_TTL_S
+            ):
+                _remove_managed_export(path)
+
+    _downloads.clear()
+    _downloads.update(normalized)
+    return needs_persist
+
+
 def configure_download_registry(registry_path: Path | None) -> None:
     """Configure persistence and reload still-valid download entries."""
     global _download_registry_path
@@ -128,77 +194,57 @@ def configure_download_registry(registry_path: Path | None) -> None:
         _downloads.clear()
         if _download_registry_path is None:
             return
-        try:
-            payload = json.loads(
-                _download_registry_path.read_text(encoding="utf-8")
-            )
-        except FileNotFoundError:
-            payload = {}
-        except (OSError, json.JSONDecodeError):
-            logger.exception(
-                "无法读取下载注册表，将从空注册表启动: %s",
-                _download_registry_path,
-            )
-            payload = {}
-        now = time.time()
-        entries = payload.get("entries") if isinstance(payload, dict) else []
-        if isinstance(entries, list):
-            for item in entries:
-                if not isinstance(item, dict):
-                    continue
-                download_id = str(item.get("downloadId") or "")
-                raw_path = str(item.get("path") or "")
-                try:
-                    created_at = float(item.get("createdAt"))
-                    path = Path(raw_path)
-                except (TypeError, ValueError, OSError):
-                    continue
-                if (
-                    _DOWNLOAD_ID_RE.fullmatch(download_id)
-                    and path.is_absolute()
-                    and path.is_file()
-                    and 0 <= now - created_at < _DOWNLOAD_TTL_S
-                ):
-                    _downloads[download_id] = (path.resolve(), created_at)
-                elif (
-                    _DOWNLOAD_ID_RE.fullmatch(download_id)
-                    and path.is_absolute()
-                    and now - created_at >= _DOWNLOAD_TTL_S
-                ):
-                    _remove_managed_export(path)
-        _prune_downloads_locked(now)
-        _persist_downloads_locked()
+        with _registry_file_lock_locked():
+            now = time.time()
+            _reload_downloads_locked(now)
+            _prune_downloads_locked(now)
+            _persist_downloads_locked()
 
 
 def register_download(file_path: Path) -> str:
     """Create a download entry and return its id."""
     download_id = f"dl_{uuid.uuid4().hex[:12]}"
     now = time.time()
+    resolved = file_path.resolve()
+    if not resolved.is_file():
+        raise FileNotFoundError(f"下载文件不存在: {file_path}")
     with _downloads_lock:
-        _prune_downloads_locked(now)
-        _downloads[download_id] = (file_path.resolve(), now)
-        _prune_downloads_locked(now)
-        _persist_downloads_locked()
+        with _registry_file_lock_locked():
+            _reload_downloads_locked(now)
+            _prune_downloads_locked(now)
+            _downloads[download_id] = (resolved, now)
+            _prune_downloads_locked(now)
+            _persist_downloads_locked()
     return download_id
 
 
 def get_download(download_id: str) -> Path | None:
     """Return the file path for *download_id* or None."""
+    if not _DOWNLOAD_ID_RE.fullmatch(download_id):
+        return None
     now = time.time()
     with _downloads_lock:
-        if _prune_downloads_locked(now):
-            _persist_downloads_locked()
-        entry = _downloads.get(download_id)
-        return entry[0] if entry is not None else None
+        with _registry_file_lock_locked():
+            needs_persist = _reload_downloads_locked(now)
+            if _prune_downloads_locked(now):
+                needs_persist = True
+            if needs_persist:
+                _persist_downloads_locked()
+            entry = _downloads.get(download_id)
+            return entry[0] if entry is not None else None
 
 
 def list_downloads() -> dict[str, str]:
     """Return {downloadId: file_name} for all active downloads."""
     now = time.time()
     with _downloads_lock:
-        if _prune_downloads_locked(now):
-            _persist_downloads_locked()
-        return {did: entry[0].name for did, entry in _downloads.items()}
+        with _registry_file_lock_locked():
+            needs_persist = _reload_downloads_locked(now)
+            if _prune_downloads_locked(now):
+                needs_persist = True
+            if needs_persist:
+                _persist_downloads_locked()
+            return {did: entry[0].name for did, entry in _downloads.items()}
 
 
 # ---------------------------------------------------------------------------

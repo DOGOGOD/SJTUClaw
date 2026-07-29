@@ -707,6 +707,7 @@ function MemorySection() {
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState("");
+  const [status, setStatus] = useState("");
 
   const refresh = useCallback(async () => {
     setLoading(true);
@@ -722,7 +723,17 @@ function MemorySection() {
   }, []);
   useEffect(() => { refresh(); }, [refresh]);
 
-  const handleAdd = async () => { if (!input.trim()) return; try { await addMemory({ content: input.trim() }); setInput(""); refresh(); } catch {} };
+  const handleAdd = async () => {
+    if (!input.trim()) return;
+    setStatus("");
+    try {
+      await addMemory({ content: input.trim() });
+      setInput("");
+      await refresh();
+    } catch (error) {
+      setStatus(loadErrorMessage(error));
+    }
+  };
   const handleDelete = async (id: string) => {
     const confirmed = await confirmDialog({
       title: "删除记忆",
@@ -731,7 +742,13 @@ function MemorySection() {
       variant: "destructive",
     });
     if (!confirmed) return;
-    try { await deleteMemory(id); refresh(); } catch {}
+    setStatus("");
+    try {
+      await deleteMemory(id);
+      await refresh();
+    } catch (error) {
+      setStatus(loadErrorMessage(error));
+    }
   };
 
   if (loading) return <p className="text-sm text-muted-foreground/60">加载中...</p>;
@@ -748,6 +765,7 @@ function MemorySection() {
         <Input value={input} onChange={(e) => setInput(e.target.value)} placeholder="输入新的记忆内容..." onKeyDown={(e) => e.key === "Enter" && handleAdd()} />
         <Button onClick={handleAdd} size="sm" className="shrink-0">添加</Button>
       </div>
+      {status && <p className="mb-3 text-xs text-destructive" role="alert">{status}</p>}
       {memories.length === 0 && <p className="text-sm text-muted-foreground/60">暂无长期记忆</p>}
       {memories.map((m) => (
         <div key={m.id} className="flex items-start gap-3 py-3 border-b border-border/40">
@@ -783,7 +801,11 @@ function CronSection({ activeSessionId }: { activeSessionId?: string | null }) {
       if (!targetSessionId) {
         setTargetSessionId(activeSessionId || sd.sessions?.[0]?.sessionId || "default");
       }
-    } catch {} finally { setLoading(false); }
+    } catch (error) {
+      setStatus(loadErrorMessage(error));
+    } finally {
+      setLoading(false);
+    }
   }, [activeSessionId]);
   useEffect(() => { refresh(); }, [refresh]);
 
@@ -859,7 +881,16 @@ function CronSection({ activeSessionId }: { activeSessionId?: string | null }) {
           </p>
           {j.payload.kind !== "system_event" && (
             <div className="mt-1.5 flex gap-1.5">
-              <Button variant="ghost" size="sm" className="h-6 text-[10px]" onClick={async () => { try { if (j.enabled) await disableCronJob(j.id); else await enableCronJob(j.id); refresh(); } catch {} }}>{j.enabled ? "禁用" : "启用"}</Button>
+              <Button variant="ghost" size="sm" className="h-6 text-[10px]" onClick={async () => {
+                setStatus("");
+                try {
+                  if (j.enabled) await disableCronJob(j.id);
+                  else await enableCronJob(j.id);
+                  await refresh();
+                } catch (error) {
+                  setStatus(loadErrorMessage(error));
+                }
+              }}>{j.enabled ? "禁用" : "启用"}</Button>
               <Button variant="ghost" size="sm" className="h-6 text-[10px] text-destructive hover:bg-destructive/10" onClick={async () => {
                 const confirmed = await confirmDialog({
                   title: "删除定时任务",
@@ -868,7 +899,13 @@ function CronSection({ activeSessionId }: { activeSessionId?: string | null }) {
                   variant: "destructive",
                 });
                 if (!confirmed) return;
-                try { await deleteCronJob(j.id); refresh(); } catch {}
+                setStatus("");
+                try {
+                  await deleteCronJob(j.id);
+                  await refresh();
+                } catch (error) {
+                  setStatus(loadErrorMessage(error));
+                }
               }}>删除</Button>
             </div>
           )}

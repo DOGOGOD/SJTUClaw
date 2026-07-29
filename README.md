@@ -267,7 +267,7 @@ SJTUClaw 默认对写入和 Shell 等高风险工具进行审批。未启用 mic
 | 模式 | 作用 | 审批行为 | 文件系统边界 |
 |------|------|----------|--------------|
 | 默认模式 | 使用完整安全保护 | 写入和 Shell 操作逐次审批 | 绑定的 workspace，或 sandbox 私有 `/workspace` |
-| AUTO | 减少 workspace 内操作的人工确认 | 自动批准结构化文件写入；Shell 和 Skill 加载确认仍保留 | 仍严格限制在当前 workspace，越界操作由工具拒绝 |
+| AUTO | 减少 workspace 内操作的人工确认 | 自动批准结构化文件写入；microsandbox 实际生效时也自动批准其中的 Shell，宿主 Shell 和 Skill 加载确认仍保留 | 仍严格限制在当前 workspace，越界操作由工具拒绝 |
 | UNLIMITED | 解除 workspace 路径限制 | 写入、覆盖、删除和 Shell 操作始终逐次审批，AUTO 无法跳过 | 可访问 workspace 外路径 |
 
 启用或查看 AUTO 模式：
@@ -286,7 +286,7 @@ SJTUClaw 默认对写入和 Shell 等高风险工具进行审批。未启用 mic
 /unlimited status   # 查看当前 Session 的状态
 ```
 
-> AUTO 不等于取消安全边界：它只省略 workspace 沙箱内结构化文件写入的逐次审批，Shell 命令始终需要明确审批。UNLIMITED 才会解除路径边界，但不会取消危险操作审批。
+> AUTO 不等于取消安全边界：它省略 workspace 内结构化文件写入的逐次审批，并在 microsandbox 实际生效时省略 microVM 内 Shell 操作的审批；未进入 microVM 的宿主 Shell 仍需明确审批。UNLIMITED 才会解除路径边界，但不会取消危险操作审批。
 
 ### microsandbox microVM
 

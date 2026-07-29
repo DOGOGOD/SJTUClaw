@@ -234,6 +234,29 @@ def test_pi_manual_compact_uses_native_rpc_command(tmp_path, monkeypatch):
     assert "native pi summary" in result
 
 
+def test_pi_windows_processes_do_not_open_a_console(monkeypatch):
+    import claw.pi.client as pi_module
+
+    monkeypatch.setattr(pi_module, "_IS_WINDOWS", True)
+    monkeypatch.setattr(
+        pi_module.subprocess,
+        "CREATE_NEW_PROCESS_GROUP",
+        0x0200,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        pi_module.subprocess,
+        "CREATE_NO_WINDOW",
+        0x08000000,
+        raising=False,
+    )
+
+    flags = pi_module._subprocess_creation_flags()
+
+    assert flags & 0x0200
+    assert flags & 0x08000000
+
+
 def test_pi_uses_session_bound_workspace_as_process_cwd(tmp_path, monkeypatch):
     configured = _runtime(tmp_path, _ERROR_PI)
     monkeypatch.setattr("claw.pi.client.load_pi_config", lambda: configured)

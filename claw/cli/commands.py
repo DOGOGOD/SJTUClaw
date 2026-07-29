@@ -199,7 +199,7 @@ _HELP_MARKDOWN = """# SJTUClaw 可用指令
 - `/claude on`：自动检索本机 Claude Code 并为当前 session 启用
 - `/claude off`：仅将当前 session 切回 SJTUClaw 原生后端
 
-> **安全提示：** AUTO 模式只会自动批准 workspace 内的结构化文件写入；Shell 命令始终需要明确审批。UNLIMITED 模式下所有写入、覆盖、删除和 Shell 操作也都需要明确审批。
+> **安全提示：** AUTO 模式会自动批准 workspace 内的结构化文件写入；microsandbox 实际生效时也会自动批准其中的 Shell 操作，宿主 Shell 仍需明确审批。UNLIMITED 模式下所有写入、覆盖、删除和 Shell 操作都需要明确审批。
 
 ## Skill 管理
 
@@ -249,7 +249,7 @@ class RuntimeState:
     rollback_manager: WorkspaceRollbackManager | None = None
     # Track the current pending approval for the active agent turn
     pending_approval_id: str | None = None
-    # AUTO mode — skip approval for structured workspace writes only
+    # AUTO mode — skip workspace writes and effective microsandbox shell approval
     auto_mode: bool = False
     # AUTO is session-scoped. Sharing this mapping across command invocations
     # prevents a privileged mode from leaking when the user switches sessions.
@@ -1631,7 +1631,8 @@ def _handle_auto_command(
                 "- `/auto off`：关闭 AUTO 模式\n"
                 "- `/auto status`：查看当前状态\n\n"
                 "> AUTO 模式会自动批准 workspace 内的结构化文件写入；"
-                "Shell 命令始终需要明确审批。UNLIMITED 模式下所有危险操作"
+                "microsandbox 实际生效时也会自动批准其中的 Shell 操作，"
+                "宿主 Shell 仍需明确审批。UNLIMITED 模式下所有危险操作"
                 "也仍需用户明确审批。AUTO 状态会随当前 session 持久保存。"
             )
         return (
@@ -1641,7 +1642,8 @@ def _handle_auto_command(
             "  /auto off     关闭 AUTO 模式\n"
             "  /auto status  查看当前状态\n\n"
             "AUTO 模式会自动批准 workspace 内的结构化文件写入；"
-            "Shell 命令始终需要明确审批。UNLIMITED 模式下所有危险操作"
+            "microsandbox 实际生效时也会自动批准其中的 Shell 操作，"
+            "宿主 Shell 仍需明确审批。UNLIMITED 模式下所有危险操作"
             "也仍需用户明确审批。AUTO 状态会随当前 session 持久保存。"
         )
 
@@ -1653,7 +1655,8 @@ def _handle_auto_command(
         return (
             "AUTO 模式已开启并保存到当前 session。"
             "workspace 内的结构化文件写入可自动执行；"
-            "Shell 命令仍需逐一审批。"
+            "microsandbox 实际生效时其中的 Shell 命令也可自动执行，"
+            "宿主 Shell 仍需逐一审批。"
         )
     elif sub in ("off", "disable", "0"):
         try:
@@ -1662,7 +1665,7 @@ def _handle_auto_command(
             return f"[错误] AUTO 状态保存失败: {exc}"
         return (
             "AUTO 模式已关闭并保存到当前 session。"
-            "Agent 的写操作恢复逐次审批；Shell 命令始终需要审批。"
+            "Agent 的写入和 Shell 操作恢复逐次审批。"
         )
 
     return (

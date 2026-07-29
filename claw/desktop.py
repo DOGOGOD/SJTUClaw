@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import os
 import socket
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
 import webbrowser
 import traceback
 from pathlib import Path
@@ -34,16 +37,23 @@ def _choose_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def _wait_until_ready(url: str, timeout_s: float = 20.0) -> None:
-    import urllib.request
-
+def _wait_until_ready(
+    url: str,
+    timeout_s: float = 20.0,
+    *,
+    server_thread: threading.Thread | None = None,
+) -> None:
+    """Wait for the local Gateway or fail before opening the desktop window."""
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
+        if server_thread is not None and not server_thread.is_alive():
+            raise RuntimeError("本地 Gateway 启动进程已意外退出。")
         try:
             with urllib.request.urlopen(url, timeout=0.5):
                 return
-        except Exception:
-                time.sleep(0.2)
+        except (OSError, urllib.error.URLError):
+            time.sleep(0.2)
+    raise TimeoutError(f"本地 Gateway 在 {timeout_s:g} 秒内未能启动。")
 
 
 def _log_path() -> Path:
@@ -60,21 +70,54 @@ def _log(message: str) -> None:
         pass
 
 
-def _run_server(host: str, port: int) -> None:
+def _show_startup_error(message: str) -> None:
+    """Show a visible error for the windowless Windows desktop executable."""
+    if os.name != "nt":
+        return
     try:
-        config = uvicorn.Config(
-            "claw.gateway.server:app",
-            host=host,
-            port=port,
-            log_level="warning",
-            log_config=None,
-            access_log=False,
+        ctypes.windll.user32.MessageBoxW(
+            None,
+            message,
+            "SJTUClaw 启动失败",
+            0x10,
         )
-        server = uvicorn.Server(config)
+    except (AttributeError, OSError):
+        pass
+
+
+def _create_server(host: str, port: int) -> uvicorn.Server:
+    config = uvicorn.Config(
+        "claw.gateway.server:app",
+        host=host,
+        port=port,
+        log_level="warning",
+        log_config=None,
+        access_log=False,
+        timeout_graceful_shutdown=5,
+    )
+    return uvicorn.Server(config)
+
+
+def _run_server(server: uvicorn.Server) -> None:
+    try:
         server.run()
     except Exception:
         _log(traceback.format_exc())
         raise
+
+
+def _stop_server(
+    server: uvicorn.Server,
+    thread: threading.Thread,
+    *,
+    timeout_s: float = 7.0,
+) -> None:
+    """Stop the Gateway so its lifespan cleanup also closes child processes."""
+    server.should_exit = True
+    if thread.is_alive() and thread is not threading.current_thread():
+        thread.join(timeout=timeout_s)
+    if thread.is_alive():
+        _log(f"Gateway did not stop within {timeout_s:g} seconds.")
 
 
 def _window_icon_path() -> str | None:
@@ -108,6 +151,71 @@ def _run_window(url: str) -> None:
     webview.start(icon=_window_icon_path())
 
 
+def _run_sandbox_self_test(report_path: Path, workspace: Path) -> int:
+    """Run one real frozen sandbox tool command and persist a QA report."""
+    import json
+    import uuid
+    from dataclasses import replace
+
+    from claw.sandbox import SandboxManager, load_sandbox_config
+    from claw.utils import atomic_write
+
+    class _Workspace:
+        def get(self, _session_id: str) -> Path:
+            return workspace
+
+        def is_unlimited(self, _session_id: str) -> bool:
+            return False
+
+    workspace.mkdir(parents=True, exist_ok=True)
+    session_id = f"desktop-self-test-{uuid.uuid4().hex}"
+    manager: SandboxManager | None = None
+    report: dict[str, object] = {"ok": False}
+    exit_code = 1
+    try:
+        config = replace(load_sandbox_config(), mode="required")
+        manager = SandboxManager(config)
+        manager.set_agent_backend_provider(lambda _sid: "sjtuclaw")
+        shell = manager.new_shell(session_id, _Workspace())
+        result = manager.run_command(
+            session_id,
+            _Workspace(),
+            "printf 'frozen-tool-ok\\n'",
+            60,
+        )
+        if not result.ok or "frozen-tool-ok" not in result.stdout:
+            raise RuntimeError(result.stderr or f"命令退出码 {result.exit_code}")
+        import microsandbox._microsandbox as native_msb
+
+        report = {
+            "ok": True,
+            "runtime": native_msb.resolved_msb_path(),
+            "shell": shell,
+            "stdout": result.stdout,
+        }
+        exit_code = 0
+    except BaseException as exc:
+        report = {
+            "ok": False,
+            "errorType": type(exc).__name__,
+            "error": str(exc),
+            "traceback": traceback.format_exc(),
+        }
+    finally:
+        if manager is not None:
+            try:
+                manager.purge_session(session_id)
+                manager.close_all()
+            except Exception:
+                report["cleanupError"] = traceback.format_exc()
+                exit_code = 1
+        atomic_write(
+            report_path,
+            json.dumps(report, ensure_ascii=False, indent=2),
+        )
+    return exit_code
+
+
 def main() -> int:
     force_utf8_stdio()
     # The packaged app's default agent directory must exist before the first
@@ -116,6 +224,16 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="SJTUClaw desktop launcher")
     parser.add_argument("--pet", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--server-only", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--sandbox-self-test-report",
+        type=Path,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--sandbox-self-test-workspace",
+        type=Path,
+        help=argparse.SUPPRESS,
+    )
     args, _ = parser.parse_known_args()
     if args.pet:
         # Keep the Tk-based pet isolated from the main desktop launcher.
@@ -125,6 +243,15 @@ def main() -> int:
 
         sys.argv = [sys.argv[0], *(arg for arg in sys.argv[1:] if arg != "--pet")]
         return pet_main()
+    if args.sandbox_self_test_report:
+        workspace = (
+            args.sandbox_self_test_workspace
+            or user_root() / "data" / "sandbox-self-test"
+        )
+        return _run_sandbox_self_test(
+            args.sandbox_self_test_report.resolve(),
+            workspace.resolve(),
+        )
 
     host = "127.0.0.1"
     port = _choose_port()
@@ -132,15 +259,26 @@ def main() -> int:
     os.environ["GATEWAY_PORT"] = str(port)
     url = f"http://{host}:{port}"
     _log(f"Starting SJTUClaw desktop gateway at {url}")
+    server = _create_server(host, port)
 
     if args.server_only:
-        _run_server(host, port)
+        _run_server(server)
         return 0
 
-    thread = threading.Thread(target=_run_server, args=(host, port), daemon=True)
+    thread = threading.Thread(target=_run_server, args=(server,), daemon=True)
     thread.start()
-    _wait_until_ready(url)
-    _run_window(url)
+    try:
+        _wait_until_ready(url, server_thread=thread)
+    except (RuntimeError, TimeoutError) as exc:
+        message = f"{exc}\n请查看日志：{_log_path()}"
+        _log(message)
+        _show_startup_error(message)
+        _stop_server(server, thread)
+        return 1
+    try:
+        _run_window(url)
+    finally:
+        _stop_server(server, thread)
     return 0
 
 

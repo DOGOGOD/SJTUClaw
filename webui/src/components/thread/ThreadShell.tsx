@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Bot, PanelLeft, Moon, Sun, ShieldCheck, Zap } from "lucide-react";
+import { Bot, Box, PanelLeft, Moon, Sun, ShieldCheck, Zap } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ThreadViewport } from "./ThreadViewport";
 import { ThreadComposer } from "./ThreadComposer";
@@ -13,6 +13,7 @@ interface ThreadShellProps {
   loading: boolean;
   sending: boolean;
   autoMode?: boolean;
+  sandboxMode?: boolean;
   unlimitedMode?: boolean;
   piMode?: boolean;
   agentBackend?: AgentBackend;
@@ -31,11 +32,13 @@ interface ThreadShellProps {
 
 export function SessionModeBadges({
   autoMode,
+  sandboxMode = false,
   unlimitedMode,
   piMode,
   agentBackend,
 }: {
   autoMode: boolean;
+  sandboxMode?: boolean;
   unlimitedMode: boolean;
   piMode: boolean;
   agentBackend?: AgentBackend;
@@ -46,6 +49,15 @@ export function SessionModeBadges({
       {autoMode && (
         <span className="flex shrink-0 items-center gap-1 rounded-lg border border-primary/20 bg-primary/10 px-2 py-1 text-[10px] font-semibold text-primary">
           <Zap className="h-3 w-3" /> Auto
+        </span>
+      )}
+      {sandboxMode && (
+        <span
+          data-testid="sandbox-mode-badge"
+          className="flex shrink-0 items-center gap-1 rounded-lg border border-emerald-500/25 bg-emerald-500/10 px-2 py-1 text-[10px] font-semibold text-emerald-700 dark:text-emerald-300"
+          title="当前会话的原生文件和 Shell 工具运行在隔离 microVM 中"
+        >
+          <Box className="h-3 w-3" /> Sandbox
         </span>
       )}
       {unlimitedMode && (
@@ -86,6 +98,7 @@ export function ThreadShell({
   onToggleSidebar,
   onToggleTheme,
   autoMode = false,
+  sandboxMode = false,
   unlimitedMode = false,
   piMode = false,
   agentBackend,
@@ -193,6 +206,7 @@ export function ThreadShell({
           </h1>
           <SessionModeBadges
             autoMode={autoMode}
+            sandboxMode={sandboxMode}
             unlimitedMode={unlimitedMode}
             piMode={piMode}
             agentBackend={agentBackend}

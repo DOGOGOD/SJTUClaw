@@ -1302,16 +1302,12 @@ def _run_agent_turn_unlocked(
                     # caused intermittent approval prompts in AUTO mode.
 
 
-                    # Shell languages can expand variables, invoke nested
-
-
-                    # interpreters and access devices in ways that lexical
-
-
-                    # path checks cannot sandbox reliably. Shell tools always
-
-
-                    # require an explicit decision, even in AUTO mode.
+                    # Shell can make broad or destructive changes inside its
+                    # allowed environment. A microsandbox supplies a strong
+                    # host-isolation boundary, but it does not turn every
+                    # command into an intended change (especially for a
+                    # writable mounted workspace or public network). Shell
+                    # tools therefore still require an explicit decision.
 
 
                     shell_tool = _is_shell_tool(tc.name)
@@ -1335,7 +1331,7 @@ def _run_agent_turn_unlocked(
                                 "shell tool %s requires explicit approval; "
 
 
-                                "AUTO mode cannot safely sandbox a shell",
+                                "sandbox isolation does not replace intent approval",
 
 
                                 tc.name,

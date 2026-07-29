@@ -27,7 +27,12 @@ sjtuclaw-desktop = "claw.desktop:main"
 
 [project.optional-dependencies]
 desktop = ["pywebview>=5.0"]
-build = ["pyinstaller>=6.0", "pywebview>=5.0"]
+sandbox = ["microsandbox>=0.6.7,<0.7"]
+build = [
+    "pyinstaller>=6.0",
+    "pywebview>=5.0",
+    "microsandbox>=0.6.7,<0.7",
+]
 
 [build-system]
 requires = ["setuptools>=75", "wheel"]

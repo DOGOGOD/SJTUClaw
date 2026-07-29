@@ -24,6 +24,7 @@ def register_all_tools(
     registry: ToolRegistry,
     *,
     workspace_manager=None,
+    sandbox_manager=None,
     session_id_provider=None,
     sessions_dir=None,
     include_skill_tool: bool = False,
@@ -44,6 +45,8 @@ def register_all_tools(
         registry: the ``ToolRegistry`` to populate.
         workspace_manager: ``WorkspaceManager`` instance (required for
             write/shell/download/attachment tools).
+        sandbox_manager: optional ``SandboxManager``. When active, native
+            file and shell tools share a per-session microVM.
         session_id_provider: zero-arg callable returning the current
             session id (required for workspace-aware tools).
         sessions_dir: ``Path`` to the sessions directory (required for
@@ -57,7 +60,12 @@ def register_all_tools(
     from claw.tools.readonly import register_all_readonly
     from claw.tools.web import register_web_tools
 
-    register_all_readonly(registry, workspace_manager, session_id_provider)
+    register_all_readonly(
+        registry,
+        workspace_manager,
+        session_id_provider,
+        sandbox_manager,
+    )
     # Network tools are read-only and do not depend on a workspace.  They are
     # enabled by default and can be disabled with WEB_TOOL_ENABLED=false.
     register_web_tools(registry)
@@ -105,26 +113,41 @@ def register_all_tools(
     from claw.tools.attachment import create_copy_attachment_tool
 
     registry.register(
-        create_create_file_tool(workspace_manager, session_id_provider)
+        create_create_file_tool(
+            workspace_manager, session_id_provider, sandbox_manager
+        )
     )
     registry.register(
-        create_overwrite_file_tool(workspace_manager, session_id_provider)
+        create_overwrite_file_tool(
+            workspace_manager, session_id_provider, sandbox_manager
+        )
     )
     registry.register(
-        create_edit_file_tool(workspace_manager, session_id_provider)
+        create_edit_file_tool(
+            workspace_manager, session_id_provider, sandbox_manager
+        )
     )
     registry.register(
-        create_new_shell_tool(workspace_manager, session_id_provider)
+        create_new_shell_tool(
+            workspace_manager, session_id_provider, sandbox_manager
+        )
     )
     registry.register(
-        create_run_command_tool(workspace_manager, session_id_provider)
+        create_run_command_tool(
+            workspace_manager, session_id_provider, sandbox_manager
+        )
     )
     registry.register(
-        create_download_tool(workspace_manager, session_id_provider)
+        create_download_tool(
+            workspace_manager, session_id_provider, sandbox_manager
+        )
     )
     if sessions_dir is not None:
         registry.register(
             create_copy_attachment_tool(
-                workspace_manager, session_id_provider, sessions_dir
+                workspace_manager,
+                session_id_provider,
+                sessions_dir,
+                sandbox_manager,
             )
         )

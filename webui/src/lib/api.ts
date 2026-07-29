@@ -90,7 +90,7 @@ export async function fetchSessions(): Promise<{ ok: boolean; sessions: import("
   return request("/sessions");
 }
 
-export async function createSession(): Promise<{ ok: boolean; sessionId: string; title: string; piMode?: boolean; agentBackend?: import("@/lib/types").AgentBackend }> {
+export async function createSession(): Promise<{ ok: boolean; sessionId: string; title: string; sandboxMode?: boolean; piMode?: boolean; agentBackend?: import("@/lib/types").AgentBackend }> {
   return request("/sessions", { method: "POST", body: "{}" });
 }
 
@@ -109,7 +109,7 @@ export async function renameSession(sessionId: string, title: string): Promise<{
 
 export async function fetchMessages(sessionId: string): Promise<{
   ok: boolean; sessionId: string; messages: import("@/lib/types").ChatMessage[]; summary: string;
-  autoMode?: boolean; unlimitedMode?: boolean; piMode?: boolean; agentBackend?: import("@/lib/types").AgentBackend; rollback?: import("@/lib/types").RollbackStatus;
+  autoMode?: boolean; sandboxMode?: boolean; unlimitedMode?: boolean; piMode?: boolean; agentBackend?: import("@/lib/types").AgentBackend; rollback?: import("@/lib/types").RollbackStatus;
 }> {
   return request(`/sessions/${encodeURIComponent(sessionId)}/messages`);
 }
@@ -215,6 +215,7 @@ export async function sendCommand(data: { sessionId: string; command: string }):
   actions?: string[];
   switchToSessionId?: string;
   autoMode?: boolean;
+  sandboxMode?: boolean;
   unlimitedMode?: boolean;
   piMode?: boolean;
   agentBackend?: import("@/lib/types").AgentBackend;

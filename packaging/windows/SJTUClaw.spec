@@ -1,8 +1,9 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+import importlib.util
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_submodules
+from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 
 ROOT = Path(SPECPATH).parents[1]
@@ -15,6 +16,8 @@ def add_tree(name: str):
 
 
 datas = []
+binaries = []
+hiddenimports = []
 datas += add_tree("web")
 datas += add_tree("prompts")
 datas += add_tree("skills")
@@ -26,7 +29,33 @@ for pi_extension in ("permission_gate.ts", "sjtuclaw_provider.ts", "sjtuclaw_too
 if (ROOT / ".env.example").exists():
     datas.append((str(ROOT / ".env.example"), "."))
 
-hiddenimports = []
+# The wheel bundles its native extension, msb and libkrunfw.
+sandbox_datas, sandbox_binaries, sandbox_hiddenimports = collect_all(
+    "microsandbox",
+    on_error="raise",
+)
+native_sandbox_spec = importlib.util.find_spec("microsandbox._microsandbox")
+if (
+    native_sandbox_spec is None
+    or native_sandbox_spec.origin is None
+    or not Path(native_sandbox_spec.origin).is_file()
+):
+    raise RuntimeError("microsandbox native extension is not installed")
+required_sandbox_files = {"msb.exe", "libkrunfw.dll"}
+collected_sandbox_files = {
+    Path(source).name
+    for source, _destination in sandbox_datas + sandbox_binaries
+}
+missing_sandbox_files = required_sandbox_files - collected_sandbox_files
+if missing_sandbox_files:
+    raise RuntimeError(
+        "microsandbox runtime collection is incomplete; missing: "
+        + ", ".join(sorted(missing_sandbox_files))
+    )
+datas += sandbox_datas
+binaries += sandbox_binaries
+hiddenimports += sandbox_hiddenimports
+
 hiddenimports += collect_submodules("uvicorn")
 hiddenimports += collect_submodules("webview")
 hiddenimports += [
@@ -50,7 +79,7 @@ excludes = [
 a = Analysis(
     [str(ROOT / "claw" / "desktop.py")],
     pathex=[str(ROOT)],
-    binaries=[],
+    binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],

@@ -18,6 +18,7 @@ SJTUClaw 将多轮对话、工具调用、长期记忆、Skill、定时任务和
 - **可选 Pi Agent 后端**：通过官方 JSONL RPC 接入 Pi，保留其模型提供商、工具循环、Skills、Extensions、自动压缩、重试和持久会话，同时沿用 SJTUClaw 的界面、渠道与审批体验。
 - **可选 Claude Code 后端**：自动检索电脑中已安装的 Claude Code，保留原生 prompt，并沿用现有登录、模型、Skills、MCP 和权限配置，通过官方 `stream-json` 接口保留工具循环、持久会话、危险操作审批与停止控制。
 - **工具调用与安全审批**：支持文件读写、Shell、联网、下载、记忆、Skill 和 Cron 工具，并按安全级别控制执行。
+- **可选 microVM 沙箱**：原生 Agent 可通过 microsandbox 在 session 级 microVM 中共享文件与 Shell；未设置 workspace 时自动获得私有 `/workspace`，设置后只挂载明确绑定的目录。
 - **可控执行模式**：提供按 Session 隔离的 AUTO 与 UNLIMITED 模式，可在自动执行效率和文件系统安全边界之间明确切换。
 - **上下文与长期记忆**：支持 Session 持久化、上下文压缩、Markdown 记忆和每日 Reflection。
 - **Workspace 回退**：设置 workspace 后自动创建逐回合检查点，同时恢复文件和对话；未设置 workspace 时保持关闭。
@@ -47,6 +48,7 @@ SJTUClaw/
 │   ├── pet/                      # 桌面宠物进程、状态与资源管理
 │   ├── pi/                       # 可选 Pi Agent RPC 客户端与工具桥接
 │   ├── scheduler/                # Cron、Heartbeat、任务分发与状态持久化
+│   ├── sandbox/                  # microsandbox 配置、生命周期与文件/Shell 适配
 │   ├── session/                  # Session/Message 模型、标题与 JSONL Store
 │   ├── skills/                   # Skill Registry、安装、统计与状态管理
 │   ├── tools/                    # 文件、Shell、网页、附件、Memory、Cron、Skill 等工具
@@ -141,6 +143,8 @@ sjtuclaw setup
 ```
 
 也可以复制 `.env.example` 为 `.env` 手动配置。
+如需 microVM 隔离，改用 `python -m pip install -e ".[sandbox]"`，并在 Windows
+启用 Windows Hypervisor Platform。
 
 #### 切换 Agent 后端
 
@@ -244,11 +248,15 @@ JSON 数字，例如 `2`，不能写成字符串 `"2"`。
 
 ### AUTO 与 UNLIMITED 模式
 
-SJTUClaw 默认对写入和 Shell 等高风险工具进行审批，并将文件及命令操作限制在当前 Session 绑定的 workspace 内。AUTO 和 UNLIMITED 是两个相互独立、按 Session 生效的执行模式；新建 Session 时二者默认均为关闭状态，Gateway 重启后也会恢复为关闭状态。
+SJTUClaw 默认对写入和 Shell 等高风险工具进行审批。未启用 microsandbox 时，
+文件及命令操作限制在当前 Session 绑定的 workspace 内；启用后由 microVM
+承载绑定目录或 session 私有 workspace。AUTO 和 UNLIMITED 是两个相互独立、
+按 Session 生效的审批/路径模式；新建 Session 时二者默认均为关闭状态，
+Gateway 重启后也会恢复为关闭状态。
 
 | 模式 | 作用 | 审批行为 | 文件系统边界 |
 |------|------|----------|--------------|
-| 默认模式 | 使用完整安全保护 | 写入和 Shell 操作逐次审批 | 仅允许访问当前 workspace |
+| 默认模式 | 使用完整安全保护 | 写入和 Shell 操作逐次审批 | 绑定的 workspace，或 sandbox 私有 `/workspace` |
 | AUTO | 减少 workspace 内操作的人工确认 | 自动批准结构化文件写入；Shell 和 Skill 加载确认仍保留 | 仍严格限制在当前 workspace，越界操作由工具拒绝 |
 | UNLIMITED | 解除 workspace 路径限制 | 写入、覆盖、删除和 Shell 操作始终逐次审批，AUTO 无法跳过 | 可访问 workspace 外路径 |
 
@@ -269,6 +277,22 @@ SJTUClaw 默认对写入和 Shell 等高风险工具进行审批，并将文件�
 ```
 
 > AUTO 不等于取消安全边界：它只省略 workspace 沙箱内结构化文件写入的逐次审批，Shell 命令始终需要明确审批。UNLIMITED 才会解除路径边界，但不会取消危险操作审批。
+
+### microsandbox microVM
+
+安装 `sandbox` 可选依赖后，默认 `SANDBOX_MODE=off`，新 session 不会自动启动
+microVM；可使用 `/sandbox on` 为当前 session 开启。设置 `SANDBOX_MODE=auto`
+后，SJTUClaw 原生 Agent 的文件、Shell、附件和下载工具会共享同一 session
+microVM。未绑定 workspace 时使用持久化私有卷；绑定后只把该目录挂载为 guest
+`/workspace`。如需保证绝不回退到宿主执行，设置 `SANDBOX_MODE=required`；
+该模式禁止 UNLIMITED，并拒绝使用尚未纳入 microVM 的 Pi / Claude Code 后端。
+
+使用 `/sandbox status` 查看当前状态，使用 `/sandbox on` 或 `/sandbox off`
+单独控制当前 session；其他 session 不受影响。关闭会停止当前 microVM，但保留
+其私有 workspace 数据；开关覆盖在应用重启后恢复配置默认值，`required` 模式
+不允许关闭。详细配置和架构见
+[配置说明](docs/configuration.md) 与
+[sandbox 接入架构](docs/sandbox-architecture.md)。
 
 ### Workspace 回退
 

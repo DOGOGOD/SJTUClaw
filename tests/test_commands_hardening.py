@@ -57,6 +57,7 @@ def test_empty_command_is_handled_without_exception(tmp_path):
         ("/session", ("/session new", "/session delete <sessionId>")),
         ("/memory", ("/memory add", "/memory status")),
         ("/workspace", ("/workspace set <路径>", "/workspace unset")),
+        ("/sandbox", ("/sandbox on", "/sandbox off")),
         ("/skill", ("/skill list", "/skill <skill-name> <任务描述>")),
         ("/reflect", ("/reflect status", "/reflect now")),
         ("/cron", ("/cron list", "/cron delete <jobId>")),
@@ -81,6 +82,40 @@ def test_namespace_help_is_formatted_for_webui_markdown(tmp_path):
     assert "- `/skill list`：列出可用 Skills 及其简介" in result
     assert "- `/skill show <skill-name>`：查看指定 Skill 的详细说明" in result
     assert "**用法：** ``" not in result
+
+
+def test_help_describes_sandbox_commands_and_workspace_behavior(tmp_path):
+    state = _state(tmp_path)
+
+    plain = handle_command("/help", state)
+    markdown = handle_command("/help", state, markdown=True)
+
+    for result in (plain, markdown):
+        assert "/sandbox status" in result
+        assert "/sandbox on" in result
+        assert "/sandbox off" in result
+        assert "/sandbox reset" not in result
+        assert "私有" in result
+        assert "/workspace" in result
+        assert "明确绑定的目录" in result
+
+
+def test_bare_sandbox_command_shows_subcommand_help(tmp_path):
+    result = handle_command("/sandbox", _state(tmp_path))
+
+    assert result.startswith("用法:")
+    assert "/sandbox status" in result
+    assert "/sandbox on" in result
+    assert "/sandbox off" in result
+    assert "/sandbox reset" not in result
+    assert "Sandbox 模式:" not in result
+
+
+@pytest.mark.parametrize("command", ["/sandbox help", "/sandbox ?"])
+def test_sandbox_does_not_expose_help_aliases(tmp_path, command):
+    result = handle_command(command, _state(tmp_path))
+
+    assert result.startswith("未知 /sandbox 子命令")
 
 
 def test_unknown_namespace_subcommand_includes_available_commands(tmp_path):
@@ -273,6 +308,10 @@ def test_active_turn_guard_covers_mutating_commands():
     assert _mutating_command_session("/rollback undo", "s1") == "s1"
     assert _mutating_command_session("/session delete s2", "s1") == "s2"
     assert _mutating_command_session("/workspace show", "s1") is None
+    assert _mutating_command_session("/sandbox status", "s1") is None
+    assert _mutating_command_session("/sandbox on", "s1") == "s1"
+    assert _mutating_command_session("/sandbox off", "s1") == "s1"
+    assert _mutating_command_session("/sandbox reset", "s1") is None
     assert _mutating_command_session("/pi", "s1") is None
     assert _mutating_command_session("/pi status", "s1") is None
     assert _mutating_command_session("/pi on", "s1") == "s1"

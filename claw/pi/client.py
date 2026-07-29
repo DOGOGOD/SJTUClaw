@@ -892,6 +892,7 @@ class RuntimeAgentClient:
             else None
         )
         self._pi_client = PiAgentClient(config)
+        self._sandbox_manager = None
         from claw.claude import ClaudeCodeAgentClient
 
         self._claude_client = ClaudeCodeAgentClient(config)
@@ -929,6 +930,21 @@ class RuntimeAgentClient:
             self._legacy_client = client
         self._config = client.config
 
+    def set_sandbox_manager(self, manager) -> None:
+        """Attach the runtime guard used to prevent external-backend bypass."""
+        self._sandbox_manager = manager
+
+    def _guard_external_backend(self, backend: str) -> None:
+        if (
+            backend in {"pi", "claude"}
+            and self._sandbox_manager is not None
+            and self._sandbox_manager.required
+        ):
+            raise LLMError(
+                "required sandbox 模式当前只覆盖 SJTUClaw 原生后端；"
+                f"已拒绝在宿主启动 {backend}。"
+            )
+
     def chat(self, *args, **kwargs):
         if self._legacy_client is None:
             raise LLMError("辅助 LLM 未配置。")
@@ -943,6 +959,7 @@ class RuntimeAgentClient:
         self, session_id: str, user_message: str, *, session_store, **kwargs
     ) -> str:
         backend = self.backend_for_session(session_id, session_store)
+        self._guard_external_backend(backend)
         if backend == "pi":
             return self._pi_client.run_agent_turn(
                 session_id,
@@ -980,6 +997,7 @@ class RuntimeAgentClient:
 
     def compact_session(self, session_id: str, *, session_store) -> str:
         backend = self.backend_for_session(session_id, session_store)
+        self._guard_external_backend(backend)
         if backend == "pi":
             return self._pi_client.compact_session(
                 session_id,

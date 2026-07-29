@@ -41,6 +41,7 @@ function Shell() {
   const [isMobile, setIsMobile] = useState(false);
   const [pendingApproval, setPendingApproval] = useState<ApprovalInfo | null>(null);
   const [autoMode, setAutoMode] = useState(false);
+  const [sandboxMode, setSandboxMode] = useState(false);
   const [unlimitedMode, setUnlimitedMode] = useState(false);
   const [agentBackend, setAgentBackend] = useState<AgentBackend>("sjtuclaw");
   const [rollbackEnabled, setRollbackEnabled] = useState(false);
@@ -59,9 +60,10 @@ function Shell() {
     if (!activeSessionId) {
       setMessages([]);
       setMessagesLoading(false);
-      // AUTO and UNLIMITED are session-scoped.  Reset stale badges when the
-      // user opens a new-chat draft; the new session starts with both off.
+      // Runtime modes are session-scoped. Reset stale badges when the user
+      // opens a new-chat draft.
       setAutoMode(false);
+      setSandboxMode(false);
       setUnlimitedMode(false);
       setAgentBackend("sjtuclaw");
       setRollbackEnabled(false);
@@ -76,6 +78,7 @@ function Shell() {
     // Never show badges inherited from the previously selected session while
     // the new session's independent mode state is loading.
     setAutoMode(false);
+    setSandboxMode(false);
     setUnlimitedMode(false);
     setAgentBackend("sjtuclaw");
     setMessagesLoading(true);
@@ -85,6 +88,7 @@ function Shell() {
         if (d.ok) {
           setMessages(d.messages || []);
           if (d.autoMode !== undefined) setAutoMode(!!d.autoMode);
+          if (d.sandboxMode !== undefined) setSandboxMode(!!d.sandboxMode);
           if (d.unlimitedMode !== undefined) setUnlimitedMode(!!d.unlimitedMode);
           const backend = responseBackend(d);
           if (backend) setAgentBackend(backend);
@@ -92,6 +96,7 @@ function Shell() {
         } else {
           setMessages([]);
           setAutoMode(false);
+          setSandboxMode(false);
           setUnlimitedMode(false);
           setAgentBackend("sjtuclaw");
         }
@@ -101,6 +106,7 @@ function Shell() {
         console.error("Failed to load messages", e);
         setMessages([]);
         setAutoMode(false);
+        setSandboxMode(false);
         setUnlimitedMode(false);
         setAgentBackend("sjtuclaw");
       })
@@ -121,6 +127,7 @@ function Shell() {
         if (d.ok && d.messages) {
           setRollbackEnabled(!!d.rollback?.enabled);
           if (d.autoMode !== undefined) setAutoMode(!!d.autoMode);
+          if (d.sandboxMode !== undefined) setSandboxMode(!!d.sandboxMode);
           if (d.unlimitedMode !== undefined) setUnlimitedMode(!!d.unlimitedMode);
           const backend = responseBackend(d);
           if (backend) setAgentBackend(backend);
@@ -210,6 +217,7 @@ function Shell() {
         }
         sessionId = created.sessionId;
         freshlyCreatedSessionRef.current = sessionId;
+        if (created.sandboxMode !== undefined) setSandboxMode(!!created.sandboxMode);
         const backend = responseBackend(created);
         if (backend) setAgentBackend(backend);
         navigateToChat(sessionId);
@@ -254,6 +262,7 @@ function Shell() {
           };
           setMessages((prev) => [...prev, commandResult!]);
           if (d.autoMode !== undefined) setAutoMode(!!d.autoMode);
+          if (d.sandboxMode !== undefined) setSandboxMode(!!d.sandboxMode);
           if (d.unlimitedMode !== undefined) setUnlimitedMode(!!d.unlimitedMode);
           const backend = responseBackend(d);
           if (backend) setAgentBackend(backend);
@@ -337,6 +346,7 @@ function Shell() {
           setMessages(d.messages);
         }
         if ((d as any).autoMode !== undefined) setAutoMode(!!(d as any).autoMode);
+        if (d.sandboxMode !== undefined) setSandboxMode(!!d.sandboxMode);
         if ((d as any).unlimitedMode !== undefined) setUnlimitedMode(!!(d as any).unlimitedMode);
         const backend = responseBackend(d);
         if (backend) setAgentBackend(backend);
@@ -507,6 +517,7 @@ function Shell() {
           loading={messagesLoading}
           sending={sending}
           autoMode={autoMode}
+          sandboxMode={sandboxMode}
           unlimitedMode={unlimitedMode}
           agentBackend={agentBackend}
           rollbackEnabled={rollbackEnabled}

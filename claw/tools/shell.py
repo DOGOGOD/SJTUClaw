@@ -40,11 +40,14 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from claw.tools.base import Tool, ToolResult
 from claw.utils import decode_subprocess_output
 from claw.workspace.manager import WorkspaceManager, WorkspaceError
+
+if TYPE_CHECKING:
+    from claw.sandbox import SandboxManager
 
 _IS_WINDOWS = os.name == "nt"
 _DEFAULT_TIMEOUT = 60
@@ -52,6 +55,22 @@ _MAX_OUTPUT_BYTES = 64 * 1024
 
 _CD_MARKER = "__CLAW_CD_MARKER__"
 _EXIT_MARKER = "__CLAW_EXIT_MARKER__"
+
+
+def _bounded_tool_output(
+    value: str,
+    *,
+    already_truncated: bool,
+    stream_name: str,
+) -> tuple[str, bool]:
+    raw = value.encode("utf-8", errors="replace")
+    truncated = already_truncated or len(raw) > _MAX_OUTPUT_BYTES
+    if not truncated:
+        return value, False
+    suffix = f"\n\n[{stream_name} 已截断]".encode("utf-8")
+    available = max(0, _MAX_OUTPUT_BYTES - len(suffix))
+    rendered = raw[:available].decode("utf-8", errors="replace")
+    return rendered + suffix.decode("utf-8"), True
 
 
 class ShellSession:
@@ -539,9 +558,33 @@ def _shell_help() -> str:
 def _make_new_shell_handler(
     workspace_manager: WorkspaceManager,
     session_id_provider: Callable[[], str],
+    sandbox_manager: SandboxManager | None = None,
 ) -> Callable[[dict[str, Any]], ToolResult]:
     def handler(args: dict[str, Any]) -> ToolResult:
         session_id = session_id_provider()
+        if sandbox_manager is not None:
+            try:
+                if sandbox_manager.should_use(session_id, workspace_manager):
+                    info = sandbox_manager.new_shell(
+                        session_id,
+                        workspace_manager,
+                        str(args.get("sub_dir", "")),
+                    )
+                    return ToolResult(
+                        ok=True,
+                        content=json.dumps(
+                            {
+                                "tool": "new_shell",
+                                **info,
+                                "execution": "microsandbox",
+                                "result": "隔离 shell 已启动",
+                            },
+                            ensure_ascii=False,
+                        ),
+                    )
+            except Exception as exc:
+                return ToolResult(ok=False, error=str(exc))
+
         ws = workspace_manager.require(session_id)
 
         # Opportunistic cleanup of stale shell sessions
@@ -589,11 +632,64 @@ def _make_new_shell_handler(
 def _make_run_command_handler(
     workspace_manager: WorkspaceManager,
     session_id_provider: Callable[[], str],
+    sandbox_manager: SandboxManager | None = None,
 ) -> Callable[[dict[str, Any]], ToolResult]:
     def _handle(args: dict[str, Any]) -> ToolResult:
         command: str = args["command"]
         timeout: int = args.get("timeout", _DEFAULT_TIMEOUT)
         session_id = session_id_provider()
+
+        if sandbox_manager is not None:
+            try:
+                if sandbox_manager.should_use(session_id, workspace_manager):
+                    result = sandbox_manager.run_command(
+                        session_id,
+                        workspace_manager,
+                        command,
+                        timeout,
+                    )
+                    stdout, stdout_truncated = _bounded_tool_output(
+                        result.stdout,
+                        already_truncated=result.stdout_truncated,
+                        stream_name="stdout",
+                    )
+                    stderr, stderr_truncated = _bounded_tool_output(
+                        result.stderr,
+                        already_truncated=result.stderr_truncated,
+                        stream_name="stderr",
+                    )
+                    result_obj = {
+                        "tool": "run_command",
+                        "ok": result.ok,
+                        "execution": "microsandbox",
+                        "command": command,
+                        "cwd": result.cwd,
+                        "exit_code": (
+                            None if result.timed_out else result.exit_code
+                        ),
+                        "stdout": stdout,
+                        "stderr": stderr,
+                        "timed_out": result.timed_out,
+                        "stdout_truncated": stdout_truncated,
+                        "stderr_truncated": stderr_truncated,
+                        "output_limited": result.output_limited,
+                    }
+                    if result.timed_out:
+                        result_obj["error"] = f"命令执行超时（{timeout} 秒）"
+                    elif result.output_limited:
+                        result_obj["error"] = (
+                            "命令输出超过 sandbox 安全限制（8 MiB），进程已终止"
+                        )
+                    elif result.exit_code != 0:
+                        result_obj["error"] = f"命令退出码: {result.exit_code}"
+                    serialized = json.dumps(result_obj, ensure_ascii=False)
+                    return ToolResult(
+                        ok=result.ok,
+                        content=serialized if result.ok else None,
+                        error=None if result.ok else serialized,
+                    )
+            except Exception as exc:
+                return ToolResult(ok=False, error=str(exc))
 
         with _shell_sessions_lock:
             shell = _shell_sessions.get(session_id)
@@ -766,6 +862,12 @@ def _make_run_command_handler(
 
     def handler(args: dict[str, Any]) -> ToolResult:
         session_id = session_id_provider()
+        if sandbox_manager is not None:
+            try:
+                if sandbox_manager.should_use(session_id, workspace_manager):
+                    return _handle(args)
+            except Exception as exc:
+                return ToolResult(ok=False, error=str(exc))
         with _shell_sessions_lock:
             shell = _shell_sessions.get(session_id)
         if shell is None:
@@ -794,11 +896,14 @@ def _make_run_command_handler(
 def create_new_shell_tool(
     workspace_manager: WorkspaceManager,
     session_id_provider: Callable[[], str],
+    sandbox_manager: SandboxManager | None = None,
 ) -> Tool:
     return Tool(
         name="new_shell",
         description=(
-            f"在 workspace 内启动一个新的 shell（{_shell_exe()}）。"
+            "在 workspace 内启动一个新的 shell。启用 sandbox 时，"
+            "shell 是 microVM 中的 Linux /bin/sh；"
+            f"否则使用宿主 {_shell_exe()}。"
             "如果之前已有 shell，旧 shell 会先被终止。"
             "新 shell 的初始工作目录是 workspace 根目录。"
             "启动后可使用 run_command 执行命令，cd 效果会在后续命令中保留。"
@@ -813,7 +918,9 @@ def create_new_shell_tool(
             },
             "required": [],
         },
-        handler=_make_new_shell_handler(workspace_manager, session_id_provider),
+        handler=_make_new_shell_handler(
+            workspace_manager, session_id_provider, sandbox_manager
+        ),
         safety_level="shell",
     )
 
@@ -821,13 +928,15 @@ def create_new_shell_tool(
 def create_run_command_tool(
     workspace_manager: WorkspaceManager,
     session_id_provider: Callable[[], str],
+    sandbox_manager: SandboxManager | None = None,
 ) -> Tool:
     return Tool(
         name="run_command",
         description=(
-            f"{_shell_help()}\n"
+            f"{_shell_help()}\n启用 sandbox 时命令改在隔离的 Linux /bin/sh 中执行，"
+            "未设置 workspace 会自动使用 sandbox 私有 /workspace。"
             "多次 run_command 复用同一个 shell 状态：cd 效果会保留到后续命令。"
-            "如果没有已启动的 shell，请先调用 new_shell。"
+            "sandbox 模式可自动启动 shell；宿主模式请先调用 new_shell。"
             "每次执行前后都会检查 shell 的真实工作目录，越界会终止 shell。"
             "可选参数 timeout（秒，默认 60）。"
             "返回包含：是否成功、命令、cwd、退出码、stdout、stderr、是否超时。"
@@ -849,6 +958,8 @@ def create_run_command_tool(
             },
             "required": ["command"],
         },
-        handler=_make_run_command_handler(workspace_manager, session_id_provider),
+        handler=_make_run_command_handler(
+            workspace_manager, session_id_provider, sandbox_manager
+        ),
         safety_level="shell",
     )

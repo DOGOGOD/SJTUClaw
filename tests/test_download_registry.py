@@ -57,3 +57,30 @@ def test_download_registry_survives_reload(tmp_path):
         assert download.get_download(download_id) == file_path.resolve()
     finally:
         download.configure_download_registry(None)
+
+
+def test_expired_download_removes_only_managed_sandbox_export(
+    monkeypatch, tmp_path
+):
+    from claw.tools import download
+
+    export_root = tmp_path / "sandbox" / "exports"
+    managed = export_root / "session" / "request" / "result.txt"
+    managed.parent.mkdir(parents=True)
+    managed.write_text("managed", encoding="utf-8")
+    ordinary = tmp_path / "workspace.txt"
+    ordinary.write_text("workspace", encoding="utf-8")
+    monkeypatch.setattr(download, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(download, "_DOWNLOAD_TTL_S", 1)
+    clock = iter((10.0, 10.0, 10.0, 10.0, 12.0))
+    monkeypatch.setattr(download.time, "time", lambda: next(clock))
+    download.configure_download_registry(None)
+
+    managed_id = download.register_download(managed)
+    ordinary_id = download.register_download(ordinary)
+    assert download.get_download(managed_id) == managed
+    assert download.get_download(ordinary_id) == ordinary
+    assert download.get_download(managed_id) is None
+
+    assert not managed.exists()
+    assert ordinary.exists()

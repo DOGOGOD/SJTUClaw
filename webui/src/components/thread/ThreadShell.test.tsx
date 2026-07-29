@@ -58,6 +58,30 @@ function flushAnimationFrames() {
 }
 
 describe("SessionModeBadges", () => {
+  it("shows the Sandbox indicator only for sandboxed sessions", () => {
+    const view = render(
+      <SessionModeBadges
+        autoMode={false}
+        sandboxMode
+        unlimitedMode={false}
+        piMode={false}
+      />
+    );
+    expect(view.getByTestId("sandbox-mode-badge").textContent).toContain(
+      "Sandbox"
+    );
+
+    view.rerender(
+      <SessionModeBadges
+        autoMode={false}
+        sandboxMode={false}
+        unlimitedMode={false}
+        piMode={false}
+      />
+    );
+    expect(view.queryByTestId("sandbox-mode-badge")).toBeNull();
+  });
+
   it("shows the Pi indicator only for sessions with Pi enabled", () => {
     const view = render(
       <SessionModeBadges autoMode={false} unlimitedMode={false} piMode />

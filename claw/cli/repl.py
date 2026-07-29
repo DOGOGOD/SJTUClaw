@@ -39,6 +39,7 @@ def run_repl(
     tool_registry: ToolRegistry,
     *,
     workspace_manager: WorkspaceManager | None = None,
+    sandbox_manager=None,
     approval_manager: ApprovalManager | None = None,
     skill_registry=None,
     reflection_manager=None,
@@ -60,6 +61,7 @@ def run_repl(
         llm_client=client,
         current_session_id=initial_session.session_id,
         workspace_manager=workspace_manager,
+        sandbox_manager=sandbox_manager,
         approval_manager=approval_manager,
         tool_registry=tool_registry,
         skill_registry=skill_registry,
@@ -87,6 +89,15 @@ def run_repl(
                 "sjtuclaw": "SJTUClaw",
             }.get(current, current)
             return f"当前 session 的 Agent 后端：{label}。"
+        if (
+            target in {"pi", "claude"}
+            and sandbox_manager is not None
+            and sandbox_manager.required
+        ):
+            return (
+                "[错误] required sandbox 模式当前只覆盖 SJTUClaw 原生后端；"
+                "为避免外部 Agent 绕过 microVM，已拒绝切换。"
+            )
         if target == current:
             if target == "pi":
                 try:
@@ -115,6 +126,8 @@ def run_repl(
                 and state.llm_config.model
             ):
                 raise RuntimeError("SJTUClaw 原生后端需要完整的 LLM API Key、Base URL 和模型配置")
+            if sandbox_manager is not None:
+                sandbox_manager.close_session(state.current_session_id)
             set_session_backend(
                 state.session_store,
                 state.current_session_id,
@@ -140,6 +153,7 @@ def run_repl(
         register_all_tools(
             fresh_registry,
             workspace_manager=workspace_manager,
+            sandbox_manager=sandbox_manager,
             session_id_provider=lambda: state.current_session_id,
             sessions_dir=session_store.sessions_dir,
             include_skill_tool=skill_registry is not None,
@@ -248,7 +262,26 @@ def run_repl(
         if ws:
             print(f"Workspace: {ws}")
         else:
-            print("Workspace: (未设置) 使用 /workspace set <路径> 设置")
+            if (
+                sandbox_manager is not None
+                and sandbox_manager.is_session_effective(
+                    state.current_session_id,
+                    workspace_manager,
+                )
+            ):
+                print("Workspace: sandbox 私有 /workspace（按需创建）")
+            else:
+                print("Workspace: (未设置) 使用 /workspace set <路径> 设置")
+    if sandbox_manager is not None:
+        sandbox_status = sandbox_manager.status(
+            state.current_session_id, workspace_manager
+        )
+        print(
+            "Sandbox: "
+            f"{'on' if sandbox_status['enabled'] else 'off'} "
+            f"(默认 {sandbox_status['mode']}，"
+            f"{'可用' if sandbox_status['available'] else '不可用'})"
+        )
     if skill_registry is not None:
         skills = skill_registry.list_skills()
         print(f"Skills: {len(skills)} loaded ({', '.join(s.name for s in skills)})")

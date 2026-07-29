@@ -9,27 +9,25 @@ from __future__ import annotations
 import json
 import shutil
 from pathlib import Path
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from claw.tools.base import Tool, ToolResult
 from claw.workspace.manager import WorkspaceManager, WorkspaceError
+
+if TYPE_CHECKING:
+    from claw.sandbox import SandboxManager
 
 
 def _make_copy_attachment_handler(
     workspace_manager: WorkspaceManager,
     session_id_provider: Callable[[], str],
     sessions_dir: Path,
+    sandbox_manager: SandboxManager | None = None,
 ) -> Callable[[dict[str, Any]], ToolResult]:
     def handler(args: dict[str, Any]) -> ToolResult:
         attachment_id: str = args["attachment_id"]
-        dest_path_str: str = args.get("dest_path", attachment_id)
+        requested_dest = args.get("dest_path")
         session_id = session_id_provider()
-
-        # Resolve the destination path within workspace
-        try:
-            dest_resolved = workspace_manager.resolve(session_id, dest_path_str)
-        except WorkspaceError as exc:
-            return ToolResult(ok=False, error=str(exc))
 
         # Locate the attachment in the current session's attachment dir
         att_dir = sessions_dir / session_id / "attachments"
@@ -100,6 +98,11 @@ def _make_copy_attachment_handler(
                 )
 
         stored_name = record.get("storedName", "")
+        dest_path_str = str(
+            requested_dest
+            or record.get("originalName")
+            or attachment_id
+        )
         src_path = att_dir / stored_name
 
         if not src_path.exists():
@@ -108,11 +111,27 @@ def _make_copy_attachment_handler(
                 error=f"附件文件 \"{stored_name}\" 在磁盘上不存在",
             )
 
-        # Copy to workspace
+        # Copy to workspace (host path or the session's microVM).
         try:
-            dest_resolved.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(str(src_path), str(dest_resolved))
-        except OSError as exc:
+            if (
+                sandbox_manager is not None
+                and sandbox_manager.should_use(session_id, workspace_manager)
+            ):
+                sandbox_manager.import_file(
+                    session_id,
+                    workspace_manager,
+                    src_path,
+                    dest_path_str,
+                )
+                execution = "microsandbox"
+            else:
+                dest_resolved = workspace_manager.resolve(
+                    session_id, dest_path_str
+                )
+                dest_resolved.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(str(src_path), str(dest_resolved))
+                execution = "host"
+        except Exception as exc:
             return ToolResult(
                 ok=False,
                 error=f"复制附件到 workspace 失败: {exc}",
@@ -126,6 +145,7 @@ def _make_copy_attachment_handler(
                     "attachment_id": attachment_id,
                     "original_name": record.get("originalName", ""),
                     "dest_path": dest_path_str,
+                    "execution": execution,
                     "result": f"附件已复制到 workspace: {dest_path_str}",
                 },
                 ensure_ascii=False,
@@ -144,6 +164,7 @@ def create_copy_attachment_tool(
     workspace_manager: WorkspaceManager,
     session_id_provider: Callable[[], str],
     sessions_dir: Path,
+    sandbox_manager: SandboxManager | None = None,
 ) -> Tool:
     return Tool(
         name="copy_attachment_to_workspace",
@@ -171,7 +192,10 @@ def create_copy_attachment_tool(
             "required": ["attachment_id"],
         },
         handler=_make_copy_attachment_handler(
-            workspace_manager, session_id_provider, sessions_dir
+            workspace_manager,
+            session_id_provider,
+            sessions_dir,
+            sandbox_manager,
         ),
         safety_level="write",
     )

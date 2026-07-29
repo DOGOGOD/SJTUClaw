@@ -43,6 +43,7 @@ from claw.skills.registry import SkillRegistry
 from claw.tools.base import ToolRegistry
 from claw.utils import default_timezone_name, force_utf8_stdio
 from claw.workspace.manager import WorkspaceManager
+from claw.sandbox import SandboxManager, load_sandbox_config
 from claw.pet.catalog import PetCatalog
 from claw.pet.process import PetProcessManager
 
@@ -86,6 +87,11 @@ def main() -> int:
     initialize_session_backends(session_store)
     memory_store = MemoryStore(MEMORY_DIR)
     workspace_manager = WorkspaceManager()
+    sandbox_manager = SandboxManager(load_sandbox_config())
+    sandbox_manager.set_agent_backend_provider(
+        lambda sid: get_session_backend(session_store, sid)
+    )
+    client.set_sandbox_manager(sandbox_manager)
 
     # -- Context builder ----------------------------------------------------
     compact_cfg = load_compaction_config()
@@ -96,6 +102,7 @@ def main() -> int:
         workspace_path=str(SESSIONS_DIR.parent),
         timezone=default_timezone_name(),
         workspace_manager=workspace_manager,
+        sandbox_manager=sandbox_manager,
     )
 
     # -- Token-threshold compaction worker ---------------------------------
@@ -212,6 +219,7 @@ def main() -> int:
             context_builder,
             tool_registry,
             workspace_manager=workspace_manager,
+            sandbox_manager=sandbox_manager,
             approval_manager=approval_manager,
             skill_registry=skill_registry,
             reflection_manager=reflection_mgr,
@@ -223,6 +231,7 @@ def main() -> int:
         )
     finally:
         cron_service.stop()
+        sandbox_manager.close_all()
         reflection_mgr.stop()
     return 0
 

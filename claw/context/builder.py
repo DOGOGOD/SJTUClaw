@@ -202,6 +202,7 @@ class ContextBuilder:
         timezone: str | None = None,
         channel: str = "",
         workspace_manager=None,
+        sandbox_manager=None,
     ):
         self._system_prompt = system_prompt
         self._soul = soul
@@ -210,6 +211,7 @@ class ContextBuilder:
         self._timezone = timezone
         self._channel = channel
         self._workspace_manager = workspace_manager
+        self._sandbox_manager = sandbox_manager
         self._skill_registry = None
         self._skill_block_cache: str | None = None
         self._skill_block_version: int = -1
@@ -277,6 +279,9 @@ class ContextBuilder:
         # --- Stable prefix (prompt-cache friendly, cached across iterations) ---
         effective_ws = self._resolve_workspace(session.session_id)
         messages = list(self._get_system_prefix(workspace_path=effective_ws))
+        sandbox_context = self._build_sandbox_context(session.session_id)
+        if sandbox_context is not None:
+            messages.append({"role": "system", "content": sandbox_context})
 
         # Memory block
         memory_block = self._build_memory_block()
@@ -405,6 +410,41 @@ class ContextBuilder:
             if ws is not None:
                 return str(ws)
         return self._workspace_path or ""
+
+    def _build_sandbox_context(self, session_id: str) -> str | None:
+        """Describe native-tool isolation without treating guest paths as host paths."""
+        manager = self._sandbox_manager
+        workspace_manager = self._workspace_manager
+        if manager is None or workspace_manager is None:
+            return None
+        if not manager.is_session_enabled(session_id):
+            return None
+        status = manager.status(session_id, workspace_manager)
+        if not status["covered"]:
+            return None
+        if not status["available"]:
+            if status["mode"] == "required":
+                return (
+                    "## Sandbox 运行环境\n\n"
+                    "当前配置要求所有原生文件和 Shell 工具使用 microsandbox，"
+                    "但运行时不可用。工具会 fail-closed，绝不会回退到宿主执行。"
+                )
+            return None
+        kind = (
+            "用户明确绑定的宿主 workspace（仅该目录挂载进 microVM）"
+            if status["workspaceKind"] == "host-mounted"
+            else "当前 session 的持久化 sandbox 私有 workspace"
+        )
+        return (
+            "## Sandbox 运行环境\n\n"
+            "SJTUClaw 原生文件工具与 Shell 在同一个 microsandbox microVM 中运行。"
+            f"可操作工作区是 {kind}，guest 路径为 `{status['guestWorkspace']}`。"
+            "没有宿主 workspace 时无需请求用户先设置，直接使用相对路径或 "
+            "`/workspace` 即可。不要把 Windows 盘符路径传给工具；"
+            "需要宿主文件时请使用附件导入或请用户显式绑定 workspace。"
+            "Shell 是 Linux `/bin/sh`，可以安全使用 microVM 内的 `/tmp` 等路径；"
+            "结构化文件工具仍限定在 `/workspace`。"
+        )
 
     def bound_workspace(self, session_id: str) -> str | None:
         """Return the explicitly bound workspace for an agent session.

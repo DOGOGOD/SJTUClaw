@@ -159,6 +159,7 @@ export interface SendMessageResponse {
   messages?: ChatMessage[];
   error?: string;
   autoMode?: boolean;
+  sandboxMode?: boolean;
   unlimitedMode?: boolean;
   piMode?: boolean;
   agentBackend?: AgentBackend;
@@ -220,6 +221,7 @@ export interface SSESessionInfoEvent {
   type: "_session_info";
   sessionId: string;
   autoMode: boolean;
+  sandboxMode?: boolean;
   unlimitedMode?: boolean;
   piMode?: boolean;
   agentBackend?: AgentBackend;

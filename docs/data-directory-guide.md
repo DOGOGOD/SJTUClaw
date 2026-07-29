@@ -39,6 +39,7 @@ data/
 ├── pets/           # 用户导入的宠物资源
 ├── pi/             # Pi Agent 后端原生会话
 ├── sessions/       # SJTUClaw 主会话和附件
+├── sandbox/        # microVM 文件的临时宿主导出
 ├── settings/       # Web UI 运行配置和密钥
 └── workspace/      # 工作区绑定和文件回退数据
 ```
@@ -167,6 +168,24 @@ sessions/<session-id>/attachments/
 - 中断的回合难以恢复；
 - 会话和工作区无法一起回退；
 - 已上传的附件无法继续使用。
+
+### 3.7 microsandbox 数据
+
+启用 microsandbox 后，准备下载的 guest 文件会先导出到：
+
+```text
+data/sandbox/exports/<session-hash>/<request-id>/<file-name>
+```
+
+这些文件进入现有下载注册表，过期或因注册表容量被淘汰时会被自动删除。只有这个
+受管目录中的导出副本会被清理；workspace 原文件不会因为下载链接过期而删除。
+
+未绑定宿主 workspace 时使用的持久化命名卷不在 `data/` 中，而由 microsandbox
+保存在其 `MSB_HOME`（Windows 通常为 `%USERPROFILE%\.microsandbox`）下。正常关闭
+SJTUClaw 或使用 `/sandbox off` 只停止当前 session 的 microVM，不删除命名卷，
+因此再次 `/sandbox on` 后仍能看到原文件；删除对应 SJTUClaw session 时会同时
+请求删除该命名卷。若应用异常退出，可使用 `msb ps --all` 和
+`msb volume list` 检查残留资源。
 
 ## 4. 外部 Agent 后端数据
 

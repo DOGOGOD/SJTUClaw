@@ -318,6 +318,8 @@ _WORKSPACE_VIOLATION_MARKERS = (
     "path traversal detected",
     "路径越界",
     "不在 workspace",
+    "超出 sandbox workspace",
+    "拒绝直接访问宿主绝对路径",
 )
 
 _SSRF_BOUNDARY_NOTE = (

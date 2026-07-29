@@ -85,6 +85,7 @@ from claw.tools.download import (
 )
 from claw.workspace.manager import WorkspaceManager, WorkspaceError
 from claw.workspace.rollback import WorkspaceRollbackManager, RollbackError
+from claw.sandbox import SandboxError, SandboxManager, load_sandbox_config
 from claw.scheduler.service import CronService
 from claw.scheduler.session_turns import visible_session_messages
 from claw.scheduler.callbacks import (
@@ -120,6 +121,7 @@ class RuntimeLLMClient:
 
     def __init__(self) -> None:
         self._client: RuntimeAgentClient | None = None
+        self._sandbox_manager = None
         self._config = LLMConfig(api_key="", base_url="https://api.openai.com/v1", model="")
         self.error_message = _LLM_NOT_CONFIGURED_MESSAGE
 
@@ -139,8 +141,15 @@ class RuntimeLLMClient:
 
     def set_config(self, config: LLMConfig) -> None:
         self._client = RuntimeAgentClient(config)
+        if self._sandbox_manager is not None:
+            self._client.set_sandbox_manager(self._sandbox_manager)
         self._config = config
         self.error_message = ""
+
+    def set_sandbox_manager(self, manager) -> None:
+        self._sandbox_manager = manager
+        if self._client is not None:
+            self._client.set_sandbox_manager(manager)
 
     def clear(self, message: str | None = None) -> None:
         self._client = None
@@ -195,6 +204,11 @@ initialize_session_backends(_session_store)
 _memory_store = MemoryStore(MEMORY_DIR)
 _compact_cfg = load_compaction_config()
 _workspace_manager = WorkspaceManager()
+_sandbox_manager = SandboxManager(load_sandbox_config())
+_sandbox_manager.set_agent_backend_provider(
+    lambda sid: get_session_backend(_session_store, sid)
+)
+_llm_client.set_sandbox_manager(_sandbox_manager)
 _rollback_manager = WorkspaceRollbackManager(_workspace_manager, _session_store)
 
 
@@ -213,6 +227,7 @@ _context_builder = ContextBuilder(
     workspace_path=str(MAIN_DIR),
     timezone=default_timezone_name(),
     workspace_manager=_workspace_manager,
+    sandbox_manager=_sandbox_manager,
 )
 
 _approval_manager = ApprovalManager()
@@ -286,6 +301,7 @@ _cron_service = CronService(_cron_store_path)
 register_all_tools(
     _tool_registry,
     workspace_manager=_workspace_manager,
+    sandbox_manager=_sandbox_manager,
     session_id_provider=_get_turn_session_id,
     sessions_dir=SESSIONS_DIR,
     include_skill_tool=True,
@@ -566,6 +582,7 @@ async def _lifespan(_app: FastAPI):
     _compaction_worker.wait(timeout=5.0)
     _reflection_mgr.stop()
     _cron_service.stop()
+    _sandbox_manager.close_all()
     _pet_process.stop()
 
 
@@ -606,6 +623,15 @@ _WEB_DIR = web_dir()
 # Per-session AUTO mode flag (in-memory, resets on restart)
 _auto_mode: dict[str, bool] = {}
 
+
+def _session_sandbox_mode(session_id: str) -> bool:
+    """Return whether this session is effectively routed through sandbox."""
+    return _sandbox_manager.is_session_effective(
+        session_id,
+        _workspace_manager,
+    )
+
+
 # Active agent turns — tracks running turns for cancellation.
 # Key: session_id, Value: threading.Event (set when cancelled).
 _active_turns: dict[str, threading.Event] = {}
@@ -637,6 +663,15 @@ def _cancel_active_turn(session_id: str) -> bool:
         event = _active_turns.get(session_id)
     if event is not None:
         event.set()
+        # Stopping the session VM interrupts an in-flight sandbox command.
+        try:
+            _sandbox_manager.close_session(session_id)
+        except SandboxError:
+            logger.warning(
+                "停止任务时关闭 sandbox 失败: %s",
+                session_id,
+                exc_info=True,
+            )
         for request in _approval_manager.list_by_session(session_id):
             if request.status == ApprovalStatus.PENDING.value:
                 _approval_manager.reject(
@@ -650,10 +685,19 @@ def _cancel_active_turn(session_id: str) -> bool:
 def _cancel_all_active_turns() -> int:
     """Cancel all active turns. Returns the count cancelled."""
     with _active_turns_lock:
-        events = list(_active_turns.values())
-        count = len(events)
-        for e in events:
+        turns = list(_active_turns.items())
+        count = len(turns)
+        for _, e in turns:
             e.set()
+    for session_id, _ in turns:
+        try:
+            _sandbox_manager.close_session(session_id)
+        except SandboxError:
+            logger.warning(
+                "停止全部任务时关闭 sandbox 失败: %s",
+                session_id,
+                exc_info=True,
+            )
     for request in _approval_manager.get_pending():
         _approval_manager.reject(
             request.approval_id,
@@ -1255,6 +1299,7 @@ async def handle_chat(req: ChatRequest):
             "reply": result_text,
             "messages": messages,
             "autoMode": _auto_mode.get(sid, False),
+            "sandboxMode": _session_sandbox_mode(sid),
             "unlimitedMode": _workspace_manager.is_unlimited(sid),
             "piMode": _session_pi_mode(sid),
             "agentBackend": _session_backend(sid),
@@ -1283,6 +1328,7 @@ async def handle_chat(req: ChatRequest):
             "reply": reply,
             "messages": messages,
             "autoMode": _auto_mode.get(sid, False),
+            "sandboxMode": _session_sandbox_mode(sid),
             "unlimitedMode": _workspace_manager.is_unlimited(sid),
             "piMode": _session_pi_mode(sid),
             "agentBackend": _session_backend(sid),
@@ -1377,6 +1423,7 @@ async def handle_chat(req: ChatRequest):
         "reply": reply,
         "messages": messages,
         "autoMode": _auto_mode.get(sid, False),
+        "sandboxMode": _session_sandbox_mode(sid),
         "unlimitedMode": _workspace_manager.is_unlimited(sid),
         "piMode": _session_pi_mode(sid),
         "agentBackend": _session_backend(sid),
@@ -1442,6 +1489,8 @@ def _mutating_command_session(command: str, current_session_id: str) -> str | No
     if root == "/compact":
         return current_session_id
     if root == "/workspace" and sub in {"set", "unset"}:
+        return current_session_id
+    if root == "/sandbox" and sub in {"on", "off"}:
         return current_session_id
     if root == "/unlimited" and sub in {
         "on", "off", "enable", "disable", "1", "0", "toggle",
@@ -1509,6 +1558,11 @@ def _execute_slash_command(
                 "sjtuclaw": "SJTUClaw",
             }.get(current, current)
             return f"当前 session 的 Agent 后端：{label}。"
+        if target in {"pi", "claude"} and _sandbox_manager.required:
+            return (
+                "[错误] required sandbox 模式当前只覆盖 SJTUClaw 原生后端；"
+                "为避免外部 Agent 绕过 microVM，已拒绝切换。"
+            )
         if target == current:
             if target == "pi":
                 try:
@@ -1541,6 +1595,7 @@ def _execute_slash_command(
                 and _config.model
             ):
                 raise RuntimeError("SJTUClaw 原生后端需要完整的 LLM API Key、Base URL 和模型配置")
+            _sandbox_manager.close_session(sid)
             set_session_backend(_session_store, sid, target)
         except Exception as exc:
             return f"[错误] 当前 session 的 Agent 后端切换失败：{exc}"
@@ -1560,6 +1615,7 @@ def _execute_slash_command(
         llm_client=_llm_client,
         current_session_id=sid,
         workspace_manager=_workspace_manager,
+        sandbox_manager=_sandbox_manager,
         approval_manager=_approval_manager,
         tool_registry=_tool_registry,
         skill_registry=_skill_registry,
@@ -1615,6 +1671,7 @@ async def _run_explicit_skill_command(
             "result": _llm_missing_reply(),
             "actions": [],
             "autoMode": _auto_mode.get(session_id, False),
+            "sandboxMode": _session_sandbox_mode(session_id),
             "unlimitedMode": _workspace_manager.is_unlimited(session_id),
             "piMode": _session_pi_mode(session_id),
             "agentBackend": _session_backend(session_id),
@@ -1689,6 +1746,7 @@ async def _run_explicit_skill_command(
             "reload_rollback_status",
         ],
         "autoMode": _auto_mode.get(session_id, False),
+        "sandboxMode": _session_sandbox_mode(session_id),
         "unlimitedMode": _workspace_manager.is_unlimited(session_id),
         "piMode": _session_pi_mode(session_id),
         "agentBackend": _session_backend(session_id),
@@ -1748,6 +1806,8 @@ async def handle_command(req: CommandRequest):
         actions = ["clear_session"]
     elif root == "/auto":
         actions = ["reload_auto_mode"]
+    elif root == "/sandbox":
+        actions = ["reload_sandbox_mode"]
     elif root == "/compact":
         # Compaction preserves the raw visible transcript, so reloading it
         # only erases the ephemeral command result in the WebUI.
@@ -1768,6 +1828,7 @@ async def handle_command(req: CommandRequest):
         "result": result_text,
         "actions": actions,
         "autoMode": _auto_mode.get(mode_sid, False),
+        "sandboxMode": _session_sandbox_mode(mode_sid),
         "unlimitedMode": _workspace_manager.is_unlimited(mode_sid),
         "piMode": _session_pi_mode(mode_sid) if mode_session_exists else False,
         "agentBackend": (
@@ -1809,6 +1870,7 @@ def create_session(req: CreateSessionRequest | None = None):
         "ok": True,
         "sessionId": session.session_id,
         "title": session.title,
+        "sandboxMode": _session_sandbox_mode(session.session_id),
         "piMode": _session_pi_mode(session.session_id),
         "agentBackend": _session_backend(session.session_id),
     }
@@ -1825,6 +1887,7 @@ def get_messages(session_id: str):
         "messages": _visible_messages(session),
         "summary": session.summary,
         "autoMode": _auto_mode.get(session_id, False),
+        "sandboxMode": _session_sandbox_mode(session_id),
         "unlimitedMode": _workspace_manager.is_unlimited(session_id),
         "piMode": _session_pi_mode(session_id),
         "agentBackend": _session_backend(session_id),
@@ -2089,12 +2152,13 @@ def set_workspace(req: SetWorkspaceRequest):
     try:
         with _rollback_manager.session_guard(req.session_id):
             resolved = _workspace_manager.set(req.session_id, raw_path)
+            _sandbox_manager.close_session(req.session_id)
             rollback_status = (
                 _rollback_manager.enable(req.session_id, _session_store.get(req.session_id))
                 if _session_store.exists(req.session_id)
                 else _rollback_manager.status(req.session_id)
             )
-    except (WorkspaceError, RollbackError, OSError) as exc:
+    except (WorkspaceError, RollbackError, SandboxError, OSError) as exc:
         try:
             if previous is None:
                 _workspace_manager.unset(req.session_id)
@@ -2102,7 +2166,8 @@ def set_workspace(req: SetWorkspaceRequest):
                 _workspace_manager.set(req.session_id, str(previous))
         except (WorkspaceError, OSError):
             pass
-        raise HTTPException(status_code=400, detail=str(exc))
+        status_code = 503 if isinstance(exc, SandboxError) else 400
+        raise HTTPException(status_code=status_code, detail=str(exc))
     return {
         "ok": True,
         "sessionId": req.session_id,
@@ -2116,9 +2181,15 @@ def unset_workspace(session_id: str = Query(..., alias="sessionId")):
     """Remove the workspace binding for a session."""
     if _session_turn_active(session_id):
         raise HTTPException(status_code=409, detail="当前任务正在运行，请先停止任务。")
-    with _rollback_manager.session_guard(session_id):
-        _rollback_manager.disable(session_id)
-        _workspace_manager.unset(session_id)
+    try:
+        with _rollback_manager.session_guard(session_id):
+            _sandbox_manager.close_session(session_id)
+            _rollback_manager.disable(session_id)
+            _workspace_manager.unset(session_id)
+    except SandboxError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except (WorkspaceError, RollbackError, OSError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"ok": True, "sessionId": session_id}
 
 
@@ -2597,6 +2668,11 @@ def delete_session(session_id: str):
             logger.exception("删除 session 后清理 workspace 失败: %s", session_id)
         finally:
             _workspace_manager.set_unlimited(session_id, False)
+        try:
+            _sandbox_manager.purge_session(session_id)
+        except Exception:
+            cleanup_warnings.append("sandbox 清理失败，请查看 Gateway 日志。")
+            logger.exception("删除 session 后清理 sandbox 失败: %s", session_id)
     _auto_mode.pop(session_id, None)
     # Clean up attachments directory
     att_dir = _attachments_dir(session_id)
@@ -3493,7 +3569,7 @@ async def handle_chat_stream(req: ChatRequest):
 
         async def _command_events():
             yield _event_to_sse(FinalEvent(content=result_text))
-            yield f"data: {json.dumps({'type': '_session_info', 'sessionId': sid, 'autoMode': _auto_mode.get(sid, False), 'unlimitedMode': _workspace_manager.is_unlimited(sid), 'piMode': _session_pi_mode(sid), 'agentBackend': _session_backend(sid)}, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'type': '_session_info', 'sessionId': sid, 'autoMode': _auto_mode.get(sid, False), 'sandboxMode': _session_sandbox_mode(sid), 'unlimitedMode': _workspace_manager.is_unlimited(sid), 'piMode': _session_pi_mode(sid), 'agentBackend': _session_backend(sid)}, ensure_ascii=False)}\n\n"
             yield "data: {\"type\": \"_done\"}\n\n"
 
         return StreamingResponse(
@@ -3518,7 +3594,7 @@ async def handle_chat_stream(req: ChatRequest):
 
         async def _config_required_events():
             yield _event_to_sse(FinalEvent(content=reply))
-            yield f"data: {json.dumps({'type': '_session_info', 'sessionId': sid, 'autoMode': _auto_mode.get(sid, False), 'unlimitedMode': _workspace_manager.is_unlimited(sid), 'piMode': _session_pi_mode(sid), 'agentBackend': _session_backend(sid)}, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'type': '_session_info', 'sessionId': sid, 'autoMode': _auto_mode.get(sid, False), 'sandboxMode': _session_sandbox_mode(sid), 'unlimitedMode': _workspace_manager.is_unlimited(sid), 'piMode': _session_pi_mode(sid), 'agentBackend': _session_backend(sid)}, ensure_ascii=False)}\n\n"
             yield "data: {\"type\": \"_done\"}\n\n"
 
         return StreamingResponse(
@@ -3565,8 +3641,16 @@ async def handle_chat_stream(req: ChatRequest):
                 rollback_manager=_rollback_manager,
             )
             # The FinalEvent is emitted inside run_agent_turn, but we
-            # also send a session_id + autoMode info event
-            event_queue.put({"type": "_session_info", "sessionId": sid, "autoMode": _auto_mode.get(sid, False), "unlimitedMode": _workspace_manager.is_unlimited(sid), "piMode": _session_pi_mode(sid), "agentBackend": _session_backend(sid)})
+            # Also send session-scoped mode information.
+            event_queue.put({
+                "type": "_session_info",
+                "sessionId": sid,
+                "autoMode": _auto_mode.get(sid, False),
+                "sandboxMode": _session_sandbox_mode(sid),
+                "unlimitedMode": _workspace_manager.is_unlimited(sid),
+                "piMode": _session_pi_mode(sid),
+                "agentBackend": _session_backend(sid),
+            })
 
             # Auto-title
             try:

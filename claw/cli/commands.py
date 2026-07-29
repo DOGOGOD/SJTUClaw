@@ -23,6 +23,7 @@ from claw.context.compaction import (
 from claw.llm.client import LLMClient
 from claw.memory.reflection import is_valid_reflection_time
 from claw.memory.store import MemoryStore, MemoryStoreError
+from claw.sandbox import SandboxError
 from claw.session.store import SessionNotFoundError, SessionStore, SessionStoreError
 from claw.tools.base import ToolRegistry
 from claw.utils import default_timezone_name
@@ -32,7 +33,8 @@ from claw.workspace.rollback import RollbackError, WorkspaceRollbackManager
 _COMMAND_PREFIXES = (
     "/session", "/memory", "/compact", "/workspace", "/approve", "/reject",
     "/approvals", "/skill", "/reflect", "/cron", "/help", "/auto",
-    "/unlimited", "/pi", "/claude", "/pet", "/rollback", "/stop", "/exit",
+    "/unlimited", "/sandbox", "/pi", "/claude", "/pet", "/rollback", "/stop",
+    "/exit",
 )
 
 _HELP_TEXT = (
@@ -61,6 +63,12 @@ _HELP_TEXT = (
     "    set <路径>               设置工作区路径\n"
     "    show                     查看当前工作区\n"
     "    unset                    取消工作区设置\n"
+    "  /sandbox                 查看 sandbox 相关命令的简要说明\n"
+    "  /sandbox on              为当前 session 开启沙箱\n"
+    "  /sandbox off             为当前 session 关闭沙箱\n"
+    "  /sandbox status          查看沙箱状态、可用性与 workspace 类型\n"
+    "  Sandbox 说明             未设置 workspace 时使用私有 /workspace；\n"
+    "                           设置后仅挂载明确绑定的目录\n"
     "  Workspace 回退（需先设置 workspace）：\n"
     "  /rollback                 回退到上一条用户消息发送前\n"
     "  /rollback <n>             回退到倒数第 n 个用户回合之前\n"
@@ -143,6 +151,16 @@ _HELP_MARKDOWN = """# SJTUClaw 可用指令
 - `/workspace show`：查看当前工作区
 - `/workspace unset`：取消工作区设置
 
+## Sandbox
+
+- `/sandbox`：显示 sandbox 相关命令的简要说明
+- `/sandbox status`：查看当前 session 的 sandbox 状态
+- `/sandbox on`：为当前 session 开启 sandbox
+- `/sandbox off`：为当前 session 关闭 sandbox
+
+> 未设置 workspace 时，原生文件和 Shell 工具使用当前 session 私有的
+> `/workspace`；设置 workspace 后，仅挂载用户明确绑定的目录。
+
 ## Workspace 回退
 
 > 设置 workspace 后自动启用；未设置 workspace 时不支持回退。
@@ -212,6 +230,7 @@ class RuntimeState:
     llm_client: LLMClient
     current_session_id: str
     workspace_manager: WorkspaceManager | None = None
+    sandbox_manager: object | None = None
     approval_manager: ApprovalManager | None = None
     tool_registry: ToolRegistry | None = None
     skill_registry: object | None = None
@@ -275,6 +294,8 @@ def handle_command(user_input: str, state: RuntimeState, *, markdown: bool = Fal
         return finish(_handle_compact_command(state))
     if root == "/workspace":
         return finish(_handle_workspace_command(args, state))
+    if root == "/sandbox":
+        return finish(_handle_sandbox_command(args, state))
     if root == "/rollback":
         return finish(_handle_rollback_command(args, state))
     if root == "/approvals":
@@ -560,6 +581,11 @@ def _delete_session(session_id: str, state: RuntimeState) -> str:
             cleanup_warnings.append(f"workspace 绑定清理失败: {exc}")
         finally:
             state.workspace_manager.set_unlimited(session_id, False)
+    if state.sandbox_manager is not None:
+        try:
+            state.sandbox_manager.purge_session(session_id)
+        except Exception as exc:
+            cleanup_warnings.append(f"sandbox 清理失败: {exc}")
     state.auto_modes.pop(session_id, None)
 
     suffix = (
@@ -912,10 +938,12 @@ def _handle_workspace_command(args: list[str], state: RuntimeState) -> str:
         try:
             with guard:
                 resolved = state.workspace_manager.set(sid, path_str)
+                if state.sandbox_manager is not None:
+                    state.sandbox_manager.close_session(sid)
                 if state.rollback_manager is not None:
                     state.rollback_manager.enable(sid, state.session_store.get(sid))
             return f"Workspace 已设置为: {resolved}"
-        except (WorkspaceError, RollbackError, OSError) as exc:
+        except (WorkspaceError, RollbackError, SandboxError, OSError) as exc:
             try:
                 if previous is None:
                     state.workspace_manager.unset(sid)
@@ -942,17 +970,86 @@ def _handle_workspace_command(args: list[str], state: RuntimeState) -> str:
         )
         try:
             with guard:
+                if state.sandbox_manager is not None:
+                    state.sandbox_manager.close_session(sid)
                 if state.rollback_manager is not None:
                     state.rollback_manager.disable(sid)
                 state.workspace_manager.unset(sid)
                 # Removing the sandbox root must never leave unrestricted
                 # filesystem access enabled implicitly.
                 state.workspace_manager.set_unlimited(sid, False)
-        except (WorkspaceError, RollbackError, OSError) as exc:
+        except (WorkspaceError, RollbackError, SandboxError, OSError) as exc:
             return f"[错误] {exc}"
         return "Workspace 已取消设置，UNLIMITED 模式已关闭。"
 
     return f"未知 /workspace 子命令: {sub}\n\n{_WORKSPACE_USAGE}"
+
+
+_SANDBOX_USAGE = """用法:
+  /sandbox          显示 sandbox 相关命令
+  /sandbox status   查看模式、可用性、运行状态与 workspace 类型
+  /sandbox on       为当前 session 开启 sandbox
+  /sandbox off      为当前 session 关闭 sandbox
+
+未设置 workspace 时使用当前 session 私有的 /workspace；设置后仅挂载明确绑定的目录。"""
+
+
+def _handle_sandbox_command(args: list[str], state: RuntimeState) -> str:
+    """Show or change the current session's isolated runtime."""
+    if not args:
+        return _SANDBOX_USAGE
+    if len(args) != 1:
+        return _SANDBOX_USAGE
+    sub = args[0].lower()
+    if sub not in {"status", "show", "on", "off"}:
+        return f"未知 /sandbox 子命令: {sub}\n\n{_SANDBOX_USAGE}"
+    manager = state.sandbox_manager
+    if manager is None or state.workspace_manager is None:
+        return "Sandbox manager 未初始化。"
+    sid = state.current_session_id
+    if sub in {"status", "show"}:
+        status = manager.status(sid, state.workspace_manager)
+        enabled = "已开启" if status["enabled"] else "已关闭"
+        availability = (
+            "运行环境可用" if status["available"] else "运行环境不可用"
+        )
+        running = (
+            "运行中"
+            if status["running"]
+            else ("按需启动" if status["effective"] else "未运行")
+        )
+        kind = (
+            "已绑定宿主 workspace"
+            if status["workspaceKind"] == "host-mounted"
+            else "sandbox 私有 workspace"
+        )
+        return (
+            f"Sandbox 状态: {enabled}（配置默认值 {status['mode']}，"
+            f"{availability}，{running}，"
+            f"{'当前生效' if status['effective'] else '当前未生效'}）\n"
+            f"Agent 后端: {status['agentBackend']}（"
+            f"{'已覆盖' if status['covered'] else '未覆盖'}）\n"
+            f"Workspace: {kind} → {status['guestWorkspace']}\n"
+            f"镜像: {status['image']}\n"
+            f"网络: {status['network']}；安全策略: {status['security']}"
+        )
+    try:
+        manager.set_session_enabled(
+            sid,
+            sub == "on",
+            state.workspace_manager,
+        )
+    except SandboxError as exc:
+        return f"[错误] sandbox 状态修改失败: {exc}"
+    if sub == "on":
+        return (
+            "当前 session 的 sandbox 已开启。"
+            "原生文件和 Shell 工具将在隔离 microVM 中运行。"
+        )
+    return (
+        "当前 session 的 sandbox 已关闭，已停止其 microVM。"
+        "其他 session 的 sandbox 状态不受影响。"
+    )
 
 
 _ROLLBACK_USAGE = """用法:
@@ -1559,6 +1656,19 @@ def _handle_unlimited_command(
     if sub in ("help", "status", "show"):
         return _help()
     if sub in ("on", "enable", "1"):
+        if (
+            state.sandbox_manager is not None
+            and state.sandbox_manager.required
+        ):
+            return (
+                "[错误] required sandbox 模式不允许开启 UNLIMITED；"
+                "该模式会绕过 microVM 的宿主文件隔离。"
+            )
+        if state.sandbox_manager is not None:
+            try:
+                state.sandbox_manager.close_session(sid)
+            except SandboxError as exc:
+                return f"[错误] 无法关闭当前 sandbox: {exc}"
         state.workspace_manager.set_unlimited(sid, True)
         return (
             "UNLIMITED 模式已开启。\n"

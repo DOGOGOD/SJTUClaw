@@ -20,6 +20,77 @@ cp .env.example .env
 `.env`；安装版读取 `%USERPROFILE%\.sjtuclaw\.env`。系统环境变量优先于
 `.env`，Web UI 保存的运行时设置又优先于二者。
 
+## microsandbox 隔离运行
+
+SJTUClaw 原生 Agent 的文件工具、Shell、附件导入和下载导出可以共享一个
+session 级 microsandbox microVM。安装可选依赖：
+
+```bash
+pip install -e ".[sandbox]"
+```
+
+Windows 还需要启用 Windows Hypervisor Platform。使用本仓库旁边的
+microsandbox 源码调试时，可以改为安装
+`../microsandbox/sdk/python`，但源码构建仍需准备 Rust 与 microsandbox 的原生运行
+依赖；发布版更适合使用包含 `msb` 与 `libkrunfw` 的官方 wheel。
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `SANDBOX_MODE` | `off` | `off`、`auto` 或 fail-closed 的 `required` |
+| `SANDBOX_IMAGE` | `python:3.12-bookworm` | 带常用开发基础的 OCI 镜像 |
+| `SANDBOX_CPUS` | `2` | vCPU 数 |
+| `SANDBOX_MEMORY_MIB` | `2048` | 内存上限（MiB） |
+| `SANDBOX_MAX_DURATION_S` | `21600` | 单个 microVM 最长生命周期 |
+| `SANDBOX_IDLE_TIMEOUT_S` | `3600` | 空闲回收时间 |
+| `SANDBOX_NETWORK` | `public` | `public` 允许开发联网，`none` 禁止 guest 网络 |
+| `SANDBOX_SECURITY` | `restricted` | microsandbox 安全策略 |
+| `SANDBOX_WORKSPACE_QUOTA_MIB` | `4096` | guest 对 workspace 的新增写入配额 |
+
+行为规则：
+
+- 默认 `off` 模式下，新 session 的 Sandbox 状态为关闭；可使用 `/sandbox on`
+  单独为当前 session 开启。
+- Sandbox 开启且未设置 workspace 时，第一次原生文件或 Shell 工具调用会自动
+  创建 session 私有的持久卷，并挂载到 guest `/workspace`。
+- 设置 workspace 后，只把用户明确绑定的目录挂载到 guest `/workspace`；
+  不会因为模型给出宿主绝对路径或 `../` 就扩大挂载范围。
+- Shell 可以在 microVM 内使用 `/tmp` 等 guest 路径；结构化文件工具仍只访问
+  `/workspace`，防止把宿主路径与 guest 路径混为一谈。
+- 附件通过 microsandbox 文件 API 导入；下载文件先导出到 SJTUClaw 管理目录，
+  再进入现有限时下载注册表。
+- 文件读取和 Shell 输出都采用流式、有界处理。Tool 最多返回 64 KiB；
+  单次命令 stdout 与 stderr 合计超过 8 MiB 时进程会被终止并明确报错。
+  非 UTF-8 输出会使用替换字符展示。
+- 覆盖、编辑和附件导入使用同目录临时文件后 rename 提交，失败时不会把目标文件
+  留在部分写入状态。
+- `required` 模式下，SDK 缺失、WHP 未启用、镜像拉取失败或 microVM 启动失败都会
+  明确报错，不会悄悄改回宿主执行。该模式也禁止 `UNLIMITED`，并拒绝切换到目前
+  尚未纳入 microVM 的 Pi / Claude Code 后端。
+- `auto` 模式会先运行一次本地能力检查，只有 SDK、原生运行文件与 hypervisor
+  都就绪时才启用；显式打开 `UNLIMITED` 仍表示用户选择
+  原有宿主级不受限行为。生产或处理不可信代码时应使用 `required`。
+
+可在任意对话入口输入 `/sandbox status` 查看当前状态，使用 `/sandbox on` 或
+`/sandbox off` 单独控制当前 session。不同 session 的开关互不影响；关闭时会
+停止当前 microVM，再次开启后由下次工具调用按需重建。`required` 模式不允许
+关闭。session 覆盖状态保存在当前 CLI/Gateway 进程内，应用重启后恢复
+`SANDBOX_MODE` 的默认值。改变 workspace 绑定也会自动重建 microVM，确保旧
+挂载不会继续生效。停止失败时命令会返回错误，不会误报关闭成功。
+修改上述环境变量后需要重启 CLI 或 Gateway。
+任务运行期间使用 `/stop` 时，Gateway 还会停止该 session 的 microVM，以中断
+正在等待的 sandbox 命令；私有命名卷不会因此丢失。
+
+安装后可执行真实环境冒烟测试：
+
+```bash
+python tests/sandbox_smoke.py --image alpine:3.21
+python tests/sandbox_smoke.py --image alpine:3.21 --workspace C:\path\to\test-workspace
+```
+
+第一条验证私有命名卷，第二条验证显式宿主目录挂载。脚本会实际启动 microVM，
+完成 Shell、文件读写、导出和清理；镜像尚未缓存时需要访问 OCI registry。生产
+配置建议将 `SANDBOX_IMAGE` 固定到团队审核过的镜像 digest。
+
 ## Pi Agent 后端
 
 设置 `AGENT_BACKEND=pi` 后，新建会话默认由 Pi coding agent 的官方 RPC 模式执行；

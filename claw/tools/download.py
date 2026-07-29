@@ -18,10 +18,14 @@ import time
 import uuid
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
+from claw.config import DATA_DIR
 from claw.tools.base import Tool, ToolResult
 from claw.workspace.manager import WorkspaceManager, WorkspaceError
+
+if TYPE_CHECKING:
+    from claw.sandbox import SandboxManager
 
 logger = logging.getLogger(__name__)
 
@@ -45,12 +49,37 @@ def _prune_downloads_locked(now: float) -> bool:
         if now - created_at >= _DOWNLOAD_TTL_S or not path.is_file()
     ]
     for download_id in expired:
-        _downloads.pop(download_id, None)
+        entry = _downloads.pop(download_id, None)
+        if entry is not None:
+            _remove_managed_export(entry[0])
     trimmed = False
     while len(_downloads) > _MAX_DOWNLOADS:
-        _downloads.popitem(last=False)
+        _, (path, _) = _downloads.popitem(last=False)
+        _remove_managed_export(path)
         trimmed = True
     return bool(expired) or trimmed
+
+
+def _remove_managed_export(path: Path) -> None:
+    """Remove expired sandbox exports without ever deleting workspace files."""
+    export_root = (DATA_DIR / "sandbox" / "exports").resolve()
+    try:
+        resolved = path.resolve()
+        resolved.relative_to(export_root)
+    except (OSError, ValueError):
+        return
+    try:
+        resolved.unlink(missing_ok=True)
+    except OSError:
+        logger.warning("无法清理过期 sandbox 导出文件: %s", resolved)
+        return
+    parent = resolved.parent
+    while parent != export_root:
+        try:
+            parent.rmdir()
+        except OSError:
+            break
+        parent = parent.parent
 
 
 def _persist_downloads_locked() -> None:
@@ -131,6 +160,12 @@ def configure_download_registry(registry_path: Path | None) -> None:
                     and 0 <= now - created_at < _DOWNLOAD_TTL_S
                 ):
                     _downloads[download_id] = (path.resolve(), created_at)
+                elif (
+                    _DOWNLOAD_ID_RE.fullmatch(download_id)
+                    and path.is_absolute()
+                    and now - created_at >= _DOWNLOAD_TTL_S
+                ):
+                    _remove_managed_export(path)
         _prune_downloads_locked(now)
         _persist_downloads_locked()
 
@@ -174,17 +209,31 @@ def list_downloads() -> dict[str, str]:
 def _make_create_download_handler(
     workspace_manager: WorkspaceManager,
     session_id_provider: Callable[[], str],
+    sandbox_manager: SandboxManager | None = None,
 ) -> Callable[[dict[str, Any]], ToolResult]:
     def handler(args: dict[str, Any]) -> ToolResult:
         path_str: str = args["path"]
         session_id = session_id_provider()
 
-        try:
-            resolved = workspace_manager.resolve(
-                session_id, path_str, must_exist=True
-            )
-        except WorkspaceError as exc:
-            return ToolResult(ok=False, error=str(exc))
+        if sandbox_manager is not None:
+            try:
+                if sandbox_manager.should_use(session_id, workspace_manager):
+                    resolved = sandbox_manager.export_file(
+                        session_id, workspace_manager, path_str
+                    )
+                else:
+                    resolved = workspace_manager.resolve(
+                        session_id, path_str, must_exist=True
+                    )
+            except Exception as exc:
+                return ToolResult(ok=False, error=str(exc))
+        else:
+            try:
+                resolved = workspace_manager.resolve(
+                    session_id, path_str, must_exist=True
+                )
+            except WorkspaceError as exc:
+                return ToolResult(ok=False, error=str(exc))
 
         if not resolved.is_file():
             return ToolResult(
@@ -242,6 +291,7 @@ def _make_create_download_handler(
 def create_download_tool(
     workspace_manager: WorkspaceManager,
     session_id_provider: Callable[[], str],
+    sandbox_manager: SandboxManager | None = None,
 ) -> Tool:
     return Tool(
         name="create_download",
@@ -264,6 +314,8 @@ def create_download_tool(
             },
             "required": ["path"],
         },
-        handler=_make_create_download_handler(workspace_manager, session_id_provider),
+        handler=_make_create_download_handler(
+            workspace_manager, session_id_provider, sandbox_manager
+        ),
         safety_level="download",
     )

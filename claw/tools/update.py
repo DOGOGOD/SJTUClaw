@@ -17,11 +17,14 @@ import json
 import threading
 from functools import wraps
 from pathlib import Path
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from claw.tools.base import Tool, ToolResult
 from claw.utils import atomic_write
 from claw.workspace.manager import WorkspaceManager, WorkspaceError
+
+if TYPE_CHECKING:
+    from claw.sandbox import SandboxManager
 
 
 _UPDATE_LOCK = threading.RLock()
@@ -40,6 +43,7 @@ def _make_update_handler(
     operation: str,
     workspace_manager: WorkspaceManager,
     session_id_provider: Callable[[], str],
+    sandbox_manager: SandboxManager | None = None,
 ) -> Callable[[dict[str, Any]], ToolResult]:
     """Factory that returns a handler for create / overwrite / edit.
 
@@ -49,6 +53,62 @@ def _make_update_handler(
     def handler(args: dict[str, Any]) -> ToolResult:
         path_str: str = args["path"]
         session_id = session_id_provider()
+
+        if sandbox_manager is not None:
+            try:
+                use_sandbox = sandbox_manager.should_use(
+                    session_id, workspace_manager
+                )
+                if use_sandbox:
+                    if operation == "create":
+                        sandbox_manager.create_file(
+                            session_id, workspace_manager, path_str
+                        )
+                        message = "文件创建成功"
+                    elif operation == "overwrite":
+                        content = args.get("content", "")
+                        sandbox_manager.overwrite_file(
+                            session_id, workspace_manager, path_str, content
+                        )
+                        message = f"文件已覆盖写入，共 {len(content)} 字符"
+                    elif operation == "edit":
+                        sandbox_manager.edit_file(
+                            session_id,
+                            workspace_manager,
+                            path_str,
+                            args.get("old_string", ""),
+                            args.get("new_string", ""),
+                        )
+                        message = "文件已编辑，替换 1 处"
+                    else:
+                        return ToolResult(ok=False, error=f"未知操作: {operation}")
+                    return ToolResult(
+                        ok=True,
+                        content=json.dumps(
+                            {
+                                "tool": (
+                                    "create_file"
+                                    if operation == "create"
+                                    else (
+                                        "overwrite_file"
+                                        if operation == "overwrite"
+                                        else "edit_file"
+                                    )
+                                ),
+                                "path": path_str,
+                                "execution": "microsandbox",
+                                "result": message,
+                            },
+                            ensure_ascii=False,
+                        ),
+                    )
+            except FileExistsError:
+                return ToolResult(
+                    ok=False,
+                    error=f"create_file 失败：文件已存在 \"{path_str}\"",
+                )
+            except Exception as exc:
+                return ToolResult(ok=False, error=str(exc))
 
         try:
             resolved = workspace_manager.resolve(session_id, path_str)
@@ -194,6 +254,7 @@ def _do_edit(
 def create_create_file_tool(
     workspace_manager: WorkspaceManager,
     session_id_provider: Callable[[], str],
+    sandbox_manager: SandboxManager | None = None,
 ) -> Tool:
     return Tool(
         name="create_file",
@@ -212,7 +273,9 @@ def create_create_file_tool(
             },
             "required": ["path"],
         },
-        handler=_make_update_handler("create", workspace_manager, session_id_provider),
+        handler=_make_update_handler(
+            "create", workspace_manager, session_id_provider, sandbox_manager
+        ),
         safety_level="write",
     )
 
@@ -220,6 +283,7 @@ def create_create_file_tool(
 def create_overwrite_file_tool(
     workspace_manager: WorkspaceManager,
     session_id_provider: Callable[[], str],
+    sandbox_manager: SandboxManager | None = None,
 ) -> Tool:
     return Tool(
         name="overwrite_file",
@@ -243,7 +307,7 @@ def create_overwrite_file_tool(
             "required": ["path", "content"],
         },
         handler=_make_update_handler(
-            "overwrite", workspace_manager, session_id_provider
+            "overwrite", workspace_manager, session_id_provider, sandbox_manager
         ),
         safety_level="write",
     )
@@ -252,6 +316,7 @@ def create_overwrite_file_tool(
 def create_edit_file_tool(
     workspace_manager: WorkspaceManager,
     session_id_provider: Callable[[], str],
+    sandbox_manager: SandboxManager | None = None,
 ) -> Tool:
     return Tool(
         name="edit_file",
@@ -281,7 +346,9 @@ def create_edit_file_tool(
             },
             "required": ["path", "old_string", "new_string"],
         },
-        handler=_make_update_handler("edit", workspace_manager, session_id_provider),
+        handler=_make_update_handler(
+            "edit", workspace_manager, session_id_provider, sandbox_manager
+        ),
         safety_level="write",
     )
 

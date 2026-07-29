@@ -22,12 +22,15 @@ import heapq
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from claw.tools.base import Tool, ToolResult
 from claw.utils import default_timezone_name
 from claw.paths import main_dir
 from claw.workspace.manager import WorkspaceManager, WorkspaceError
+
+if TYPE_CHECKING:
+    from claw.sandbox import SandboxManager
 
 # Maximum file size before truncation: 64 KiB of UTF-8 text.
 # Larger files are truncated with a clear marker in the returned content
@@ -103,9 +106,46 @@ def _handle_current_time(args: dict[str, Any]) -> ToolResult:
 def _make_list_dir_handler(
     workspace_manager: WorkspaceManager | None = None,
     session_id_provider: Callable[[], str] | None = None,
+    sandbox_manager: SandboxManager | None = None,
 ) -> Callable[[dict[str, Any]], ToolResult]:
     def handler(args: dict[str, Any]) -> ToolResult:
         path_str: str = args["path"]
+        if (
+            sandbox_manager is not None
+            and workspace_manager is not None
+            and session_id_provider is not None
+        ):
+            session_id = session_id_provider()
+            try:
+                use_sandbox = sandbox_manager.should_use(
+                    session_id, workspace_manager
+                )
+                if use_sandbox:
+                    entries = sandbox_manager.list_dir(
+                        session_id, workspace_manager, path_str
+                    )
+                    lines = []
+                    for entry in entries[:_MAX_DIR_ENTRIES]:
+                        suffix = "/" if entry.kind in {"directory", "dir"} else ""
+                        line = entry.name + suffix
+                        if entry.kind in {"file", "regular"}:
+                            line += f"  ({_format_size(entry.size)})"
+                        lines.append(line)
+                    if len(entries) > _MAX_DIR_ENTRIES:
+                        lines.append(
+                            f"...[目录条目已截断，仅显示前 {_MAX_DIR_ENTRIES} 项]"
+                        )
+                    return ToolResult(
+                        ok=True,
+                        content=(
+                            "\n".join(lines)
+                            if lines
+                            else f'directory "{path_str}" is empty'
+                        ),
+                    )
+            except Exception as exc:
+                return ToolResult(ok=False, error=str(exc))
+
         try:
             target = _resolve_path(path_str, workspace_manager, session_id_provider)
         except WorkspaceError as exc:
@@ -160,9 +200,38 @@ def _make_list_dir_handler(
 def _make_read_file_handler(
     workspace_manager: WorkspaceManager | None = None,
     session_id_provider: Callable[[], str] | None = None,
+    sandbox_manager: SandboxManager | None = None,
 ) -> Callable[[dict[str, Any]], ToolResult]:
     def handler(args: dict[str, Any]) -> ToolResult:
         path_str: str = args["path"]
+        if (
+            sandbox_manager is not None
+            and workspace_manager is not None
+            and session_id_provider is not None
+        ):
+            session_id = session_id_provider()
+            try:
+                use_sandbox = sandbox_manager.should_use(
+                    session_id, workspace_manager
+                )
+                if use_sandbox:
+                    payload, truncated = sandbox_manager.read_file(
+                        session_id,
+                        workspace_manager,
+                        path_str,
+                        max_bytes=_MAX_FILE_BYTES,
+                    )
+                    raw = payload.decode("utf-8", errors="replace")
+                    content = (
+                        f"[file too large, truncated] "
+                        f"showing first {_format_size(_MAX_FILE_BYTES)}:\n\n{raw}"
+                        if truncated
+                        else raw
+                    )
+                    return ToolResult(ok=True, content=content)
+            except Exception as exc:
+                return ToolResult(ok=False, error=str(exc))
+
         try:
             target = _resolve_path(path_str, workspace_manager, session_id_provider)
         except WorkspaceError as exc:
@@ -251,6 +320,7 @@ def create_current_time_tool() -> Tool:
 def create_list_dir_tool(
     workspace_manager: WorkspaceManager | None = None,
     session_id_provider: Callable[[], str] | None = None,
+    sandbox_manager: SandboxManager | None = None,
 ) -> Tool:
     return Tool(
         name="list_dir",
@@ -270,7 +340,9 @@ def create_list_dir_tool(
             },
             "required": ["path"],
         },
-        handler=_make_list_dir_handler(workspace_manager, session_id_provider),
+        handler=_make_list_dir_handler(
+            workspace_manager, session_id_provider, sandbox_manager
+        ),
         safety_level="read_only",
         concurrency_safe=True,
     )
@@ -279,6 +351,7 @@ def create_list_dir_tool(
 def create_read_file_tool(
     workspace_manager: WorkspaceManager | None = None,
     session_id_provider: Callable[[], str] | None = None,
+    sandbox_manager: SandboxManager | None = None,
 ) -> Tool:
     return Tool(
         name="read_file",
@@ -300,7 +373,9 @@ def create_read_file_tool(
             },
             "required": ["path"],
         },
-        handler=_make_read_file_handler(workspace_manager, session_id_provider),
+        handler=_make_read_file_handler(
+            workspace_manager, session_id_provider, sandbox_manager
+        ),
         safety_level="read_only",
         concurrency_safe=True,
     )
@@ -310,6 +385,7 @@ def register_all_readonly(
     registry,
     workspace_manager: WorkspaceManager | None = None,
     session_id_provider: Callable[[], str] | None = None,
+    sandbox_manager: SandboxManager | None = None,
 ) -> None:
     """Register all three read-only tools in *registry*.
 
@@ -318,5 +394,13 @@ def register_all_readonly(
     per-session workspace.
     """
     registry.register(create_current_time_tool())
-    registry.register(create_list_dir_tool(workspace_manager, session_id_provider))
-    registry.register(create_read_file_tool(workspace_manager, session_id_provider))
+    registry.register(
+        create_list_dir_tool(
+            workspace_manager, session_id_provider, sandbox_manager
+        )
+    )
+    registry.register(
+        create_read_file_tool(
+            workspace_manager, session_id_provider, sandbox_manager
+        )
+    )

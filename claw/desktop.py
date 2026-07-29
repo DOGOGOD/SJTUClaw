@@ -22,6 +22,12 @@ from claw.paths import resource_root, user_root
 from claw.utils import force_utf8_stdio
 
 
+_WEBVIEW_RECOVERY_LIMIT = 2
+_WEBVIEW_RECOVERY_WINDOW_SECONDS = 60.0
+_webview_recovery_attempts: list[float] = []
+_webview_process_failed_handlers: list[object] = []
+
+
 def _port_available(port: int) -> bool:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.settimeout(0.2)
@@ -132,6 +138,97 @@ def _window_icon_path() -> str | None:
     return None
 
 
+def _webview_failure_value(args: object, name: str, default: object = "unknown") -> object:
+    try:
+        return getattr(args, name)
+    except (AttributeError, RuntimeError):
+        getter = getattr(args, f"get_{name}", None)
+        if callable(getter):
+            try:
+                return getter()
+            except (AttributeError, RuntimeError):
+                pass
+    return default
+
+
+def _webview_failure_text(args: object, name: str) -> str:
+    value = _webview_failure_value(args, name)
+    to_string = getattr(value, "ToString", None)
+    if callable(to_string):
+        try:
+            return str(to_string())
+        except (AttributeError, RuntimeError):
+            pass
+    return str(value)
+
+
+def _handle_webview_process_failed(sender: object, args: object) -> None:
+    """Log WebView2 failures and recover a crashed main-frame renderer."""
+    global _webview_recovery_attempts
+
+    kind = _webview_failure_text(args, "ProcessFailedKind")
+    reason = _webview_failure_text(args, "Reason")
+    exit_code = _webview_failure_value(args, "ExitCode")
+    _log(
+        "WebView2 process failed: "
+        f"kind={kind}, reason={reason}, exitCode={exit_code}"
+    )
+
+    if kind != "RenderProcessExited":
+        return
+
+    now = time.monotonic()
+    _webview_recovery_attempts = [
+        attempt
+        for attempt in _webview_recovery_attempts
+        if now - attempt < _WEBVIEW_RECOVERY_WINDOW_SECONDS
+    ]
+    if len(_webview_recovery_attempts) >= _WEBVIEW_RECOVERY_LIMIT:
+        _log("WebView2 automatic reload skipped after repeated renderer failures.")
+        return
+
+    _webview_recovery_attempts.append(now)
+    try:
+        sender.Reload()
+        _log("WebView2 renderer reloaded automatically.")
+    except Exception:
+        _log("WebView2 automatic reload failed:\n" + traceback.format_exc())
+
+
+def _install_webview_recovery(window: object) -> None:
+    """Attach WebView2 process recovery after pywebview initializes."""
+    if os.name != "nt":
+        return
+
+    events = getattr(window, "events", None)
+    loaded = getattr(events, "loaded", None)
+    if loaded is None or not loaded.wait(20):
+        _log("WebView2 recovery handler was not installed before startup timeout.")
+        return
+
+    try:
+        native = getattr(window, "native")
+        control = getattr(native, "webview")
+        core = getattr(control, "CoreWebView2")
+
+        def process_failed(sender, args):
+            _handle_webview_process_failed(sender, args)
+
+        def attach():
+            core.add_ProcessFailed(process_failed)
+
+        if getattr(native, "InvokeRequired", False):
+            from System import Action
+
+            native.Invoke(Action(attach))
+        else:
+            attach()
+        _webview_process_failed_handlers.append(process_failed)
+        _log("WebView2 process recovery handler installed.")
+    except Exception:
+        _log("WebView2 recovery handler installation failed:\n" + traceback.format_exc())
+
+
 def _run_window(url: str) -> None:
     try:
         import webview
@@ -140,7 +237,7 @@ def _run_window(url: str) -> None:
         while True:
             time.sleep(3600)
 
-    webview.create_window(
+    window = webview.create_window(
         "SJTUClaw",
         url,
         width=1280,
@@ -148,7 +245,12 @@ def _run_window(url: str) -> None:
         min_size=(960, 640),
         text_select=True,
     )
-    webview.start(icon=_window_icon_path())
+    webview.start(
+        _install_webview_recovery,
+        args=(window,),
+        gui="edgechromium" if os.name == "nt" else None,
+        icon=_window_icon_path(),
+    )
 
 
 def _run_sandbox_self_test(report_path: Path, workspace: Path) -> int:

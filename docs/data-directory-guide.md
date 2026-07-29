@@ -33,7 +33,7 @@ SJTUClaw 会根据运行方式决定数据目录：
 data/
 ├── claude/         # Claude Code 临时运行交换文件
 ├── cron/           # 定时任务及运行输出
-├── downloads/      # Web UI 临时下载注册表
+├── downloads/      # Web UI 持久下载注册表
 ├── memory/         # 跨会话长期记忆
 ├── pet/            # 桌宠运行设置和互动台词
 ├── pets/           # 用户导入的宠物资源
@@ -277,9 +277,9 @@ MCP。Claude session UUID、generation、owner 和工作目录映射保存在对
 目录内还会短暂出现随机命名的 `.sjtuclaw-approval-*` 交换目录；批准、拒绝、停止或
 正常结束后都会自动清理。
 
-## 5. `data/downloads/`：临时下载注册表
+## 5. `data/downloads/`：持久下载注册表
 
-`downloads/registry.json` 保存 `create_download` 创建的临时入口，结构包含版本号及
+`downloads/registry.json` 保存 `create_download` 创建的下载入口，结构包含版本号及
 若干下载条目：
 
 ```json
@@ -295,9 +295,9 @@ MCP。Claude session UUID、generation、owner 和工作目录映射保存在对
 }
 ```
 
-注册表只记录文件位置，不复制文件内容。入口默认一小时过期，最多保留 1000 条；
-加载、查询和新增时会清理过期、源文件不存在或超过容量的条目。采用临时文件加
-原子替换写入，Gateway 重启后仍可恢复有效条目。该文件包含 workspace 绝对路径，
+注册表只记录文件位置，不复制文件内容。入口不按时间过期，最多保留 1000 条；
+加载、查询和新增时会清理源文件不存在或超过容量的条目。采用临时文件加
+原子替换写入，Gateway 重启和重新打开旧会话后仍可恢复有效条目。该文件包含 workspace 绝对路径，
 因此也应作为私有运行数据保护。
 
 删除 `registry.json` 不会删除 workspace 中的原文件，但所有既有下载链接会失效；
@@ -731,7 +731,7 @@ JSONL 会话、定时任务输出、SQLite 检查点和内容对象库让系统�
 - `sessions/` 负责对话；
 - `pi/` 负责 Pi 后端上下文；
 - `claude/runtime/` 负责 Claude Code 的临时提示交换；
-- `downloads/` 负责一小时有效的 Web UI 文件入口；
+- `downloads/` 负责可跨时间和重启恢复的 Web UI 文件入口；
 - `memory/` 负责长期记忆；
 - `cron/` 负责自动任务；
 - `pet/` 和 `pets/` 负责桌宠；

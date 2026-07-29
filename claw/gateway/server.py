@@ -86,7 +86,9 @@ from claw.tools import register_all_tools
 from claw.tools.download import (
     configure_download_registry,
     get_download,
+    is_valid_download_id,
     list_downloads,
+    restore_download,
 )
 from claw.workspace.manager import WorkspaceManager, WorkspaceError
 from claw.workspace.rollback import WorkspaceRollbackManager, RollbackError
@@ -2537,8 +2539,10 @@ def serve_download(
     """Serve the file registered under *download_id*."""
     file_path = get_download(download_id)
     if file_path is None:
+        file_path = _restore_download_from_session_history(download_id)
+    if file_path is None:
         raise HTTPException(
-            status_code=404, detail=f"下载入口不存在或已过期: {download_id}"
+            status_code=404, detail=f"下载入口不存在或已失效: {download_id}"
         )
     if not file_path.exists():
         raise HTTPException(
@@ -2559,6 +2563,65 @@ def serve_download(
         media_type=media_type,
         headers=headers,
     )
+
+
+def _restore_download_from_session_history(download_id: str) -> Path | None:
+    """Recover links pruned by older versions from persisted tool results."""
+    if not is_valid_download_id(download_id):
+        return None
+    match: tuple[str, str] | None = None
+    for summary in _session_store.list_summaries():
+        try:
+            session = _session_store.get(summary.session_id)
+        except Exception:
+            continue
+        for message in reversed(tuple(session.messages)):
+            if message.role != "tool" or message.name != "create_download":
+                continue
+            try:
+                payload = json.loads(message.content)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            if (
+                payload.get("tool") == "create_download"
+                and payload.get("downloadId") == download_id
+                and isinstance(payload.get("path"), str)
+                and payload["path"].strip()
+            ):
+                match = (session.session_id, payload["path"])
+                break
+        if match is not None:
+            break
+
+    if match is None:
+        return None
+
+    session_id, path_str = match
+    try:
+        if _sandbox_manager.should_use(session_id, _workspace_manager):
+            recovered = _sandbox_manager.export_file(
+                session_id,
+                _workspace_manager,
+                path_str,
+            )
+        else:
+            recovered = _workspace_manager.resolve(
+                session_id,
+                path_str,
+                must_exist=True,
+            )
+        restore_download(download_id, recovered)
+        logger.info("已从会话历史恢复下载入口: %s", download_id)
+        return recovered
+    except Exception as exc:
+        logger.warning(
+            "无法从会话历史恢复下载入口 %s: %s",
+            download_id,
+            exc,
+        )
+        return None
 
 
 # ==========================================================================

@@ -14,6 +14,7 @@ interface ThreadComposerProps {
   messageHistory?: string[];
   workspaceRefreshToken?: number;
   home?: boolean;
+  onCreateWorkspaceSession?: (path: string) => Promise<void>;
 }
 
 interface PendingAttachment {
@@ -43,12 +44,14 @@ export function ThreadComposer({
   messageHistory,
   workspaceRefreshToken = 0,
   home = false,
+  onCreateWorkspaceSession,
 }: ThreadComposerProps) {
   const [value, setValue] = useState("");
   const [showWsPicker, setShowWsPicker] = useState(false);
   const [wsPath, setWsPath] = useState("");
-  const [wsDisplay, setWsDisplay] = useState("");
+  const [savedWsPath, setSavedWsPath] = useState("");
   const [wsError, setWsError] = useState("");
+  const [workspaceBusy, setWorkspaceBusy] = useState(false);
   const [sendError, setSendError] = useState("");
   const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([]);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -61,17 +64,22 @@ export function ThreadComposer({
   const pendingAttachmentsRef = useRef<PendingAttachment[]>([]);
 
   const historyKey = sessionId || "__home__";
+  const wsDisplay = savedWsPath
+    ? savedWsPath.split("/").pop()?.split("\\").pop() || savedWsPath
+    : "";
+  const workspaceDraftChanged = wsPath.trim() !== savedWsPath;
 
   useEffect(() => {
     if (!sessionId) {
       setWsPath("");
-      setWsDisplay("");
+      setSavedWsPath("");
       setWsError("");
       return;
     }
     fetchWorkspace(sessionId).then((d) => {
-      setWsPath(d.workspace || "");
-      setWsDisplay(d.workspace ? d.workspace.split("/").pop()?.split("\\").pop() || d.workspace : "");
+      const workspace = d.workspace || "";
+      setWsPath(workspace);
+      setSavedWsPath(workspace);
     }).catch(() => {});
   }, [sessionId, workspaceRefreshToken]);
 
@@ -111,11 +119,15 @@ export function ThreadComposer({
 
   useEffect(() => {
     const handler = (e: MouseEvent) => {
-      if (wsRef.current && !wsRef.current.contains(e.target as Node)) setShowWsPicker(false);
+      if (wsRef.current && !wsRef.current.contains(e.target as Node)) {
+        setWsPath(savedWsPath);
+        setWsError("");
+        setShowWsPicker(false);
+      }
     };
     if (showWsPicker) document.addEventListener("mousedown", handler);
     return () => document.removeEventListener("mousedown", handler);
-  }, [showWsPicker]);
+  }, [savedWsPath, showWsPicker]);
 
   const autoResize = useCallback(() => {
     const el = textareaRef.current;
@@ -305,48 +317,77 @@ export function ThreadComposer({
 
   const handlePickFolder = useCallback(async () => {
     setWsError("");
+    setWorkspaceBusy(true);
     try {
       const result = await pickWorkspace();
       if (result.path) {
         setWsPath(result.path);
-        setWsDisplay(result.path.split("/").pop()?.split("\\").pop() || result.path);
       }
     } catch (error) {
       setWsError(error instanceof Error ? error.message : "无法打开本机文件夹选择器。");
+    } finally {
+      setWorkspaceBusy(false);
     }
   }, []);
 
   const handleWsSet = async () => {
-    if (!sessionId) return;
-    const sid = sessionId;
     const path = wsPath.trim();
     if (!path) {
       setWsError("请填写 workspace 的绝对路径。");
       return;
     }
+    if (!sessionId && !onCreateWorkspaceSession) {
+      setWsError("无法为新会话创建 workspace，请刷新页面后重试。");
+      return;
+    }
+    setWorkspaceBusy(true);
     try {
-      await setWorkspace(sid, path);
+      if (sessionId) {
+        await setWorkspace(sessionId, path);
+      } else {
+        await onCreateWorkspaceSession!(path);
+      }
       setWsPath(path);
-      setWsDisplay(path.split("/").pop()?.split("\\").pop() || path);
+      setSavedWsPath(path);
       setWsError("");
       setShowWsPicker(false);
     } catch (error) {
       setWsError(error instanceof Error ? error.message : "workspace 设置失败，请检查路径是否存在且为文件夹。");
+    } finally {
+      setWorkspaceBusy(false);
     }
   };
 
   const handleWsUnset = async () => {
-    if (!sessionId) return;
+    if (!sessionId) {
+      setWsPath("");
+      setWsError("");
+      setShowWsPicker(false);
+      return;
+    }
     const sid = sessionId;
+    setWorkspaceBusy(true);
     try {
       await unsetWorkspace(sid);
       setWsPath("");
-      setWsDisplay("");
+      setSavedWsPath("");
       setWsError("");
       setShowWsPicker(false);
     } catch (error) {
       setWsError(error instanceof Error ? error.message : "取消 workspace 失败，请重试。");
+    } finally {
+      setWorkspaceBusy(false);
     }
+  };
+
+  const handleWsCancelOrUnset = async () => {
+    if (workspaceDraftChanged) {
+      setWsPath(savedWsPath);
+      setWsError("");
+      setShowWsPicker(false);
+      return;
+    }
+    await handleWsUnset();
   };
 
   const hasContent = value.trim().length > 0 || pendingAttachments.length > 0;
@@ -409,25 +450,64 @@ export function ThreadComposer({
         <Button
           variant="ghost"
           size="icon-sm"
-          onClick={() => setShowWsPicker(!showWsPicker)}
-          disabled={!sessionId}
+          onClick={() => {
+            setWsPath(savedWsPath);
+            setWsError("");
+            setShowWsPicker(!showWsPicker);
+          }}
+          disabled={workspaceBusy || (!sessionId && !onCreateWorkspaceSession)}
           className={cn("h-8 w-8 rounded-xl", wsDisplay && "bg-primary/10 text-primary")}
-          title={wsDisplay || "未设置 workspace"}
+          title={wsDisplay || (home ? "选择工作区" : "未设置 workspace")}
+          aria-label={wsDisplay ? `当前工作区：${wsDisplay}` : "选择工作区"}
         >
           <FolderOpen className="h-3.5 w-3.5" />
         </Button>
         {showWsPicker && (
           <div className="absolute bottom-full left-0 z-50 mb-2 w-[min(20rem,calc(100vw-2rem))] rounded-2xl border border-border/70 bg-popover/95 p-4 shadow-2xl backdrop-blur-xl animate-enter-scale">
             <p className="mb-1 text-sm font-semibold">Workspace</p>
-            <p className="mb-3 text-[11px] leading-relaxed text-muted-foreground">设置当前会话允许操作的项目目录。</p>
+            <p className="mb-3 text-[11px] leading-relaxed text-muted-foreground">
+              {sessionId
+                ? "设置当前会话允许操作的项目目录。"
+                : "选择目录后将创建新会话，并将该目录设为工作区。"}
+            </p>
             <div className="flex gap-1.5 mb-2.5">
-              <Input value={wsPath} onChange={(e) => setWsPath(e.target.value)} placeholder="选择文件夹或输入路径..." className="h-7 text-xs flex-1" onKeyDown={(e) => e.key === "Enter" && handleWsSet()} />
-              <Button variant="outline" size="sm" className="h-7 w-7 p-0 shrink-0" onClick={handlePickFolder}><FolderSearch className="h-3 w-3" /></Button>
+              <Input
+                value={wsPath}
+                onChange={(e) => setWsPath(e.target.value)}
+                placeholder="选择文件夹或输入路径..."
+                className="h-7 text-xs flex-1"
+                onKeyDown={(e) => e.key === "Enter" && handleWsSet()}
+                aria-label="workspace 路径"
+                disabled={workspaceBusy}
+              />
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-7 w-7 p-0 shrink-0"
+                onClick={handlePickFolder}
+                aria-label="浏览工作区"
+                title="浏览工作区"
+                disabled={workspaceBusy}
+              >
+                <FolderSearch className="h-3 w-3" />
+              </Button>
             </div>
             {wsError && <p role="alert" className="mb-2 text-[11px] leading-relaxed text-destructive">{wsError}</p>}
             <div className="flex gap-1.5">
-              <Button size="sm" className="h-6 text-[10px]" onClick={handleWsSet}>设置</Button>
-              {wsPath && <Button variant="ghost" size="sm" className="h-6 text-[10px] text-destructive" onClick={handleWsUnset}>取消</Button>}
+              <Button size="sm" className="h-6 text-[10px]" onClick={handleWsSet} disabled={workspaceBusy}>
+                {workspaceBusy ? "设置中" : "设置"}
+              </Button>
+              {(wsPath || savedWsPath) && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-6 text-[10px] text-destructive"
+                  onClick={handleWsCancelOrUnset}
+                  disabled={workspaceBusy}
+                >
+                  取消
+                </Button>
+              )}
             </div>
           </div>
         )}

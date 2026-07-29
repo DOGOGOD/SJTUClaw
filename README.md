@@ -25,7 +25,7 @@ SJTUClaw 将多轮对话、工具调用、长期记忆、Skill、定时任务和
 - **Skill 系统**：通过 `SKILL.md` 组织可复用工作流，支持发现、加载和管理。
 - **多入口与实时反馈**：Web UI 通过 SSE 展示 Agent 事件，QQ Bot 支持私聊、群聊和内联审批。
 - **多模态会话**：Web UI 支持粘贴或上传图片，每条消息最多 4 张、单张最多 20 MB；附件按 Session 隔离保存。
-- **输出文件交付**：Agent 可把 workspace 内的图片、Markdown、PDF、Office 文档、压缩包等注册为临时下载；Web UI 自动显示图片预览或文件下载按钮，链接在一小时有效期内可跨 Gateway 重启继续使用。
+- **输出文件交付**：Agent 可把 workspace 内的图片、Markdown、PDF、Office 文档、压缩包等注册为下载；Web UI 自动显示图片预览或文件下载按钮，只要源文件仍存在，链接即可跨时间和 Gateway 重启继续使用。
 - **本地化时间与定时任务**：自动识别系统时区，支持 `CLAW_TIMEZONE` 显式覆盖，识别失败时回退到上海时区。
 - **Windows 桌面应用**：使用 pywebview 承载完整 Web UI，通过 PyInstaller 打包后无需单独安装 Python 或 Node.js。
 - **标准安装与卸载体验**：使用 Inno Setup 7 生成安装向导，支持自选安装路径、开始菜单、桌面快捷方式、覆盖升级和系统卸载入口。
@@ -186,8 +186,8 @@ Gateway 启动后访问 <http://127.0.0.1:8000>。
 
 需要从 Web UI 获取 Agent 生成的文件时，可以直接要求“把某文件通过 WebUI 发给我”。
 Agent 调用 `create_download` 后，普通文件会显示带文件名的下载按钮，安全的位图格式会
-同时显示预览和下载入口。下载注册表保存在 `data/downloads/registry.json`，链接默认
-有效一小时；源文件被删除、有效期结束或注册表条目被清理后，链接即失效。下载入口
+同时显示预览和下载入口。下载注册表保存在 `data/downloads/registry.json`，链接不再
+按时间过期；源文件被删除或最旧的注册表条目因超过 1000 条上限被清理后，链接才会失效。下载入口
 只暴露已注册文件，不允许通过下载 URL 提交任意路径读取服务器文件；默认模式下
 注册源文件仍受当前 session 的 workspace 边界约束。
 

@@ -25,22 +25,28 @@ def test_download_registry_is_bounded(monkeypatch, tmp_path):
     assert len(download.list_downloads()) == 3
 
 
-def test_download_registry_expires_old_entries(monkeypatch, tmp_path):
+def test_download_registry_keeps_old_entries_while_file_exists(
+    monkeypatch, tmp_path
+):
     from claw.tools import download
 
-    download.configure_download_registry(None)
-    clock = iter((10.0, 10.0, 12.0))
-    monkeypatch.setattr(download, "_DOWNLOAD_TTL_S", 1)
-    monkeypatch.setattr(download.time, "time", lambda: next(clock))
-    with download._downloads_lock:
-        download._downloads.clear()
-
+    registry = tmp_path / "downloads" / "registry.json"
     path = tmp_path / "result.txt"
     path.write_text("result", encoding="utf-8")
-    download_id = download.register_download(path)
+    try:
+        download.configure_download_registry(registry)
+        monkeypatch.setattr(download.time, "time", lambda: 10.0)
+        download_id = download.register_download(path)
 
-    assert download.get_download(download_id) == path
-    assert download.get_download(download_id) is None
+        # Simulate reopening a saved chat long after the former one-hour TTL.
+        monkeypatch.setattr(download.time, "time", lambda: 86_410.0)
+        download.configure_download_registry(None)
+        download.configure_download_registry(registry)
+
+        assert download.get_download(download_id) == path.resolve()
+        assert download.get_download(download_id) == path.resolve()
+    finally:
+        download.configure_download_registry(None)
 
 
 def test_download_registry_survives_reload(tmp_path):
@@ -129,7 +135,7 @@ def test_register_download_merges_entries_created_by_another_process(tmp_path):
         download.configure_download_registry(None)
 
 
-def test_expired_download_removes_only_managed_sandbox_export(
+def test_capacity_eviction_removes_only_managed_sandbox_export(
     monkeypatch, tmp_path
 ):
     from claw.tools import download
@@ -140,17 +146,20 @@ def test_expired_download_removes_only_managed_sandbox_export(
     managed.write_text("managed", encoding="utf-8")
     ordinary = tmp_path / "workspace.txt"
     ordinary.write_text("workspace", encoding="utf-8")
+    replacement = tmp_path / "replacement.txt"
+    replacement.write_text("replacement", encoding="utf-8")
     monkeypatch.setattr(download, "DATA_DIR", tmp_path)
-    monkeypatch.setattr(download, "_DOWNLOAD_TTL_S", 1)
-    clock = iter((10.0, 10.0, 10.0, 10.0, 12.0))
-    monkeypatch.setattr(download.time, "time", lambda: next(clock))
+    monkeypatch.setattr(download, "_MAX_DOWNLOADS", 1)
     download.configure_download_registry(None)
 
-    managed_id = download.register_download(managed)
     ordinary_id = download.register_download(ordinary)
-    assert download.get_download(managed_id) == managed
-    assert download.get_download(ordinary_id) == ordinary
+    managed_id = download.register_download(managed)
+    assert download.get_download(ordinary_id) is None
+    assert ordinary.exists()
+
+    replacement_id = download.register_download(replacement)
     assert download.get_download(managed_id) is None
+    assert download.get_download(replacement_id) == replacement
 
     assert not managed.exists()
     assert ordinary.exists()

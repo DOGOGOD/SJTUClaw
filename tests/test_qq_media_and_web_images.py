@@ -561,6 +561,106 @@ def test_download_endpoint_serves_all_supported_file_formats(
         download.configure_download_registry(None)
 
 
+def test_old_chat_images_remain_available_after_gateway_restart(
+    monkeypatch, tmp_path
+):
+    from claw.gateway import server
+    from claw.tools import download
+
+    registry = tmp_path / "downloads" / "registry.json"
+    images = []
+    for index in range(3):
+        image = tmp_path / f"history-{index}.png"
+        image.write_bytes(f"image-{index}".encode())
+        images.append(image)
+
+    try:
+        download.configure_download_registry(registry)
+        created_at = iter((10.0, 20.0, 30.0))
+        monkeypatch.setattr(download.time, "time", lambda: next(created_at))
+        download_ids = [download.register_download(image) for image in images]
+
+        # Simulate reopening a chat after a restart, well past the former TTL.
+        monkeypatch.setattr(download.time, "time", lambda: 100_000.0)
+        download.configure_download_registry(None)
+        download.configure_download_registry(registry)
+
+        with TestClient(server.app) as client:
+            responses = [
+                client.get(f"/downloads/{download_id}")
+                for download_id in download_ids
+            ]
+
+        assert [response.status_code for response in responses] == [200, 200, 200]
+        assert [response.content for response in responses] == [
+            image.read_bytes() for image in images
+        ]
+    finally:
+        download.configure_download_registry(None)
+
+
+def test_download_endpoint_recovers_link_pruned_by_older_version(
+    monkeypatch, tmp_path
+):
+    import json
+    from types import SimpleNamespace
+
+    from claw.gateway import server
+    from claw.tools import download
+
+    download_id = "dl_123456789abc"
+    image = tmp_path / "recovered.png"
+    image.write_bytes(b"recovered-image")
+    tool_message = SimpleNamespace(
+        role="tool",
+        name="create_download",
+        content=json.dumps(
+            {
+                "tool": "create_download",
+                "path": "recovered.png",
+                "downloadId": download_id,
+            }
+        ),
+    )
+    session = SimpleNamespace(
+        session_id="session-history",
+        messages=[tool_message],
+    )
+    store = SimpleNamespace(
+        list_summaries=lambda: [
+            SimpleNamespace(session_id=session.session_id)
+        ],
+        get=lambda session_id: session,
+    )
+
+    class _Sandbox:
+        def __init__(self):
+            self.exported = []
+
+        def should_use(self, session_id, workspace_manager):
+            return True
+
+        def export_file(self, session_id, workspace_manager, path):
+            self.exported.append((session_id, path))
+            return image
+
+    sandbox = _Sandbox()
+    monkeypatch.setattr(server, "_session_store", store)
+    monkeypatch.setattr(server, "_sandbox_manager", sandbox)
+    monkeypatch.setattr(server, "_workspace_manager", object())
+    download.configure_download_registry(None)
+
+    try:
+        response = TestClient(server.app).get(f"/downloads/{download_id}")
+
+        assert response.status_code == 200
+        assert response.content == image.read_bytes()
+        assert sandbox.exported == [("session-history", "recovered.png")]
+        assert download.get_download(download_id) == image.resolve()
+    finally:
+        download.configure_download_registry(None)
+
+
 def test_workspace_endpoint_normalizes_quotes_and_file_uri(monkeypatch, tmp_path):
     from pathlib import Path
     from claw.gateway import server

@@ -236,7 +236,11 @@ export async function pickWorkspace(): Promise<{ ok: boolean; cancelled?: boolea
   return request("/workspace/pick", { method: "POST", body: "{}" });
 }
 
-export async function setWorkspace(sessionId: string, path: string): Promise<{ ok: boolean; workspace: string }> {
+export async function setWorkspace(sessionId: string, path: string): Promise<{
+  ok: boolean;
+  workspace: string;
+  rollback?: import("@/lib/types").RollbackStatus;
+}> {
   return request("/workspace", {
     method: "POST",
     body: JSON.stringify({ sessionId, path }),

@@ -49,6 +49,76 @@ describe("ThreadComposer keyboard interactions", () => {
     expect(view.getByTitle("project-two")).toBeTruthy();
   });
 
+  it("lets the homepage create a session with a selected workspace", async () => {
+    vi.spyOn(api, "pickWorkspace").mockResolvedValue({
+      ok: true,
+      path: "C:\\Projects\\demo",
+    });
+    const onCreateWorkspaceSession = vi.fn().mockResolvedValue(undefined);
+    const view = render(
+      <ThreadComposer
+        onSend={vi.fn().mockResolvedValue(undefined)}
+        sessionId={null}
+        onCreateWorkspaceSession={onCreateWorkspaceSession}
+        home
+      />
+    );
+
+    const workspaceButton = view.getByRole("button", { name: "选择工作区" });
+    expect((workspaceButton as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(workspaceButton);
+    expect(view.getByText("选择目录后将创建新会话，并将该目录设为工作区。")).toBeTruthy();
+
+    fireEvent.click(view.getByRole("button", { name: "浏览工作区" }));
+    await waitFor(() => {
+      expect((view.getByLabelText("workspace 路径") as HTMLInputElement).value)
+        .toBe("C:\\Projects\\demo");
+    });
+    expect(view.getByRole("button", { name: "取消" })).toBeTruthy();
+    expect(view.getByRole("button", { name: "选择工作区" }).className)
+      .not.toContain("bg-primary/10");
+    fireEvent.click(view.getByRole("button", { name: "设置" }));
+
+    await waitFor(() => {
+      expect(onCreateWorkspaceSession).toHaveBeenCalledWith("C:\\Projects\\demo");
+    });
+  });
+
+  it("does not show an unconfirmed workspace as bound after dismissing the picker", async () => {
+    const fetchWorkspace = vi.spyOn(api, "fetchWorkspace").mockResolvedValue({
+      ok: true,
+      sessionId: "session-a",
+      workspace: null,
+      isSet: false,
+    });
+    vi.spyOn(api, "pickWorkspace").mockResolvedValue({
+      ok: true,
+      path: "C:\\Projects\\unconfirmed",
+    });
+    const setWorkspace = vi.spyOn(api, "setWorkspace");
+    const view = render(
+      <ThreadComposer onSend={vi.fn().mockResolvedValue(undefined)} sessionId="session-a" />
+    );
+
+    await waitFor(() => expect(fetchWorkspace).toHaveBeenCalledTimes(1));
+    const workspaceButton = view.getByRole("button", { name: "选择工作区" });
+    fireEvent.click(workspaceButton);
+    fireEvent.click(view.getByRole("button", { name: "浏览工作区" }));
+
+    await waitFor(() => {
+      expect((view.getByLabelText("workspace 路径") as HTMLInputElement).value)
+        .toBe("C:\\Projects\\unconfirmed");
+    });
+    expect(workspaceButton.className).not.toContain("bg-primary/10");
+
+    fireEvent.mouseDown(document.body);
+
+    await waitFor(() => expect(view.queryByText("Workspace")).toBeNull());
+    expect(setWorkspace).not.toHaveBeenCalled();
+    expect(view.getByRole("button", { name: "选择工作区" }).className)
+      .not.toContain("bg-primary/10");
+  });
+
   it("clears immediately after clicking send", () => {
     const onSend = vi.fn(() => new Promise<void>(() => {}));
     const view = render(<ThreadComposer onSend={onSend} sessionId="session-a" />);

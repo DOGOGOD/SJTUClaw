@@ -25,6 +25,7 @@ interface ThreadShellProps {
   onStop?: () => Promise<void>;
   onToggleSidebar?: () => void;
   onNewChat: () => void;
+  onCreateWorkspaceSession?: (path: string) => Promise<void>;
   theme: "light" | "dark";
   onToggleTheme: () => void;
   hideSidebarToggle?: boolean;
@@ -96,6 +97,7 @@ export function ThreadShell({
   onSend,
   onStop,
   onToggleSidebar,
+  onCreateWorkspaceSession,
   onToggleTheme,
   autoMode = false,
   sandboxMode = false,
@@ -232,7 +234,15 @@ export function ThreadShell({
           <div className="mx-auto flex min-h-full w-full max-w-[760px] flex-col justify-center pb-[8vh]">
             <ThreadViewport messages={messages} loading={loading} sessionId={sessionId} rollbackEnabled={rollbackEnabled} rollingBack={rollingBack} onRollback={onRollback} />
             <div className="mt-8">
-              <ThreadComposer onSend={onSend} sessionId={sessionId} messageHistory={messageHistory} sending={sending} workspaceRefreshToken={workspaceRefreshToken} home />
+              <ThreadComposer
+                onSend={onSend}
+                sessionId={sessionId}
+                messageHistory={messageHistory}
+                sending={sending}
+                workspaceRefreshToken={workspaceRefreshToken}
+                onCreateWorkspaceSession={onCreateWorkspaceSession}
+                home
+              />
             </div>
             <p className="mt-3 text-center text-[10px] text-muted-foreground/55 select-none">
               Claw 可能会犯错，请核对重要信息

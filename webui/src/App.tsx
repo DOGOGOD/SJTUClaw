@@ -11,7 +11,7 @@ import { useSessions } from "@/hooks/useSessions";
 import { cn, escapeMarkdownImageAlt } from "@/lib/utils";
 import { isPetSelectionCommand, isSlashCommand } from "@/lib/commands";
 import { messagesAfterCommandRefresh, resolveCommandNavigation } from "@/lib/commandState";
-import { fetchMessages, sendMessage, sendCommand, stopChat, uploadAttachment, renameSession, fetchApprovals, approveApproval, rejectApproval, previewRollback, applyRollback } from "@/lib/api";
+import { fetchMessages, sendMessage, sendCommand, stopChat, uploadAttachment, renameSession, fetchApprovals, approveApproval, rejectApproval, previewRollback, applyRollback, setWorkspace } from "@/lib/api";
 import type { AgentBackend, ApprovalInfo } from "@/lib/types";
 import type { ChatMessage, SettingsSection, ShellView } from "@/lib/types";
 
@@ -188,6 +188,30 @@ function Shell() {
     if (sending) return;
     navigateToChat(sessionId);
   }, [navigateToChat, sending]);
+
+  const handleCreateWorkspaceSession = useCallback(async (path: string) => {
+    setActionError("");
+    const created = await createChat();
+    if (!created.sessionId) throw new Error("无法创建会话");
+
+    try {
+      const workspace = await setWorkspace(created.sessionId, path);
+      freshlyCreatedSessionRef.current = created.sessionId;
+      setAutoMode(false);
+      setSandboxMode(!!created.sandboxMode);
+      setUnlimitedMode(false);
+      setAgentBackend(responseBackend(created) || "sjtuclaw");
+      setRollbackEnabled(!!workspace.rollback?.enabled);
+      navigateToChat(created.sessionId);
+    } catch (error) {
+      try {
+        await deleteChat(created.sessionId);
+      } catch (cleanupError) {
+        console.error("Failed to remove workspace session after setup error", cleanupError);
+      }
+      throw error;
+    }
+  }, [createChat, deleteChat, navigateToChat]);
 
   const handleDeleteSession = useCallback(async (sessionId: string) => {
     setActionError("");
@@ -558,6 +582,7 @@ function Shell() {
           onStop={handleStop}
           onToggleSidebar={handleToggleSidebar}
           onNewChat={handleNewChat}
+          onCreateWorkspaceSession={handleCreateWorkspaceSession}
           theme={theme}
           onToggleTheme={toggleTheme}
         />

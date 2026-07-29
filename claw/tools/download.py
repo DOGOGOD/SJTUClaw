@@ -4,14 +4,16 @@
 It does NOT return file content to the model — only a downloadId that
 the frontend can use to retrieve the file.
 
-Gateway stores these entries in a bounded registry. Entries expire after one
-hour and can be persisted by the Gateway so links survive a server restart.
+Gateway stores these entries in a bounded, persistent registry. Entries remain
+available while their backing files exist, so links in saved chat history keep
+working across time and Gateway restarts.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import threading
 import time
@@ -36,13 +38,17 @@ logger = logging.getLogger(__name__)
 # Download registry (shared with Gateway, optionally persisted)
 # ---------------------------------------------------------------------------
 
-_DOWNLOAD_TTL_S = 60 * 60
 _MAX_DOWNLOADS = 1_000
 _downloads: OrderedDict[str, tuple[Path, float]] = OrderedDict()
 """downloadId -> (absolute Path, Unix creation time)."""
 _downloads_lock = threading.Lock()
 _download_registry_path: Path | None = None
 _DOWNLOAD_ID_RE = re.compile(r"^dl_[0-9a-f]{12}$")
+
+
+def is_valid_download_id(download_id: str) -> bool:
+    """Return whether *download_id* uses the public opaque-id format."""
+    return bool(_DOWNLOAD_ID_RE.fullmatch(download_id))
 
 
 @contextmanager
@@ -57,26 +63,24 @@ def _registry_file_lock_locked() -> Iterator[None]:
         yield
 
 
-def _prune_downloads_locked(now: float) -> bool:
-    expired = [
+def _prune_downloads_locked() -> bool:
+    missing = [
         download_id
-        for download_id, (path, created_at) in _downloads.items()
-        if now - created_at >= _DOWNLOAD_TTL_S or not path.is_file()
+        for download_id, (path, _) in _downloads.items()
+        if not path.is_file()
     ]
-    for download_id in expired:
-        entry = _downloads.pop(download_id, None)
-        if entry is not None:
-            _remove_managed_export(entry[0])
+    for download_id in missing:
+        _downloads.pop(download_id, None)
     trimmed = False
     while len(_downloads) > _MAX_DOWNLOADS:
         _, (path, _) = _downloads.popitem(last=False)
         _remove_managed_export(path)
         trimmed = True
-    return bool(expired) or trimmed
+    return bool(missing) or trimmed
 
 
 def _remove_managed_export(path: Path) -> None:
-    """Remove expired sandbox exports without ever deleting workspace files."""
+    """Remove evicted sandbox exports without ever deleting workspace files."""
     export_root = (DATA_DIR / "sandbox" / "exports").resolve()
     try:
         resolved = path.resolve()
@@ -86,7 +90,7 @@ def _remove_managed_export(path: Path) -> None:
     try:
         resolved.unlink(missing_ok=True)
     except OSError:
-        logger.warning("无法清理过期 sandbox 导出文件: %s", resolved)
+        logger.warning("无法清理已淘汰的 sandbox 导出文件: %s", resolved)
         return
     parent = resolved.parent
     while parent != export_root:
@@ -131,7 +135,7 @@ def _persist_downloads_locked() -> None:
             pass
 
 
-def _reload_downloads_locked(now: float) -> bool:
+def _reload_downloads_locked() -> bool:
     """Refresh memory from disk and return whether disk needs normalization."""
     registry_path = _download_registry_path
     if registry_path is None:
@@ -163,19 +167,15 @@ def _reload_downloads_locked(now: float) -> bool:
             except (TypeError, ValueError, OSError):
                 needs_persist = True
                 continue
+            if not math.isfinite(created_at):
+                needs_persist = True
+                continue
             valid_id = bool(_DOWNLOAD_ID_RE.fullmatch(download_id))
             is_absolute = path.is_absolute()
-            is_current = 0 <= now - created_at < _DOWNLOAD_TTL_S
-            if valid_id and is_absolute and path.is_file() and is_current:
+            if valid_id and is_absolute and path.is_file():
                 normalized[download_id] = (path.resolve(), created_at)
                 continue
             needs_persist = True
-            if (
-                valid_id
-                and is_absolute
-                and now - created_at >= _DOWNLOAD_TTL_S
-            ):
-                _remove_managed_export(path)
 
     _downloads.clear()
     _downloads.update(normalized)
@@ -183,7 +183,7 @@ def _reload_downloads_locked(now: float) -> bool:
 
 
 def configure_download_registry(registry_path: Path | None) -> None:
-    """Configure persistence and reload still-valid download entries."""
+    """Configure persistence and reload downloads whose files still exist."""
     global _download_registry_path
     with _downloads_lock:
         _download_registry_path = (
@@ -195,38 +195,44 @@ def configure_download_registry(registry_path: Path | None) -> None:
         if _download_registry_path is None:
             return
         with _registry_file_lock_locked():
-            now = time.time()
-            _reload_downloads_locked(now)
-            _prune_downloads_locked(now)
+            _reload_downloads_locked()
+            _prune_downloads_locked()
             _persist_downloads_locked()
 
 
 def register_download(file_path: Path) -> str:
     """Create a download entry and return its id."""
     download_id = f"dl_{uuid.uuid4().hex[:12]}"
+    restore_download(download_id, file_path)
+    return download_id
+
+
+def restore_download(download_id: str, file_path: Path) -> str:
+    """Persist an existing download id after recovering its backing file."""
+    if not is_valid_download_id(download_id):
+        raise ValueError(f"下载 ID 格式无效: {download_id}")
     now = time.time()
     resolved = file_path.resolve()
     if not resolved.is_file():
         raise FileNotFoundError(f"下载文件不存在: {file_path}")
     with _downloads_lock:
         with _registry_file_lock_locked():
-            _reload_downloads_locked(now)
-            _prune_downloads_locked(now)
+            _reload_downloads_locked()
+            _prune_downloads_locked()
             _downloads[download_id] = (resolved, now)
-            _prune_downloads_locked(now)
+            _prune_downloads_locked()
             _persist_downloads_locked()
     return download_id
 
 
 def get_download(download_id: str) -> Path | None:
     """Return the file path for *download_id* or None."""
-    if not _DOWNLOAD_ID_RE.fullmatch(download_id):
+    if not is_valid_download_id(download_id):
         return None
-    now = time.time()
     with _downloads_lock:
         with _registry_file_lock_locked():
-            needs_persist = _reload_downloads_locked(now)
-            if _prune_downloads_locked(now):
+            needs_persist = _reload_downloads_locked()
+            if _prune_downloads_locked():
                 needs_persist = True
             if needs_persist:
                 _persist_downloads_locked()
@@ -236,11 +242,10 @@ def get_download(download_id: str) -> Path | None:
 
 def list_downloads() -> dict[str, str]:
     """Return {downloadId: file_name} for all active downloads."""
-    now = time.time()
     with _downloads_lock:
         with _registry_file_lock_locked():
-            needs_persist = _reload_downloads_locked(now)
-            if _prune_downloads_locked(now):
+            needs_persist = _reload_downloads_locked()
+            if _prune_downloads_locked():
                 needs_persist = True
             if needs_persist:
                 _persist_downloads_locked()

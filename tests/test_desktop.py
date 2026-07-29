@@ -14,6 +14,20 @@ class _StoppedThread:
         return False
 
 
+class _FakeProcessFailure:
+    ProcessFailedKind = "RenderProcessExited"
+    Reason = "Crashed"
+    ExitCode = -1
+
+
+class _FakeWebViewSender:
+    def __init__(self):
+        self.reloads = 0
+
+    def Reload(self):
+        self.reloads += 1
+
+
 def test_wait_until_ready_fails_fast_when_server_thread_exits():
     with pytest.raises(RuntimeError, match="意外退出"):
         desktop._wait_until_ready(
@@ -35,6 +49,45 @@ def test_wait_until_ready_raises_after_timeout(monkeypatch):
 
     with pytest.raises(TimeoutError, match="未能启动"):
         desktop._wait_until_ready("http://127.0.0.1:65535", timeout_s=0.15)
+
+
+def test_webview_renderer_crash_reloads_automatically(monkeypatch):
+    sender = _FakeWebViewSender()
+    logs: list[str] = []
+    monkeypatch.setattr(desktop, "_log", logs.append)
+    monkeypatch.setattr(desktop, "_webview_recovery_attempts", [])
+
+    desktop._handle_webview_process_failed(sender, _FakeProcessFailure())
+
+    assert sender.reloads == 1
+    assert any("RenderProcessExited" in message for message in logs)
+    assert any("reloaded automatically" in message for message in logs)
+
+
+def test_webview_gpu_failure_does_not_reload(monkeypatch):
+    sender = _FakeWebViewSender()
+    failure = _FakeProcessFailure()
+    failure.ProcessFailedKind = "GpuProcessExited"
+    monkeypatch.setattr(desktop, "_log", lambda _message: None)
+    monkeypatch.setattr(desktop, "_webview_recovery_attempts", [])
+
+    desktop._handle_webview_process_failed(sender, failure)
+
+    assert sender.reloads == 0
+
+
+def test_webview_recovery_stops_after_repeated_renderer_failures(monkeypatch):
+    sender = _FakeWebViewSender()
+    logs: list[str] = []
+    monkeypatch.setattr(desktop, "_log", logs.append)
+    monkeypatch.setattr(desktop, "_webview_recovery_attempts", [])
+    monkeypatch.setattr(desktop.time, "monotonic", lambda: 10.0)
+
+    for _ in range(desktop._WEBVIEW_RECOVERY_LIMIT + 1):
+        desktop._handle_webview_process_failed(sender, _FakeProcessFailure())
+
+    assert sender.reloads == desktop._WEBVIEW_RECOVERY_LIMIT
+    assert any("skipped after repeated renderer failures" in message for message in logs)
 
 
 def test_main_does_not_open_window_when_gateway_is_unavailable(

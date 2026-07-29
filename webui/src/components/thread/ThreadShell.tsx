@@ -96,7 +96,7 @@ export function ThreadShell({
   theme,
   hideSidebarToggle = false,
 }: ThreadShellProps) {
-  const [autoScroll, setAutoScroll] = useState(false);
+  const [autoScroll, setAutoScroll] = useState(() => Boolean(sessionId));
   const messageHistory = useMemo(
     () => messages.filter((message) => message.role === "user").map((message) => message.content),
     [messages]
@@ -108,6 +108,13 @@ export function ThreadShell({
     axis: "y",
     onDrag: () => setAutoScroll(false),
   });
+
+  // Every session owns an independent scroll position. Entering or switching
+  // a session should start at its latest message, even if the user had scrolled
+  // up while viewing the previous session.
+  useEffect(() => {
+    setAutoScroll(Boolean(sessionId));
+  }, [sessionId]);
 
   // When the user sends a message (sending transitions to true), enable
   // auto-scroll so new replies and tool results scroll into view.
@@ -136,6 +143,35 @@ export function ThreadShell({
       });
     }
   }, [messages, autoScroll]);
+
+  // Message blocks can grow after their first render (lazy syntax highlighting,
+  // images, expanded tool output). Keep following those layout changes only
+  // while auto-scroll is active; handleScroll disables it as soon as the user
+  // moves away from the bottom.
+  useEffect(() => {
+    const viewport = viewportRef.current;
+    const content = viewport?.firstElementChild;
+    if (!autoScroll || !viewport || !content || typeof ResizeObserver === "undefined") return;
+
+    let frame = 0;
+    const scrollToLatest = () => {
+      cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => {
+        viewport.scrollTo({
+          top: viewport.scrollHeight,
+          behavior: "instant" as ScrollBehavior,
+        });
+      });
+    };
+    const observer = new ResizeObserver(scrollToLatest);
+    observer.observe(content);
+    scrollToLatest();
+
+    return () => {
+      observer.disconnect();
+      cancelAnimationFrame(frame);
+    };
+  }, [autoScroll, loading, messages, sessionId]);
 
   return (
     <div className="flex h-full min-h-0 flex-col bg-transparent">
@@ -195,6 +231,7 @@ export function ThreadShell({
             ref={viewportRef}
             {...messageDragProps}
             onScroll={handleScroll}
+            data-testid="thread-scroll-viewport"
             className="host-no-drag drag-scroll scroll-container min-h-0 flex-1 overflow-x-hidden overflow-y-auto overscroll-y-contain"
           >
             <ThreadViewport messages={messages} loading={loading} sessionId={sessionId} rollbackEnabled={rollbackEnabled} rollingBack={rollingBack} onRollback={onRollback} />

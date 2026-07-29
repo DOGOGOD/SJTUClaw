@@ -2,6 +2,7 @@ import { memo, useCallback, useState } from "react";
 import { Plus, Search, Trash2, Pencil, Settings } from "lucide-react";
 import { BrandAvatar } from "@/components/BrandAvatar";
 import { Button } from "@/components/ui/button";
+import { useAppDialog } from "@/components/ui/app-dialog";
 import { Input } from "@/components/ui/input";
 import { cn, formatTime, deriveTitle } from "@/lib/utils";
 import type { SessionSummary, ShellView, SettingsSection } from "@/lib/types";
@@ -36,6 +37,7 @@ export const Sidebar = memo(function Sidebar({
 }: SidebarProps) {
   const [searchQuery, setSearchQuery] = useState("");
   const [hoveredId, setHoveredId] = useState<string | null>(null);
+  const { confirmDialog } = useAppDialog();
 
   const filtered = searchQuery.trim()
     ? sessions.filter(
@@ -46,11 +48,17 @@ export const Sidebar = memo(function Sidebar({
     : sessions;
 
   const handleDelete = useCallback(
-    (e: React.MouseEvent, sessionId: string) => {
+    async (e: React.MouseEvent, sessionId: string) => {
       e.stopPropagation();
-      if (confirm("确定删除此对话？")) onDelete(sessionId);
+      const confirmed = await confirmDialog({
+        title: "删除对话",
+        description: "确定删除此对话吗？此操作无法撤销。",
+        confirmLabel: "删除",
+        variant: "destructive",
+      });
+      if (confirmed) onDelete(sessionId);
     },
-    [onDelete]
+    [confirmDialog, onDelete]
   );
 
   const handleRename = useCallback(

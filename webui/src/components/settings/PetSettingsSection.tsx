@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Check, MonitorUp, PawPrint, Plus, Power, Trash2, Upload } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { useAppDialog } from "@/components/ui/app-dialog";
 import {
   Dialog,
   DialogContent,
@@ -86,6 +87,7 @@ function PetPreview({ pet }: { pet: PetInfo }) {
 }
 
 export function PetSettingsSection() {
+  const { confirmDialog } = useAppDialog();
   const { setSelectedPet } = usePetSelection();
   const [settings, setSettings] = useState<PetSettings | null>(null);
   const [pets, setPets] = useState<PetInfo[]>([]);
@@ -151,7 +153,14 @@ export function PetSettingsSection() {
   };
 
   const handleDelete = async (pet: PetInfo) => {
-    if (pet.readOnly || busy || !confirm(`确定删除宠物“${pet.displayName}”吗？`)) return;
+    if (pet.readOnly || busy) return;
+    const confirmed = await confirmDialog({
+      title: "删除宠物",
+      description: `确定删除宠物“${pet.displayName}”吗？此操作无法撤销。`,
+      confirmLabel: "删除",
+      variant: "destructive",
+    });
+    if (!confirmed) return;
     setBusy(true);
     setError("");
     try {

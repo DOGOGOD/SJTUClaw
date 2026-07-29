@@ -22,6 +22,7 @@ import {
   X,
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { useAppDialog } from "@/components/ui/app-dialog";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/input";
 import { cn, formatTime } from "@/lib/utils";
@@ -701,6 +702,7 @@ function SoulSection() {
 
 /* --- Memory --- */
 function MemorySection() {
+  const { confirmDialog } = useAppDialog();
   const [memories, setMemories] = useState<MemoryEntry[]>([]);
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(true);
@@ -721,7 +723,16 @@ function MemorySection() {
   useEffect(() => { refresh(); }, [refresh]);
 
   const handleAdd = async () => { if (!input.trim()) return; try { await addMemory({ content: input.trim() }); setInput(""); refresh(); } catch {} };
-  const handleDelete = async (id: string) => { if (!confirm("确定删除？")) return; try { await deleteMemory(id); refresh(); } catch {} };
+  const handleDelete = async (id: string) => {
+    const confirmed = await confirmDialog({
+      title: "删除记忆",
+      description: "确定删除这条长期记忆吗？此操作无法撤销。",
+      confirmLabel: "删除",
+      variant: "destructive",
+    });
+    if (!confirmed) return;
+    try { await deleteMemory(id); refresh(); } catch {}
+  };
 
   if (loading) return <p className="text-sm text-muted-foreground/60">加载中...</p>;
   if (loadError) return (
@@ -753,6 +764,7 @@ function MemorySection() {
 
 /* --- Cron Jobs --- */
 function CronSection({ activeSessionId }: { activeSessionId?: string | null }) {
+  const { confirmDialog } = useAppDialog();
   const [jobs, setJobs] = useState<CronJobInfo[]>([]);
   const [sessions, setSessions] = useState<SessionSummary[]>([]);
   const [name, setName] = useState(""); const [message, setMessage] = useState("");
@@ -848,7 +860,16 @@ function CronSection({ activeSessionId }: { activeSessionId?: string | null }) {
           {j.payload.kind !== "system_event" && (
             <div className="mt-1.5 flex gap-1.5">
               <Button variant="ghost" size="sm" className="h-6 text-[10px]" onClick={async () => { try { if (j.enabled) await disableCronJob(j.id); else await enableCronJob(j.id); refresh(); } catch {} }}>{j.enabled ? "禁用" : "启用"}</Button>
-              <Button variant="ghost" size="sm" className="h-6 text-[10px] text-destructive hover:bg-destructive/10" onClick={async () => { if (!confirm("删除？")) return; try { await deleteCronJob(j.id); refresh(); } catch {} }}>删除</Button>
+              <Button variant="ghost" size="sm" className="h-6 text-[10px] text-destructive hover:bg-destructive/10" onClick={async () => {
+                const confirmed = await confirmDialog({
+                  title: "删除定时任务",
+                  description: `确定删除“${j.name || j.id}”吗？此操作无法撤销。`,
+                  confirmLabel: "删除",
+                  variant: "destructive",
+                });
+                if (!confirmed) return;
+                try { await deleteCronJob(j.id); refresh(); } catch {}
+              }}>删除</Button>
             </div>
           )}
         </div>
@@ -859,6 +880,7 @@ function CronSection({ activeSessionId }: { activeSessionId?: string | null }) {
 
 /* --- Skills --- */
 function SkillsSection() {
+  const { confirmDialog } = useAppDialog();
   const [skills, setSkills] = useState<SkillInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [file, setFile] = useState<File | null>(null);
@@ -905,7 +927,13 @@ function SkillsSection() {
   };
 
   const handleDelete = async (name: string) => {
-    if (!confirm(`确定彻底删除 Skill “${name}” 吗？此操作会删除相关文件和使用记录，无法从 .archive 恢复。`)) return;
+    const confirmed = await confirmDialog({
+      title: "彻底删除 Skill",
+      description: `确定彻底删除 Skill “${name}” 吗？此操作会删除相关文件和使用记录，无法从 .archive 恢复。`,
+      confirmLabel: "彻底删除",
+      variant: "destructive",
+    });
+    if (!confirmed) return;
     setBusy(true);
     setStatus("");
     setError("");

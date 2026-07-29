@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
+import { AppDialogProvider, useAppDialog } from "@/components/ui/app-dialog";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
 import { Sidebar } from "@/components/sidebar/Sidebar";
 import { ThreadShell } from "@/components/thread/ThreadShell";
@@ -24,6 +25,7 @@ function responseBackend(value: { agentBackend?: AgentBackend; piMode?: boolean 
 function Shell() {
   const { theme, toggle: toggleTheme } = useTheme();
   const { refreshSelectedPet } = usePetSelection();
+  const { confirmDialog, promptDialog } = useAppDialog();
   const { sessions, loading: sessionsLoading, refresh: refreshSessions, createChat, deleteChat, updateTitle } = useSessions();
 
   const [view, setView] = useState<ShellView>("chat");
@@ -181,10 +183,20 @@ function Shell() {
   }, [deleteChat, activeSessionId, navigateToChat]);
 
   const handleRenameSession = useCallback(async (sessionId: string) => {
-    const title = prompt("请输入新标题");
+    const currentTitle = sessions.find((session) => session.sessionId === sessionId)?.title || "";
+    const title = await promptDialog({
+      title: "重命名对话",
+      description: "输入一个便于识别的新标题。",
+      label: "新标题",
+      placeholder: "输入对话标题",
+      defaultValue: currentTitle,
+      confirmLabel: "保存",
+      required: true,
+      maxLength: 100,
+    });
     if (!title?.trim()) return;
     try { await renameSession(sessionId, title.trim()); await refreshSessions(); } catch {}
-  }, [refreshSessions]);
+  }, [promptDialog, refreshSessions, sessions]);
 
   const handleSend = useCallback(async (message: string, attachments: File[] = []) => {
     setSending(true);
@@ -378,11 +390,15 @@ function Shell() {
       const warning = detail.unlimitedWarning
         ? "\n\n注意：UNLIMITED 模式在 workspace 外的改动无法恢复。"
         : "";
-      const confirmed = window.confirm(
-        `确定回退到“${detail.messagePreview || "所选消息"}”之前吗？\n\n` +
-        `将恢复 ${detail.filesToRestore} 个文件，删除 ${detail.filesToDelete} 个新增路径，` +
-        `并移除 ${detail.messagesToRemove} 条对话记录。${warning}`
-      );
+      const confirmed = await confirmDialog({
+        title: "确认回退",
+        description:
+          `确定回退到“${detail.messagePreview || "所选消息"}”之前吗？\n\n` +
+          `将恢复 ${detail.filesToRestore} 个文件，删除 ${detail.filesToDelete} 个新增路径，` +
+          `并移除 ${detail.messagesToRemove} 条对话记录。${warning}`,
+        confirmLabel: "确认回退",
+        variant: "destructive",
+      });
       if (!confirmed) return;
       const result = await applyRollback(activeSessionId, checkpointId);
       if (result.ok) {
@@ -399,7 +415,7 @@ function Shell() {
     } finally {
       setRollingBack(false);
     }
-  }, [activeSessionId, refreshSessions, rollingBack, sending]);
+  }, [activeSessionId, confirmDialog, refreshSessions, rollingBack, sending]);
 
   const handleApprove = useCallback(async () => {
     if (!pendingApproval) return;
@@ -408,9 +424,17 @@ function Shell() {
 
   const handleRejectApproval = useCallback(async () => {
     if (!pendingApproval) return;
-    const reason = prompt("请输入拒绝原因（可选）") || undefined;
+    const reason = await promptDialog({
+      title: "拒绝工具调用",
+      description: "你可以填写拒绝原因，让 Agent 了解你的决定。",
+      label: "拒绝原因（可选）",
+      placeholder: "例如：请换一种更安全的方式",
+      confirmLabel: "确认拒绝",
+      maxLength: 500,
+    });
+    if (reason === null) return;
     try { await rejectApproval(pendingApproval.approvalId, reason); setPendingApproval(null); } catch (e) { console.error("Reject failed", e); }
-  }, [pendingApproval]);
+  }, [pendingApproval, promptDialog]);
 
   const handleToggleSidebar = useCallback(() => {
     if (isMobile) setMobileSidebarOpen((v) => !v);
@@ -549,11 +573,13 @@ function Shell() {
 export default function App() {
   return (
     <ThemeProvider>
-      <PetSelectionProvider>
-        <ErrorBoundary>
-          <Shell />
-        </ErrorBoundary>
-      </PetSelectionProvider>
+      <AppDialogProvider>
+        <PetSelectionProvider>
+          <ErrorBoundary>
+            <Shell />
+          </ErrorBoundary>
+        </PetSelectionProvider>
+      </AppDialogProvider>
     </ThemeProvider>
   );
 }

@@ -140,32 +140,21 @@ python -m pip install -e .
 sjtuclaw setup
 ```
 
-也可以复制 `.env.example` 为 `.env` 手动配置。`sjtuclaw setup` 只引导配置主模型、
-联网与时区、Gateway、常用高级参数和 QQ Bot，不包含 Agent 后端或 Pi 配置。
+也可以复制 `.env.example` 为 `.env` 手动配置。
 
-需要使用 Claude Code 时，只需先按[官方说明](https://code.claude.com/docs/en/installation)
-完成安装和登录。SJTUClaw 会依次检索显式配置、系统 `PATH`、官方原生安装目录
-（Windows 为 `%USERPROFILE%\.local\bin\claude.exe`）及常见 npm 安装目录。
-在任意会话中输入 `/claude on` 即可启用；无需把 Claude 凭据复制到 SJTUClaw。
-Web UI 的“设置 → LLM”也可以把 Claude Code 设为新会话默认后端，并显示自动检测结果。
-会话绑定的 workspace 只作为 Claude Code/Pi 的启动目录，不限制其原生文件与命令
-工具的访问范围；两者分别遵守自己的权限系统。SJTUClaw 只追加集成上下文，不会
-替换 Claude Code 的原生 prompt。Claude Code 还会通过本地 MCP 继续获得
-SJTUClaw 独有的 `recall`、`remember`、`cron`、Web 等工具。搜索、读取和查询操作
-直接执行；文件写入、删除、会改变外部状态的 MCP 调用及有副作用的命令会进入
-SJTUClaw 的统一审批流程。
+#### 切换 Agent 后端
 
-需要使用 Pi 时，先构建同级目录中的 `pi` 仓库，或在系统中安装可执行的 `pi`。Web UI 的“设置 → LLM”可配置新会话的默认 Agent backend；已有会话可用 `/pi on`、`/pi off` 独立切换，互不影响，标题栏会显示 Pi 状态徽标。Pi 可以直接复用已有的 OpenAI-compatible 模型配置，也可以通过 `PI_PROVIDER`、`PI_MODEL` 使用 Pi 自身的模型与认证配置。
-
-Pi 是 SJTUClaw 的可选外部运行时依赖，不需要把完整 Pi SDK 或 Pi 源码提交到本仓库。源码开发时推荐保持同级目录布局：
+使用前请先安装并配置好 Pi Agent 或 Claude Code。在当前会话中输入：
 
 ```text
-SJTUClaw/
-├── SJTUClaw/    # 本仓库
-└── pi/          # 外部 Pi 仓库或构建产物，不随本仓库上传
+/pi on          # 切换到 Pi Agent
+/claude on      # 切换到 Claude Code
+/pi off         # 切回 SJTUClaw 原生后端
+/claude off     # 切回 SJTUClaw 原生后端
 ```
 
-如果删除同级 `pi` 目录，`/pi on` 仍会继续查找 `PI_COMMAND`、`PI_CLI_PATH` 或系统 `PATH` 里的 `pi` / `pi.cmd`；都找不到时会提示 Pi 运行环境不可用，并保持当前 session 原来的后端不变。
+切换仅对当前会话生效；可用 `/pi status` 或 `/claude status` 查看状态。也可以在
+Web UI 的“设置 → LLM”中设置新会话的默认后端。
 
 完整配置项、时区覆盖方式和安全建议见 [配置说明](docs/configuration.md)。
 

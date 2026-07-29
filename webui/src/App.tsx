@@ -11,11 +11,15 @@ import { cn, escapeMarkdownImageAlt } from "@/lib/utils";
 import { isPetSelectionCommand, isSlashCommand } from "@/lib/commands";
 import { messagesAfterCommandRefresh, resolveCommandNavigation } from "@/lib/commandState";
 import { fetchMessages, sendMessage, sendCommand, stopChat, uploadAttachment, renameSession, fetchApprovals, approveApproval, rejectApproval, previewRollback, applyRollback } from "@/lib/api";
-import type { ApprovalInfo } from "@/lib/types";
+import type { AgentBackend, ApprovalInfo } from "@/lib/types";
 import type { ChatMessage, SettingsSection, ShellView } from "@/lib/types";
 
 const SIDEBAR_WIDTH = 288;
 const SIDEBAR_COLLAPSED_WIDTH = 0;
+
+function responseBackend(value: { agentBackend?: AgentBackend; piMode?: boolean }): AgentBackend | undefined {
+  return value.agentBackend ?? (value.piMode ? "pi" : undefined);
+}
 
 function Shell() {
   const { theme, toggle: toggleTheme } = useTheme();
@@ -36,7 +40,7 @@ function Shell() {
   const [pendingApproval, setPendingApproval] = useState<ApprovalInfo | null>(null);
   const [autoMode, setAutoMode] = useState(false);
   const [unlimitedMode, setUnlimitedMode] = useState(false);
-  const [piMode, setPiMode] = useState(false);
+  const [agentBackend, setAgentBackend] = useState<AgentBackend>("sjtuclaw");
   const [rollbackEnabled, setRollbackEnabled] = useState(false);
   const [rollingBack, setRollingBack] = useState(false);
   const [workspaceRefreshToken, setWorkspaceRefreshToken] = useState(0);
@@ -57,7 +61,7 @@ function Shell() {
       // user opens a new-chat draft; the new session starts with both off.
       setAutoMode(false);
       setUnlimitedMode(false);
-      setPiMode(false);
+      setAgentBackend("sjtuclaw");
       setRollbackEnabled(false);
       return;
     }
@@ -71,7 +75,7 @@ function Shell() {
     // the new session's independent mode state is loading.
     setAutoMode(false);
     setUnlimitedMode(false);
-    setPiMode(false);
+    setAgentBackend("sjtuclaw");
     setMessagesLoading(true);
     fetchMessages(activeSessionId)
       .then((d) => {
@@ -80,13 +84,14 @@ function Shell() {
           setMessages(d.messages || []);
           if (d.autoMode !== undefined) setAutoMode(!!d.autoMode);
           if (d.unlimitedMode !== undefined) setUnlimitedMode(!!d.unlimitedMode);
-          if (d.piMode !== undefined) setPiMode(!!d.piMode);
+          const backend = responseBackend(d);
+          if (backend) setAgentBackend(backend);
           setRollbackEnabled(!!d.rollback?.enabled);
         } else {
           setMessages([]);
           setAutoMode(false);
           setUnlimitedMode(false);
-          setPiMode(false);
+          setAgentBackend("sjtuclaw");
         }
       })
       .catch((e) => {
@@ -95,7 +100,7 @@ function Shell() {
         setMessages([]);
         setAutoMode(false);
         setUnlimitedMode(false);
-        setPiMode(false);
+        setAgentBackend("sjtuclaw");
       })
       .finally(() => { if (!cancelled) setMessagesLoading(false); });
     return () => { cancelled = true; };
@@ -115,7 +120,8 @@ function Shell() {
           setRollbackEnabled(!!d.rollback?.enabled);
           if (d.autoMode !== undefined) setAutoMode(!!d.autoMode);
           if (d.unlimitedMode !== undefined) setUnlimitedMode(!!d.unlimitedMode);
-          if (d.piMode !== undefined) setPiMode(!!d.piMode);
+          const backend = responseBackend(d);
+          if (backend) setAgentBackend(backend);
           setMessages((prev) => {
             // 仅在消息数量增加时更新，避免覆盖正在编辑或流式中的状态
             if (d.messages.length > prev.length) {
@@ -192,7 +198,8 @@ function Shell() {
         }
         sessionId = created.sessionId;
         freshlyCreatedSessionRef.current = sessionId;
-        if (created.piMode !== undefined) setPiMode(!!created.piMode);
+        const backend = responseBackend(created);
+        if (backend) setAgentBackend(backend);
         navigateToChat(sessionId);
       } catch (e) {
         console.error("Failed to create chat", e);
@@ -200,21 +207,25 @@ function Shell() {
         throw e;
       }
     }
-    let uploaded: Array<{ id: string; originalName: string }> = [];
+    let uploaded: Array<{ id: string; originalName: string; markdown: string }> = [];
     try {
       for (const file of attachments) {
         const result = await uploadAttachment(sessionId, file, false);
-        if (!result.ok || !result.attachment) throw new Error(`图片上传失败: ${file.name}`);
-        uploaded.push({ id: result.attachment.id, originalName: result.attachment.originalName });
+        if (!result.ok || !result.attachment) throw new Error(`附件上传失败: ${file.name}`);
+        const contentUrl = `/sessions/${sessionId}/attachments/${result.attachment.id}`;
+        uploaded.push({
+          id: result.attachment.id,
+          originalName: result.attachment.originalName,
+          markdown: result.message?.content
+            || `[附件 ${escapeMarkdownImageAlt(result.attachment.originalName)}](${contentUrl})`,
+        });
       }
     } catch (error) {
       setSending(false);
       throw error;
     }
-    const imageMarkdown = uploaded.map((item) =>
-      `![${escapeMarkdownImageAlt(item.originalName)}](/sessions/${sessionId}/attachments/${item.id})`
-    ).join("\n");
-    const optimisticContent = [message, imageMarkdown].filter(Boolean).join("\n\n");
+    const attachmentMarkdown = uploaded.map((item) => item.markdown).join("\n");
+    const optimisticContent = [message, attachmentMarkdown].filter(Boolean).join("\n\n");
     const userMsg: ChatMessage = { role: "user", content: optimisticContent };
     setMessages((prev) => [...prev, userMsg]);
 
@@ -232,7 +243,8 @@ function Shell() {
           setMessages((prev) => [...prev, commandResult!]);
           if (d.autoMode !== undefined) setAutoMode(!!d.autoMode);
           if (d.unlimitedMode !== undefined) setUnlimitedMode(!!d.unlimitedMode);
-          if (d.piMode !== undefined) setPiMode(!!d.piMode);
+          const backend = responseBackend(d);
+          if (backend) setAgentBackend(backend);
         }
         if (d.actions?.includes("open_pet_settings")) {
           navigateToSettings("pet");
@@ -258,7 +270,8 @@ function Shell() {
           if (refreshed.ok) {
             setMessages(messagesAfterCommandRefresh(refreshed.messages || [], userMsg, commandResult));
             setRollbackEnabled(!!refreshed.rollback?.enabled);
-            if (refreshed.piMode !== undefined) setPiMode(!!refreshed.piMode);
+            const backend = responseBackend(refreshed);
+            if (backend) setAgentBackend(backend);
           }
         }
         await refreshSessions();
@@ -313,7 +326,8 @@ function Shell() {
         }
         if ((d as any).autoMode !== undefined) setAutoMode(!!(d as any).autoMode);
         if ((d as any).unlimitedMode !== undefined) setUnlimitedMode(!!(d as any).unlimitedMode);
-        if (d.piMode !== undefined) setPiMode(!!d.piMode);
+        const backend = responseBackend(d);
+        if (backend) setAgentBackend(backend);
         if (d.title) updateTitle(sessionId, d.title);
       } else {
         // On failure, restore and re-fetch
@@ -470,7 +484,7 @@ function Shell() {
           sending={sending}
           autoMode={autoMode}
           unlimitedMode={unlimitedMode}
-          piMode={piMode}
+          agentBackend={agentBackend}
           rollbackEnabled={rollbackEnabled}
           rollingBack={rollingBack}
           workspaceRefreshToken={workspaceRefreshToken}

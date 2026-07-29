@@ -465,6 +465,8 @@ def test_pi_append_prompt_keeps_identity_memory_but_not_legacy_tool_contract(tmp
     assert "SJTU system" in prompt and "SJTU soul" in prompt
     assert "用户偏好深色主题" in prompt
     assert "Pi 原生 system prompt" in prompt
+    assert "不构成 SJTUClaw 文件访问边界" in prompt
+    assert "不受 SJTUClaw workspace 越界限制" in prompt
     assert "find_files" not in prompt
     assert "edit_file" not in prompt
     assert "不要把带反斜杠的 Windows 绝对路径" in prompt
@@ -542,6 +544,53 @@ def test_pi_host_tool_bridge_rejects_spoofed_token():
     ))
 
     assert response == {"ok": False, "result": "SJTUClaw 工具桥接认证失败。"}
+
+
+def test_host_cron_only_requires_approval_for_state_changing_actions():
+    executed = []
+    approvals = []
+    registry = ToolRegistry()
+    registry.register(
+        Tool(
+            "cron",
+            "Manage scheduled tasks",
+            {
+                "type": "object",
+                "properties": {"action": {"type": "string"}},
+                "required": ["action"],
+            },
+            lambda args: executed.append(args["action"]) or ToolResult(True, "ok"),
+            safety_level="read_only",
+        )
+    )
+
+    listed = json.loads(
+        PiAgentClient._execute_host_tool(
+            json.dumps({"toolName": "cron", "input": {"action": "list"}}),
+            session_id="s",
+            tool_registry=registry,
+            approval_handler=lambda request: approvals.append(request),
+            trust_tools=False,
+            auto_mode=False,
+            unlimited_mode=False,
+        )
+    )
+    added = json.loads(
+        PiAgentClient._execute_host_tool(
+            json.dumps({"toolName": "cron", "input": {"action": "add"}}),
+            session_id="s",
+            tool_registry=registry,
+            approval_handler=lambda request: approvals.append(request),
+            trust_tools=False,
+            auto_mode=False,
+            unlimited_mode=False,
+        )
+    )
+
+    assert listed["ok"] is True
+    assert added["ok"] is False
+    assert executed == ["list"]
+    assert [request.tool_args for request in approvals] == [{"action": "add"}]
 
 
 def test_pi_slash_command_only_switches_backend_when_explicit(tmp_path):

@@ -161,6 +161,7 @@ export interface SendMessageResponse {
   autoMode?: boolean;
   unlimitedMode?: boolean;
   piMode?: boolean;
+  agentBackend?: AgentBackend;
   /** Auto-generated session title from the first user message (null if not applicable). */
   title?: string | null;
 }
@@ -221,6 +222,7 @@ export interface SSESessionInfoEvent {
   autoMode: boolean;
   unlimitedMode?: boolean;
   piMode?: boolean;
+  agentBackend?: AgentBackend;
 }
 
 export interface SSETitleEvent {
@@ -257,6 +259,8 @@ export interface LiveToolCall {
 
 // ── Navigation ───────────────────────────────────────────────────────────
 
+export type AgentBackend = "sjtuclaw" | "pi" | "claude";
+
 export interface PetSettings {
   enabled: boolean;
   selectedPetId: string;
@@ -275,7 +279,7 @@ export interface PetInfo {
 }
 
 export interface LLMSettings {
-  backend: "sjtuclaw" | "pi";
+  backend: AgentBackend;
   baseUrl: string;
   apiKeyMasked: string;
   apiKeyConfigured: boolean;
@@ -288,6 +292,11 @@ export interface LLMSettings {
   piModel: string;
   piThinking: string;
   piTrustTools: boolean;
+  claudeModel: string;
+  claudePermissionMode: string;
+  claudeTrustTools: boolean;
+  claudeDetected: boolean;
+  claudeCommand: string;
 }
 
 export interface QQChannelSettings {

@@ -5,6 +5,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 
+import pytest
+from fastapi.testclient import TestClient
 from starlette.datastructures import UploadFile
 
 
@@ -233,6 +235,38 @@ def test_active_svg_attachment_is_never_rendered_inline(monkeypatch, tmp_path):
     )
     assert response.headers["content-disposition"].startswith("attachment;")
     assert response.headers["x-content-type-options"] == "nosniff"
+
+
+def test_web_non_image_attachment_can_be_sent_to_agent(monkeypatch, tmp_path):
+    from claw.gateway import server
+    from claw.session.store import SessionStore
+
+    store = SessionStore(tmp_path / "session-data")
+    session = store.create_session(session_id="file-session")
+    monkeypatch.setattr(server, "_session_store", store)
+    monkeypatch.setattr(server, "SESSIONS_DIR", tmp_path / "session-data")
+
+    upload = UploadFile(
+        BytesIO(b"plain-text"),
+        filename="notes.txt",
+        headers={"content-type": "text/plain"},
+    )
+    result = asyncio.run(
+        server.upload_attachment(session.session_id, upload, persist_message=False)
+    )
+
+    assert result["message"]["content"].startswith("[notes.txt]")
+    media_paths, markdown = server._resolve_chat_attachments(
+        session.session_id, [result["attachment"]["id"]]
+    )
+    assert media_paths == []
+    assert markdown == [
+        f"[附件 notes.txt](/sessions/{session.session_id}/attachments/{result['attachment']['id']})"
+    ]
+    response = server.get_attachment_content(
+        session.session_id, result["attachment"]["id"]
+    )
+    assert response.headers["content-disposition"].startswith("attachment;")
 
 
 def test_concurrent_prompt_updates_keep_disk_and_runtime_in_sync(monkeypatch, tmp_path):
@@ -476,6 +510,57 @@ def test_image_download_is_served_inline(tmp_path):
     assert response.headers.get("content-disposition") is None
 
 
+def test_image_download_button_requests_attachment_disposition(tmp_path):
+    from claw.gateway import server
+    from claw.tools.download import register_download
+
+    image = tmp_path / "heart.png"
+    image.write_bytes(b"png")
+    download_id = register_download(image)
+    response = server.serve_download(download_id, download=True)
+
+    assert response.media_type == "image/png"
+    assert response.headers["content-disposition"].startswith("attachment;")
+    assert "heart.png" in response.headers["content-disposition"]
+
+
+@pytest.mark.parametrize(
+    ("filename", "content"),
+    [
+        ("image.png", b"png-bytes"),
+        ("notes.txt", b"plain-text"),
+        ("report.md", b"# report"),
+        ("data.csv", b"name,value\nalpha,1\n"),
+        ("payload.json", b'{"ok":true}'),
+        ("document.pdf", b"%PDF-1.7"),
+        ("document.docx", b"PK\x03\x04docx"),
+        ("spreadsheet.xlsx", b"PK\x03\x04xlsx"),
+        ("archive.zip", b"PK\x03\x04"),
+    ],
+)
+def test_download_endpoint_serves_all_supported_file_formats(
+    filename, content, tmp_path
+):
+    from claw.gateway import server
+    from claw.tools import download
+
+    download.configure_download_registry(None)
+    file_path = tmp_path / filename
+    file_path.write_bytes(content)
+    download_id = download.register_download(file_path)
+    suffix = "?download=1" if filename.endswith(".png") else ""
+    try:
+        with TestClient(server.app) as client:
+            response = client.get(f"/downloads/{download_id}{suffix}")
+        assert response.status_code == 200
+        assert response.content == content
+        disposition = response.headers["content-disposition"]
+        assert disposition.startswith("attachment;")
+        assert filename in disposition
+    finally:
+        download.configure_download_registry(None)
+
+
 def test_workspace_endpoint_normalizes_quotes_and_file_uri(monkeypatch, tmp_path):
     from pathlib import Path
     from claw.gateway import server
@@ -557,3 +642,54 @@ def test_gateway_adds_inline_markdown_for_new_image_download(monkeypatch, tmp_pa
     reply = server._decorate_download_reply("download-session", "图片已生成", before)
     assert "![heart.png](/downloads/" in reply
     assert store.get("download-session").messages[-1].content == reply
+
+
+def test_gateway_deduplicates_image_download_markdown(monkeypatch, tmp_path):
+    from claw.gateway import server
+    from claw.session.store import SessionStore
+    from claw.tools.download import register_download
+
+    store = SessionStore(tmp_path / "sessions")
+    session = store.create_session(session_id="duplicate-download-session")
+    monkeypatch.setattr(server, "_session_store", store)
+    image = tmp_path / "heart.png"
+    image.write_bytes(b"png")
+    before = set(server.list_downloads())
+    download_id = register_download(image)
+    duplicate_reply = (
+        f"![heart.png](/downloads/{download_id})\n\n"
+        f"[下载 heart.png](/downloads/{download_id})"
+    )
+    session.append_message("assistant", duplicate_reply)
+    store.save(session)
+
+    reply = server._decorate_download_reply(
+        "duplicate-download-session", duplicate_reply, before
+    )
+
+    assert reply.count(f"/downloads/{download_id}") == 1
+    assert reply.count("![heart.png]") == 1
+    assert store.get("duplicate-download-session").messages[-1].content == reply
+
+
+def test_gateway_adds_link_for_new_regular_download(monkeypatch, tmp_path):
+    from claw.gateway import server
+    from claw.session.store import SessionStore
+    from claw.tools.download import register_download
+
+    store = SessionStore(tmp_path / "sessions")
+    session = store.create_session(session_id="download-file-session")
+    session.append_message("assistant", "下载 ID 是 dl_demo")
+    store.save(session)
+    monkeypatch.setattr(server, "_session_store", store)
+    report = tmp_path / "数据库索引性能实验报告.md"
+    report.write_text("# report", encoding="utf-8")
+    before = set(server.list_downloads())
+    register_download(report)
+
+    reply = server._decorate_download_reply(
+        "download-file-session", "下载 ID 是 dl_demo", before
+    )
+
+    assert "[下载 数据库索引性能实验报告.md](/downloads/" in reply
+    assert store.get("download-file-session").messages[-1].content == reply

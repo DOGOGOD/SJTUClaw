@@ -78,7 +78,11 @@ from claw.skills.management import (
 )
 from claw.tools.base import ToolRegistry
 from claw.tools import register_all_tools
-from claw.tools.download import get_download, list_downloads
+from claw.tools.download import (
+    configure_download_registry,
+    get_download,
+    list_downloads,
+)
 from claw.workspace.manager import WorkspaceManager, WorkspaceError
 from claw.workspace.rollback import WorkspaceRollbackManager, RollbackError
 from claw.scheduler.service import CronService
@@ -171,11 +175,11 @@ def _load_initial_llm() -> tuple[LLMConfig, RuntimeLLMClient]:
         return config, client
     except ConfigError as exc:
         # Keep the session router alive even without legacy credentials:
-        # individual persisted Pi sessions must remain usable regardless of
+        # individual persisted external-agent sessions remain usable regardless of
         # the default backend selected in settings.
         config = client.config
         client.set_config(config)
-        logger.warning("辅助 LLM 未配置；Pi session 仍可独立运行: %s", exc)
+        logger.warning("辅助 LLM 未配置；外部 Agent session 仍可独立运行: %s", exc)
         return config, client
 
 # ---------------------------------------------------------------------------
@@ -474,7 +478,9 @@ _compaction_worker = CompactionWorker(
     _session_store,
     compact_llm=_compact_llm,
     config=_compact_cfg,
-    session_filter=lambda session: _session_backend(session.session_id) != "pi",
+    session_filter=lambda session: (
+        _session_backend(session.session_id) not in {"pi", "claude"}
+    ),
     on_complete=_publish_auto_compaction_notice,
 )
 
@@ -503,6 +509,9 @@ def _gateway_approval_handler(req: ApprovalRequest) -> ApprovalRequest:
 @asynccontextmanager
 async def _lifespan(_app: FastAPI):
     global _qq_channel, _qq_task
+
+    if not os.getenv("PYTEST_CURRENT_TEST"):
+        configure_download_registry(DATA_DIR / "downloads" / "registry.json")
 
     loop = asyncio.get_running_loop()
     _cron_service.start(loop=loop)
@@ -628,6 +637,12 @@ def _cancel_active_turn(session_id: str) -> bool:
         event = _active_turns.get(session_id)
     if event is not None:
         event.set()
+        for request in _approval_manager.list_by_session(session_id):
+            if request.status == ApprovalStatus.PENDING.value:
+                _approval_manager.reject(
+                    request.approval_id,
+                    "任务已停止，审批自动拒绝",
+                )
         return True
     return False
 
@@ -639,6 +654,11 @@ def _cancel_all_active_turns() -> int:
         count = len(events)
         for e in events:
             e.set()
+    for request in _approval_manager.get_pending():
+        _approval_manager.reject(
+            request.approval_id,
+            "任务已停止，审批自动拒绝",
+        )
     return count
 
 
@@ -692,28 +712,50 @@ def _decorate_download_reply(
     reply: str,
     downloads_before: set[str],
 ) -> str:
-    """Add inline-image Markdown for image downloads created this turn."""
-    image_links: list[str] = []
-    for download_id in set(list_downloads()) - downloads_before:
+    """Add one canonical WebUI link for every download created this turn."""
+    original_reply = reply
+    download_links: list[str] = []
+    for download_id in list_downloads():
+        if download_id in downloads_before:
+            continue
         file_path = get_download(download_id)
-        if file_path is None or file_path.suffix.lower() not in _INLINE_IMAGE_EXTENSIONS:
+        if file_path is None:
             continue
         marker = f"/downloads/{download_id}"
-        if marker not in reply:
-            image_links.append(f"![{file_path.name}]({marker})")
-    if not image_links:
-        return reply
-
-    decorated = reply.rstrip() + "\n\n图片已生成：\n" + "\n".join(image_links)
+        safe_name = _markdown_image_alt(file_path.name)
+        canonical = (
+            f"![{safe_name}]({marker})"
+            if file_path.suffix.lower() in _INLINE_IMAGE_EXTENSIONS
+            else f"[下载 {safe_name}]({marker})"
+        )
+        markdown_pattern = re.compile(
+            rf"!?\[[^\]\n]*\]\(\s*{re.escape(marker)}(?:[?#][^)\s]*)?\s*\)",
+            re.IGNORECASE,
+        )
+        matches = list(markdown_pattern.finditer(reply))
+        if matches:
+            first = matches[0]
+            reply = (
+                reply[:first.start()]
+                + canonical
+                + markdown_pattern.sub("", reply[first.end():])
+            )
+            continue
+        download_links.append(canonical)
+    decorated = reply
+    if download_links:
+        decorated = reply.rstrip() + "\n\n文件已准备好：\n" + "\n".join(download_links)
+    if decorated == original_reply:
+        return original_reply
     try:
         session = _session_store.get(session_id)
         for message in reversed(session.messages):
-            if message.role == "assistant" and message.content == reply:
+            if message.role == "assistant" and message.content == original_reply:
                 message.content = decorated
                 _session_store.save(session)
                 break
     except Exception:
-        logger.exception("无法将图片 Markdown 写回 session: %s", session_id)
+        logger.exception("无法将下载链接写回 session: %s", session_id)
     return decorated
 
 
@@ -947,7 +989,7 @@ class ChatRequest(BaseModel):
     attachment_ids: list[str] = Field(
         default_factory=list,
         alias="attachmentIds",
-        description="Session-scoped image attachments sent with this turn.",
+        description="Session-scoped attachments sent with this turn.",
     )
 
     model_config = {"populate_by_name": True}
@@ -1079,9 +1121,9 @@ def _markdown_image_alt(filename: str) -> str:
 def _resolve_chat_attachments(
     session_id: str, attachment_ids: list[str]
 ) -> tuple[list[str], list[str]]:
-    """Resolve uploaded image IDs to safe local paths and display Markdown."""
+    """Resolve uploaded attachment IDs to safe paths and display Markdown."""
     if len(attachment_ids) > 4:
-        raise HTTPException(status_code=400, detail="每条消息最多发送 4 张图片")
+        raise HTTPException(status_code=400, detail="每条消息最多发送 4 个附件")
     records = {str(item.get("id")): item for item in _read_attachments_meta(session_id)}
     root = _attachments_dir(session_id).resolve()
     media_paths: list[str] = []
@@ -1092,22 +1134,23 @@ def _resolve_chat_attachments(
             raise HTTPException(status_code=404, detail=f"附件不存在: {attachment_id}")
         mime_type = str(record.get("mimeType") or "")
         path = (root / str(record.get("storedName") or "")).resolve()
-        if not _is_safe_inline_image(path, mime_type):
-            raise HTTPException(status_code=400, detail="当前消息仅支持粘贴图片")
         try:
             path.relative_to(root)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail="无效的附件路径") from exc
         if not path.is_file():
             raise HTTPException(status_code=404, detail=f"附件文件不存在: {attachment_id}")
-        if path.stat().st_size > 20 * 1024 * 1024:
+        is_inline_image = _is_safe_inline_image(path, mime_type)
+        if is_inline_image and path.stat().st_size > 20 * 1024 * 1024:
             raise HTTPException(status_code=413, detail="单张图片不能超过 20 MB")
-        original_name = str(record.get("originalName") or "image")
+        original_name = str(record.get("originalName") or "attachment")
         safe_name = _markdown_image_alt(original_name)
-        media_paths.append(str(path))
-        markdown.append(
-            f"![{safe_name}](/sessions/{session_id}/attachments/{attachment_id})"
-        )
+        content_url = f"/sessions/{session_id}/attachments/{attachment_id}"
+        if is_inline_image:
+            media_paths.append(str(path))
+            markdown.append(f"![{safe_name}]({content_url})")
+        else:
+            markdown.append(f"[附件 {safe_name}]({content_url})")
     return media_paths, markdown
 
 
@@ -1188,7 +1231,7 @@ async def handle_chat(req: ChatRequest):
     )
     text = req.message.strip()
     if not text and not attachment_markdown:
-        raise HTTPException(status_code=400, detail="消息或图片不能为空")
+        raise HTTPException(status_code=400, detail="消息或附件不能为空")
     turn_message = "\n\n".join(
         part for part in (text, "\n".join(attachment_markdown)) if part
     )
@@ -1214,6 +1257,7 @@ async def handle_chat(req: ChatRequest):
             "autoMode": _auto_mode.get(sid, False),
             "unlimitedMode": _workspace_manager.is_unlimited(sid),
             "piMode": _session_pi_mode(sid),
+            "agentBackend": _session_backend(sid),
             "title": session.title,
         }
 
@@ -1241,6 +1285,7 @@ async def handle_chat(req: ChatRequest):
             "autoMode": _auto_mode.get(sid, False),
             "unlimitedMode": _workspace_manager.is_unlimited(sid),
             "piMode": _session_pi_mode(sid),
+            "agentBackend": _session_backend(sid),
             "title": title,
         }
 
@@ -1334,6 +1379,7 @@ async def handle_chat(req: ChatRequest):
         "autoMode": _auto_mode.get(sid, False),
         "unlimitedMode": _workspace_manager.is_unlimited(sid),
         "piMode": _session_pi_mode(sid),
+        "agentBackend": _session_backend(sid),
         "title": new_title,
     }
 
@@ -1405,6 +1451,10 @@ def _mutating_command_session(command: str, current_session_id: str) -> str | No
         "on", "off", "enable", "disable", "pi", "sjtuclaw",
     }:
         return current_session_id
+    if root == "/claude" and sub in {
+        "on", "off", "enable", "disable", "claude", "sjtuclaw",
+    }:
+        return current_session_id
     if root == "/rollback" and sub not in {"status", "show", "list"}:
         return current_session_id
     if root == "/session" and sub in {"rename", "delete"} and len(parts) > 2:
@@ -1453,7 +1503,12 @@ def _execute_slash_command(
     def _switch_backend(target: str) -> str:
         current = _session_backend(sid)
         if target == "status":
-            return f"当前 session 的 Agent 后端：{'Pi' if current == 'pi' else 'SJTUClaw'}。"
+            label = {
+                "pi": "Pi",
+                "claude": "Claude Code",
+                "sjtuclaw": "SJTUClaw",
+            }.get(current, current)
+            return f"当前 session 的 Agent 后端：{label}。"
         if target == current:
             if target == "pi":
                 try:
@@ -1462,11 +1517,24 @@ def _execute_slash_command(
                 except Exception as exc:
                     return f"[错误] Pi Agent 运行环境不可用：{exc}"
                 return "当前 session 已启用 Pi，运行环境检查通过。"
+            if target == "claude":
+                try:
+                    from claw.claude import load_claude_code_config
+                    config = load_claude_code_config()
+                except Exception as exc:
+                    return f"[错误] Claude Code 运行环境不可用：{exc}"
+                return (
+                    "当前 session 已启用 Claude Code，运行环境检查通过："
+                    f"{' '.join(config.command)}"
+                )
             return "当前 session 已使用 SJTUClaw 原生后端。"
         try:
             if target == "pi":
                 from claw.pi import load_pi_config
                 load_pi_config()
+            elif target == "claude":
+                from claw.claude import load_claude_code_config
+                load_claude_code_config()
             elif not (
                 _config.api_key
                 and _config.base_url
@@ -1479,7 +1547,11 @@ def _execute_slash_command(
         return (
             "当前 session 已接入 Pi Agent 后端。"
             if target == "pi"
-            else "当前 session 已切回 SJTUClaw 原生后端。"
+            else (
+                "当前 session 已接入 Claude Code 后端。"
+                if target == "claude"
+                else "当前 session 已切回 SJTUClaw 原生后端。"
+            )
         )
 
     state = RuntimeState(
@@ -1545,6 +1617,7 @@ async def _run_explicit_skill_command(
             "autoMode": _auto_mode.get(session_id, False),
             "unlimitedMode": _workspace_manager.is_unlimited(session_id),
             "piMode": _session_pi_mode(session_id),
+            "agentBackend": _session_backend(session_id),
         }
 
     cancel_event = _register_active_turn(session_id)
@@ -1618,6 +1691,7 @@ async def _run_explicit_skill_command(
         "autoMode": _auto_mode.get(session_id, False),
         "unlimitedMode": _workspace_manager.is_unlimited(session_id),
         "piMode": _session_pi_mode(session_id),
+        "agentBackend": _session_backend(session_id),
     }
 
 
@@ -1680,8 +1754,8 @@ async def handle_command(req: CommandRequest):
         actions = []
     elif root == "/unlimited":
         actions = ["reload_unlimited_mode"]
-    elif root == "/pi" and args_lower and args_lower[0] in (
-        "on", "off", "enable", "disable", "pi", "sjtuclaw",
+    elif root in {"/pi", "/claude"} and args_lower and args_lower[0] in (
+        "on", "off", "enable", "disable", "pi", "claude", "sjtuclaw",
     ):
         actions = ["reload_sessions"]
 
@@ -1696,6 +1770,9 @@ async def handle_command(req: CommandRequest):
         "autoMode": _auto_mode.get(mode_sid, False),
         "unlimitedMode": _workspace_manager.is_unlimited(mode_sid),
         "piMode": _session_pi_mode(mode_sid) if mode_session_exists else False,
+        "agentBackend": (
+            _session_backend(mode_sid) if mode_session_exists else "sjtuclaw"
+        ),
     }
     if switch_to:
         resp["switchToSessionId"] = switch_to
@@ -1733,6 +1810,7 @@ def create_session(req: CreateSessionRequest | None = None):
         "sessionId": session.session_id,
         "title": session.title,
         "piMode": _session_pi_mode(session.session_id),
+        "agentBackend": _session_backend(session.session_id),
     }
 
 
@@ -1749,6 +1827,7 @@ def get_messages(session_id: str):
         "autoMode": _auto_mode.get(session_id, False),
         "unlimitedMode": _workspace_manager.is_unlimited(session_id),
         "piMode": _session_pi_mode(session_id),
+        "agentBackend": _session_backend(session_id),
         "rollback": _rollback_manager.status(session_id),
     }
 
@@ -2334,7 +2413,10 @@ def list_download_entries():
 
 
 @app.get("/downloads/{download_id}")
-def serve_download(download_id: str):
+def serve_download(
+    download_id: str,
+    download: bool = False,
+):
     """Serve the file registered under *download_id*."""
     file_path = get_download(download_id)
     if file_path is None:
@@ -2347,7 +2429,7 @@ def serve_download(download_id: str):
         )
     media_type = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
     headers = {"X-Content-Type-Options": "nosniff"}
-    if _is_safe_inline_image(file_path, media_type):
+    if _is_safe_inline_image(file_path, media_type) and not download:
         return FileResponse(
             path=str(file_path),
             media_type=media_type,
@@ -2908,8 +2990,14 @@ def _float_setting(name: str, default: float) -> float:
 def _llm_settings_payload() -> dict[str, Any]:
     api_key = setting_value("LLM_API_KEY", "").strip()
     backend = setting_value("AGENT_BACKEND", "sjtuclaw").strip().lower()
-    if backend not in {"sjtuclaw", "pi"}:
+    if backend not in {"sjtuclaw", "pi", "claude"}:
         backend = "sjtuclaw"
+    try:
+        from claw.claude import resolve_claude_code_command
+
+        claude_command = " ".join(resolve_claude_code_command())
+    except Exception:
+        claude_command = ""
     return {
         "backend": backend,
         "baseUrl": setting_value("LLM_BASE_URL", "https://api.openai.com/v1").strip(),
@@ -2924,6 +3012,17 @@ def _llm_settings_payload() -> dict[str, Any]:
         "piModel": setting_value("PI_MODEL", "").strip(),
         "piThinking": setting_value("PI_THINKING", "").strip(),
         "piTrustTools": setting_value("PI_TRUST_TOOLS", "false").strip().lower() in {"1", "true", "yes", "on"},
+        "claudeModel": setting_value("CLAUDE_CODE_MODEL", "").strip(),
+        "claudePermissionMode": setting_value(
+            "CLAUDE_CODE_PERMISSION_MODE",
+            "default",
+        ).strip() or "default",
+        "claudeTrustTools": setting_value(
+            "CLAUDE_CODE_TRUST_TOOLS",
+            "false",
+        ).strip().lower() in {"1", "true", "yes", "on"},
+        "claudeDetected": bool(claude_command),
+        "claudeCommand": claude_command,
     }
 
 
@@ -3003,9 +3102,9 @@ def _apply_llm_runtime_config() -> None:
     settings = _llm_settings_payload()
     api_key = setting_value("LLM_API_KEY", "").strip()
     backend = settings["backend"]
-    if backend != "pi" and not api_key:
+    if backend == "sjtuclaw" and not api_key:
         raise HTTPException(status_code=400, detail="请填写 LLM API Key")
-    if backend != "pi" and not settings["model"]:
+    if backend == "sjtuclaw" and not settings["model"]:
         raise HTTPException(status_code=400, detail="请填写 LLM 模型名称")
     if settings["baseUrl"]:
         _validate_url(settings["baseUrl"], "Base_url")
@@ -3075,6 +3174,12 @@ class LLMSettingsRequest(BaseModel):
     pi_model: str = Field(default="", alias="piModel")
     pi_thinking: str = Field(default="", alias="piThinking")
     pi_trust_tools: bool = Field(default=False, alias="piTrustTools")
+    claude_model: str = Field(default="", alias="claudeModel")
+    claude_permission_mode: str = Field(
+        default="default",
+        alias="claudePermissionMode",
+    )
+    claude_trust_tools: bool = Field(default=False, alias="claudeTrustTools")
 
 
 class QQSettingsRequest(BaseModel):
@@ -3100,13 +3205,28 @@ def get_llm_settings():
 def update_llm_settings(req: LLMSettingsRequest):
     backend = req.backend.strip().lower()
     pi_thinking = req.pi_thinking.strip().lower()
-    if backend not in {"sjtuclaw", "pi"}:
-        raise HTTPException(status_code=400, detail="Agent backend 必须是 sjtuclaw 或 pi")
+    claude_permission_mode = req.claude_permission_mode.strip() or "default"
+    if backend not in {"sjtuclaw", "pi", "claude"}:
+        raise HTTPException(
+            status_code=400,
+            detail="Agent backend 必须是 sjtuclaw、pi 或 claude",
+        )
     if pi_thinking not in {"", "off", "minimal", "low", "medium", "high", "xhigh", "max"}:
         raise HTTPException(status_code=400, detail="Pi thinking level 无效")
+    if claude_permission_mode not in {
+        "default",
+        "acceptEdits",
+        "plan",
+        "auto",
+        "dontAsk",
+    }:
+        raise HTTPException(
+            status_code=400,
+            detail="Claude Code permission mode 无效",
+        )
     if req.base_url.strip():
         _validate_url(req.base_url.strip(), "Base_url")
-    if backend != "pi" and not req.model.strip():
+    if backend == "sjtuclaw" and not req.model.strip():
         raise HTTPException(status_code=400, detail="请填写 LLM 模型名称")
     if req.context_window < 1024:
         raise HTTPException(status_code=400, detail="Context window 不能小于 1024")
@@ -3130,6 +3250,11 @@ def update_llm_settings(req: LLMSettingsRequest):
         "PI_MODEL": req.pi_model.strip(),
         "PI_THINKING": pi_thinking,
         "PI_TRUST_TOOLS": "true" if req.pi_trust_tools else "false",
+        "CLAUDE_CODE_MODEL": req.claude_model.strip(),
+        "CLAUDE_CODE_PERMISSION_MODE": claude_permission_mode,
+        "CLAUDE_CODE_TRUST_TOOLS": (
+            "true" if req.claude_trust_tools else "false"
+        ),
     }
     if req.api_key:
         updates["LLM_API_KEY"] = req.api_key
@@ -3368,7 +3493,7 @@ async def handle_chat_stream(req: ChatRequest):
 
         async def _command_events():
             yield _event_to_sse(FinalEvent(content=result_text))
-            yield f"data: {json.dumps({'type': '_session_info', 'sessionId': sid, 'autoMode': _auto_mode.get(sid, False), 'unlimitedMode': _workspace_manager.is_unlimited(sid), 'piMode': _session_pi_mode(sid)}, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'type': '_session_info', 'sessionId': sid, 'autoMode': _auto_mode.get(sid, False), 'unlimitedMode': _workspace_manager.is_unlimited(sid), 'piMode': _session_pi_mode(sid), 'agentBackend': _session_backend(sid)}, ensure_ascii=False)}\n\n"
             yield "data: {\"type\": \"_done\"}\n\n"
 
         return StreamingResponse(
@@ -3393,7 +3518,7 @@ async def handle_chat_stream(req: ChatRequest):
 
         async def _config_required_events():
             yield _event_to_sse(FinalEvent(content=reply))
-            yield f"data: {json.dumps({'type': '_session_info', 'sessionId': sid, 'autoMode': _auto_mode.get(sid, False), 'unlimitedMode': _workspace_manager.is_unlimited(sid), 'piMode': _session_pi_mode(sid)}, ensure_ascii=False)}\n\n"
+            yield f"data: {json.dumps({'type': '_session_info', 'sessionId': sid, 'autoMode': _auto_mode.get(sid, False), 'unlimitedMode': _workspace_manager.is_unlimited(sid), 'piMode': _session_pi_mode(sid), 'agentBackend': _session_backend(sid)}, ensure_ascii=False)}\n\n"
             yield "data: {\"type\": \"_done\"}\n\n"
 
         return StreamingResponse(
@@ -3441,7 +3566,7 @@ async def handle_chat_stream(req: ChatRequest):
             )
             # The FinalEvent is emitted inside run_agent_turn, but we
             # also send a session_id + autoMode info event
-            event_queue.put({"type": "_session_info", "sessionId": sid, "autoMode": _auto_mode.get(sid, False), "unlimitedMode": _workspace_manager.is_unlimited(sid), "piMode": _session_pi_mode(sid)})
+            event_queue.put({"type": "_session_info", "sessionId": sid, "autoMode": _auto_mode.get(sid, False), "unlimitedMode": _workspace_manager.is_unlimited(sid), "piMode": _session_pi_mode(sid), "agentBackend": _session_backend(sid)})
 
             # Auto-title
             try:

@@ -90,7 +90,7 @@ export async function fetchSessions(): Promise<{ ok: boolean; sessions: import("
   return request("/sessions");
 }
 
-export async function createSession(): Promise<{ ok: boolean; sessionId: string; title: string; piMode?: boolean }> {
+export async function createSession(): Promise<{ ok: boolean; sessionId: string; title: string; piMode?: boolean; agentBackend?: import("@/lib/types").AgentBackend }> {
   return request("/sessions", { method: "POST", body: "{}" });
 }
 
@@ -109,7 +109,7 @@ export async function renameSession(sessionId: string, title: string): Promise<{
 
 export async function fetchMessages(sessionId: string): Promise<{
   ok: boolean; sessionId: string; messages: import("@/lib/types").ChatMessage[]; summary: string;
-  autoMode?: boolean; unlimitedMode?: boolean; piMode?: boolean; rollback?: import("@/lib/types").RollbackStatus;
+  autoMode?: boolean; unlimitedMode?: boolean; piMode?: boolean; agentBackend?: import("@/lib/types").AgentBackend; rollback?: import("@/lib/types").RollbackStatus;
 }> {
   return request(`/sessions/${encodeURIComponent(sessionId)}/messages`);
 }
@@ -217,6 +217,7 @@ export async function sendCommand(data: { sessionId: string; command: string }):
   autoMode?: boolean;
   unlimitedMode?: boolean;
   piMode?: boolean;
+  agentBackend?: import("@/lib/types").AgentBackend;
 }> {
   return request("/command", {
     method: "POST",
@@ -278,7 +279,7 @@ export async function fetchLLMSettings(): Promise<{ ok: boolean; settings: impor
 }
 
 export async function saveLLMSettings(data: {
-  backend: "sjtuclaw" | "pi";
+  backend: "sjtuclaw" | "pi" | "claude";
   baseUrl: string;
   apiKey?: string;
   model: string;
@@ -290,6 +291,9 @@ export async function saveLLMSettings(data: {
   piModel: string;
   piThinking: string;
   piTrustTools: boolean;
+  claudeModel: string;
+  claudePermissionMode: string;
+  claudeTrustTools: boolean;
 }): Promise<{ ok: boolean; settings: import("@/lib/types").LLMSettings }> {
   return request("/settings/llm", {
     method: "PUT",

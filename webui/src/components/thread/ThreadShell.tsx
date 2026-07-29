@@ -4,7 +4,7 @@ import { Button } from "@/components/ui/button";
 import { ThreadViewport } from "./ThreadViewport";
 import { ThreadComposer } from "./ThreadComposer";
 import { useDragScroll } from "@/hooks/useDragScroll";
-import type { ChatMessage } from "@/lib/types";
+import type { AgentBackend, ChatMessage } from "@/lib/types";
 
 interface ThreadShellProps {
   sessionId: string | null;
@@ -15,6 +15,7 @@ interface ThreadShellProps {
   autoMode?: boolean;
   unlimitedMode?: boolean;
   piMode?: boolean;
+  agentBackend?: AgentBackend;
   rollbackEnabled?: boolean;
   rollingBack?: boolean;
   workspaceRefreshToken?: number;
@@ -32,11 +33,14 @@ export function SessionModeBadges({
   autoMode,
   unlimitedMode,
   piMode,
+  agentBackend,
 }: {
   autoMode: boolean;
   unlimitedMode: boolean;
   piMode: boolean;
+  agentBackend?: AgentBackend;
 }) {
+  const backend = agentBackend ?? (piMode ? "pi" : "sjtuclaw");
   return (
     <>
       {autoMode && (
@@ -49,13 +53,22 @@ export function SessionModeBadges({
           <ShieldCheck className="h-3 w-3" /> Unlimited
         </span>
       )}
-      {piMode && (
+      {backend === "pi" && (
         <span
           data-testid="pi-mode-badge"
           className="flex shrink-0 items-center gap-1 rounded-lg border border-violet-500/25 bg-violet-500/10 px-2 py-1 text-[10px] font-semibold text-violet-600 dark:text-violet-300"
           title="当前会话使用 Pi Agent 后端"
         >
           <Bot className="h-3 w-3" /> Pi
+        </span>
+      )}
+      {backend === "claude" && (
+        <span
+          data-testid="claude-mode-badge"
+          className="flex shrink-0 items-center gap-1 rounded-lg border border-orange-500/25 bg-orange-500/10 px-2 py-1 text-[10px] font-semibold text-orange-700 dark:text-orange-300"
+          title="当前会话使用 Claude Code 后端"
+        >
+          <Bot className="h-3 w-3" /> Claude Code
         </span>
       )}
     </>
@@ -75,6 +88,7 @@ export function ThreadShell({
   autoMode = false,
   unlimitedMode = false,
   piMode = false,
+  agentBackend,
   rollbackEnabled = false,
   rollingBack = false,
   workspaceRefreshToken = 0,
@@ -145,6 +159,7 @@ export function ThreadShell({
             autoMode={autoMode}
             unlimitedMode={unlimitedMode}
             piMode={piMode}
+            agentBackend={agentBackend}
           />
         </div>
         <Button

@@ -31,8 +31,15 @@ _VOLATILE_MESSAGE_KEYS = frozenset({
 
 # Metadata keys that should be stripped when forking a session.
 _FORK_VOLATILE_METADATA_KEYS = frozenset({
+    "claude_initialized_generation",
+    "claude_session_cwd",
+    "claude_session_generation",
+    "claude_session_owner",
     "goal_state",
     "pending_user_turn",
+    "pi_initialized_generation",
+    "pi_session_generation",
+    "pi_session_owner",
     "runtime_checkpoint",
     "title",
     "title_user_edited",
@@ -233,6 +240,12 @@ class Session:
         self.summary = ""
         self.metadata.pop("_last_summary", None)
         self.metadata["pi_session_generation"] = uuid.uuid4().hex
+        self.metadata["claude_session_generation"] = uuid.uuid4().hex
+        self.metadata.pop("pi_session_owner", None)
+        self.metadata.pop("pi_initialized_generation", None)
+        self.metadata.pop("claude_session_owner", None)
+        self.metadata.pop("claude_initialized_generation", None)
+        self.metadata.pop("claude_session_cwd", None)
         self.touch()
 
     # -- History replay

@@ -18,4 +18,18 @@ describe("SessionModeBadges", () => {
     );
     expect(view.queryByTestId("pi-mode-badge")).toBeNull();
   });
+
+  it("shows the Claude Code indicator for Claude sessions", () => {
+    const view = render(
+      <SessionModeBadges
+        autoMode={false}
+        unlimitedMode={false}
+        piMode={false}
+        agentBackend="claude"
+      />
+    );
+    expect(view.getByTestId("claude-mode-badge").textContent).toContain(
+      "Claude Code"
+    );
+  });
 });

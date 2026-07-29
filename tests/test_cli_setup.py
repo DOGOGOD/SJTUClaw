@@ -10,7 +10,7 @@ def _feed_inputs(monkeypatch, values: list[str]) -> None:
     monkeypatch.setattr("builtins.input", lambda _prompt="": next(answers))
 
 
-def test_setup_wizard_merges_recommended_sections_without_changing_backend(
+def test_setup_wizard_has_no_agent_backend_or_pi_configuration(
     tmp_path: Path,
     monkeypatch,
     capsys,
@@ -27,7 +27,7 @@ def test_setup_wizard_merges_recommended_sections_without_changing_backend(
     monkeypatch.setattr(cli_main, "_ENV_PATH", env_path)
     monkeypatch.setattr(cli_main, "_ENV_EXAMPLE", example_path)
 
-    decisions = iter([True, True, True, True, True])
+    decisions = iter([True, True, True, True])
     monkeypatch.setattr(
         cli_main,
         "_prompt_yn",
@@ -54,16 +54,6 @@ def test_setup_wizard_merges_recommended_sections_without_changing_backend(
             "GATEWAY_HOST": "127.0.0.1",
             "GATEWAY_PORT": "8000",
             "GATEWAY_OPEN_BROWSER": "false",
-        },
-    )
-    monkeypatch.setattr(
-        cli_main,
-        "_setup_pi",
-        lambda: {
-            "PI_PROVIDER": "openai",
-            "PI_MODEL": "pi-model",
-            "PI_THINKING": "high",
-            "PI_TRUST_TOOLS": "false",
         },
     )
     monkeypatch.setattr(
@@ -97,7 +87,6 @@ def test_setup_wizard_merges_recommended_sections_without_changing_backend(
     assert "LLM_MODEL=new-model" in saved
     assert "WEB_TOOL_ENABLED=true" in saved
     assert "GATEWAY_HOST=127.0.0.1" in saved
-    assert "PI_MODEL=pi-model" in saved
     assert "QQ_MSG_FORMAT=markdown" in saved
     assert saved.count("AGENT_BACKEND=") == 1
 
@@ -105,8 +94,9 @@ def test_setup_wizard_merges_recommended_sections_without_changing_backend(
     assert "secret-key" not in output
     assert "qq-secret" not in output
     assert "欢迎使用 SJTUClaw" in output
+    assert "Pi" not in output
+    assert "Agent 后端" not in output
     assert ".env 中其他配置保持不变" not in output
-    assert "会话后端请使用 /pi on 或 /pi off" not in output
 
 
 def test_setup_gateway_local_mode_preserves_existing_remote_security(
@@ -155,22 +145,6 @@ def test_setup_gateway_lan_mode_generates_token_and_requires_origin(
         "GATEWAY_API_TOKEN": "generated-token",
         "GATEWAY_ALLOWED_ORIGINS": "http://192.168.1.20:8123",
     }
-
-
-def test_setup_pi_never_returns_agent_backend(monkeypatch):
-    monkeypatch.setattr(cli_main, "_read_env", lambda: {})
-    monkeypatch.setattr("claw.pi.client._resolve_pi_command", lambda: ("pi",))
-    _feed_inputs(monkeypatch, ["openai", "pi-model", "high", ""])
-
-    updates = cli_main._setup_pi()
-
-    assert updates == {
-        "PI_PROVIDER": "openai",
-        "PI_MODEL": "pi-model",
-        "PI_THINKING": "high",
-        "PI_TRUST_TOOLS": "false",
-    }
-    assert "AGENT_BACKEND" not in updates
 
 
 def test_setup_advanced_uses_current_defaults_and_optional_tavily(monkeypatch):

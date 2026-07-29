@@ -409,9 +409,10 @@ class ContextBuilder:
     def bound_workspace(self, session_id: str) -> str | None:
         """Return the explicitly bound workspace for an agent session.
 
-        Full-turn backends such as Pi use this as their process cwd.  The
-        generic context fallback is intentionally excluded because it is not
-        an explicit file-operation boundary.
+        Full-turn backends such as Pi and Claude Code use this as their process
+        cwd.  It is only a starting directory for external backends, not an
+        SJTUClaw-enforced file-operation boundary.  The generic context fallback
+        is intentionally excluded because it is not an explicit binding.
         """
         if self._workspace_manager is None:
             return None
@@ -459,12 +460,14 @@ class ContextBuilder:
             "## Pi 与 SJTUClaw 集成规则\n\n"
             "Pi 原生工具只有四个：`read`（读取文件）、`bash`（执行命令）、"
             "`edit`（编辑文件）、`write`（创建/覆盖文件）。这四个工具的定义和调用规则 "
-            "以 Pi 原生 system prompt 为准。\n\n"
+            "以 Pi 原生 system prompt 为准。绑定的工作区只作为 Pi 的启动目录，"
+            "不构成 SJTUClaw 文件访问边界；Pi 原生文件和命令工具不受 SJTUClaw "
+            "workspace 越界限制，其访问范围由 Pi 自身规则和运行环境决定。\n\n"
             "SJTUClaw 通过宿主工具桥接补充了以下能力：长期记忆（`recall`/`remember`）、"
             "定时任务（`cron`）、时间查询（`current_time`）、Web 访问（`web_search`/`web_fetch`）、"
             "附件管理（`copy_attachment_to_workspace`）和文件下载（`create_download`）。\n\n"
-            "所有工具的结果均来自实际执行，不得伪造。会改变状态的操作仍受 SJTUClaw "
-            "审批与 workspace 边界约束。"
+            "所有工具的结果均来自实际执行，不得伪造。会改变状态的宿主桥接工具仍受 "
+            "SJTUClaw 审批，并遵守各自工具契约；这不会限制 Pi 的原生文件和命令工具。"
             + (
                 "\n\n当前宿主是 Windows。Pi 的 bash 已经在当前工作区启动；执行工作区内"
                 "命令时优先使用 `.` 和相对路径，不要把带反斜杠的 Windows 绝对路径"
@@ -475,6 +478,55 @@ class ContextBuilder:
             )
         )
         return "\n\n---\n\n".join(section for section in sections if section.strip())
+
+    def build_claude_code_append_prompt(self, session_id: str) -> str:
+        """Build host context without replacing Claude Code's native prompt."""
+        import platform
+
+        workspace = self._resolve_workspace(session_id)
+        runtime = (
+            f"{'macOS' if platform.system() == 'Darwin' else platform.system()} "
+            f"{platform.machine()}, Python {platform.python_version()}"
+        )
+        identity_lines = [
+            "## SJTUClaw 运行环境",
+            runtime,
+            "",
+            "## 工作区",
+            f"当前工作区：`{workspace or '.'}`",
+            "",
+            "默认使用中文回复，除非用户明确要求其他语言。",
+        ]
+        if self._timezone:
+            identity_lines.append(f"当前时区：`{self._timezone}`")
+        sections = [
+            "\n".join(identity_lines),
+            self._system_prompt,
+            self._soul,
+        ]
+        bootstrap = self._build_bootstrap_block(workspace_path=workspace)
+        if bootstrap:
+            sections.append(bootstrap)
+        memory = self._build_memory_block()
+        if memory:
+            sections.append(memory)
+        sections.append(
+            "## Claude Code 与 SJTUClaw 集成规则\n\n"
+            "你正在作为 SJTUClaw 当前会话的 Claude Code 后端运行。"
+            "文件读取、搜索、编辑、命令执行、Skills、MCP 和子 Agent 等能力，"
+            "以 Claude Code 的原生 system prompt、用户配置和权限策略为准。\n\n"
+            "SJTUClaw 负责展示对话和工具进度、保存统一会话记录，并将显式绑定的"
+            "工作区作为启动目录；该目录不构成 SJTUClaw 文件访问边界。SJTUClaw "
+            "不对 Claude Code 原生工具施加 workspace 越界限制。\n\n"
+            "SJTUClaw 通过 MCP 宿主工具桥接补充长期记忆（`recall`/`remember`）、"
+            "定时任务（`cron`）、时间查询（`current_time`）、Web 访问"
+            "（`web_search`/`web_fetch`）、附件管理和下载等能力。搜索、读取、查询"
+            "等只读操作无需 SJTUClaw 审批；写入、删除或其他会改变状态的操作必须"
+            "经过审批。所有工具结果必须来自实际执行，不得伪造。"
+        )
+        return "\n\n---\n\n".join(
+            section for section in sections if section.strip()
+        )
 
     def _invalidate_cache(self) -> None:
         self._system_prefix_cache = None

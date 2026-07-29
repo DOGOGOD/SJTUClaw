@@ -4,13 +4,15 @@
 It does NOT return file content to the model — only a downloadId that
 the frontend can use to retrieve the file.
 
-Gateway stores these entries in a bounded in-memory registry. Entries expire
-after one hour and are also cleared when the server restarts.
+Gateway stores these entries in a bounded registry. Entries expire after one
+hour and can be persisted by the Gateway so links survive a server restart.
 """
 
 from __future__ import annotations
 
 import json
+import logging
+import re
 import threading
 import time
 import uuid
@@ -21,55 +23,146 @@ from typing import Any, Callable
 from claw.tools.base import Tool, ToolResult
 from claw.workspace.manager import WorkspaceManager, WorkspaceError
 
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Download registry (in-memory, shared with Gateway)
+# Download registry (shared with Gateway, optionally persisted)
 # ---------------------------------------------------------------------------
 
 _DOWNLOAD_TTL_S = 60 * 60
 _MAX_DOWNLOADS = 1_000
 _downloads: OrderedDict[str, tuple[Path, float]] = OrderedDict()
-"""downloadId -> (absolute Path, creation time)."""
+"""downloadId -> (absolute Path, Unix creation time)."""
 _downloads_lock = threading.Lock()
+_download_registry_path: Path | None = None
+_DOWNLOAD_ID_RE = re.compile(r"^dl_[0-9a-f]{12}$")
 
 
-def _prune_downloads_locked(now: float) -> None:
+def _prune_downloads_locked(now: float) -> bool:
     expired = [
         download_id
-        for download_id, (_path, created_at) in _downloads.items()
-        if now - created_at >= _DOWNLOAD_TTL_S
+        for download_id, (path, created_at) in _downloads.items()
+        if now - created_at >= _DOWNLOAD_TTL_S or not path.is_file()
     ]
     for download_id in expired:
         _downloads.pop(download_id, None)
+    trimmed = False
     while len(_downloads) > _MAX_DOWNLOADS:
         _downloads.popitem(last=False)
+        trimmed = True
+    return bool(expired) or trimmed
+
+
+def _persist_downloads_locked() -> None:
+    registry_path = _download_registry_path
+    if registry_path is None:
+        return
+    payload = {
+        "version": 1,
+        "entries": [
+            {
+                "downloadId": download_id,
+                "path": str(path),
+                "createdAt": created_at,
+            }
+            for download_id, (path, created_at) in _downloads.items()
+        ],
+    }
+    tmp_path = registry_path.with_name(
+        f".{registry_path.name}.{uuid.uuid4().hex}.tmp"
+    )
+    try:
+        registry_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        tmp_path.replace(registry_path)
+    except OSError:
+        logger.exception("无法持久化下载注册表: %s", registry_path)
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def configure_download_registry(registry_path: Path | None) -> None:
+    """Configure persistence and reload still-valid download entries."""
+    global _download_registry_path
+    with _downloads_lock:
+        _download_registry_path = (
+            Path(registry_path).expanduser().resolve()
+            if registry_path is not None
+            else None
+        )
+        _downloads.clear()
+        if _download_registry_path is None:
+            return
+        try:
+            payload = json.loads(
+                _download_registry_path.read_text(encoding="utf-8")
+            )
+        except FileNotFoundError:
+            payload = {}
+        except (OSError, json.JSONDecodeError):
+            logger.exception(
+                "无法读取下载注册表，将从空注册表启动: %s",
+                _download_registry_path,
+            )
+            payload = {}
+        now = time.time()
+        entries = payload.get("entries") if isinstance(payload, dict) else []
+        if isinstance(entries, list):
+            for item in entries:
+                if not isinstance(item, dict):
+                    continue
+                download_id = str(item.get("downloadId") or "")
+                raw_path = str(item.get("path") or "")
+                try:
+                    created_at = float(item.get("createdAt"))
+                    path = Path(raw_path)
+                except (TypeError, ValueError, OSError):
+                    continue
+                if (
+                    _DOWNLOAD_ID_RE.fullmatch(download_id)
+                    and path.is_absolute()
+                    and path.is_file()
+                    and 0 <= now - created_at < _DOWNLOAD_TTL_S
+                ):
+                    _downloads[download_id] = (path.resolve(), created_at)
+        _prune_downloads_locked(now)
+        _persist_downloads_locked()
 
 
 def register_download(file_path: Path) -> str:
     """Create a download entry and return its id."""
     download_id = f"dl_{uuid.uuid4().hex[:12]}"
-    now = time.monotonic()
+    now = time.time()
     with _downloads_lock:
         _prune_downloads_locked(now)
-        _downloads[download_id] = (file_path, now)
+        _downloads[download_id] = (file_path.resolve(), now)
         _prune_downloads_locked(now)
+        _persist_downloads_locked()
     return download_id
 
 
 def get_download(download_id: str) -> Path | None:
     """Return the file path for *download_id* or None."""
-    now = time.monotonic()
+    now = time.time()
     with _downloads_lock:
-        _prune_downloads_locked(now)
+        if _prune_downloads_locked(now):
+            _persist_downloads_locked()
         entry = _downloads.get(download_id)
         return entry[0] if entry is not None else None
 
 
 def list_downloads() -> dict[str, str]:
     """Return {downloadId: file_name} for all active downloads."""
-    now = time.monotonic()
+    now = time.time()
     with _downloads_lock:
-        _prune_downloads_locked(now)
+        if _prune_downloads_locked(now):
+            _persist_downloads_locked()
         return {did: entry[0].name for did, entry in _downloads.items()}
 
 
@@ -107,6 +200,14 @@ def _make_create_download_handler(
                 error=f"create_download 失败：{exc}",
             )
 
+        is_inline_image = resolved.suffix.lower() in {
+            ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".avif"
+        }
+        display_markdown = (
+            f"![{resolved.name}](/downloads/{download_id})"
+            if is_inline_image
+            else f"[下载 {resolved.name}](/downloads/{download_id})"
+        )
         return ToolResult(
             ok=True,
             content=json.dumps(
@@ -115,9 +216,13 @@ def _make_create_download_handler(
                     "path": path_str,
                     "downloadId": download_id,
                     "fileName": resolved.name,
+                    "downloadMarkdown": (
+                        f"[下载 {resolved.name}](/downloads/{download_id})"
+                    ),
+                    "displayMarkdown": display_markdown,
                     "inlineMarkdown": (
                         f"![{resolved.name}](/downloads/{download_id})"
-                        if resolved.suffix.lower() in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".avif"}
+                        if is_inline_image
                         else None
                     ),
                     "result": "下载入口已创建",
@@ -143,8 +248,10 @@ def create_download_tool(
         description=(
             "为 workspace 内已有文件创建一个可通过 Gateway 下载的临时入口。"
             "需要提供 path 参数（相对于 workspace 的文件路径）。"
-            "文件必须已存在。返回 downloadId，前端可通过此 ID 下载文件；图片还会返回 inlineMarkdown，"
-            "最终回复中必须使用该 Markdown 图片语法展示图片，不要说无法在消息中显示图片。"
+            "文件必须已存在。返回 downloadId 和应直接展示的 displayMarkdown。"
+            "最终回复只使用一次 displayMarkdown；图片的 displayMarkdown 已同时"
+            "提供预览和前端下载按钮，不要再输出 downloadMarkdown 或 inlineMarkdown，"
+            "也不要只把 downloadId 作为普通文字告诉用户。"
         ),
         input_schema={
             "type": "object",

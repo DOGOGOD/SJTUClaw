@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import base64
-import hmac
 import hashlib
 import json
 import logging
@@ -21,6 +20,7 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 
 from claw.agent.events import ErrorEvent, FinalEvent, ThinkingEvent, ToolCallEndEvent, ToolCallStartEvent
+from claw.agent.host_tools import execute_host_tool, list_host_tool_definitions
 from claw.approval.manager import ApprovalRequest, ApprovalStatus
 from claw.config import DATA_DIR, MAIN_DIR, PROJECT_ROOT, LLMConfig
 from claw.llm.client import LLMClient, LLMError
@@ -31,7 +31,7 @@ from claw.utils import now_iso
 logger = logging.getLogger(__name__)
 
 SESSION_BACKEND_KEY = "agent_backend"
-_VALID_AGENT_BACKENDS = frozenset({"sjtuclaw", "pi"})
+_VALID_AGENT_BACKENDS = frozenset({"sjtuclaw", "pi", "claude"})
 
 
 class PiError(RuntimeError):
@@ -167,14 +167,16 @@ def set_session_backend(session_store, session_id: str, backend: str) -> str:
     current = str(session.metadata.get(SESSION_BACKEND_KEY) or "").strip().lower()
     if current not in _VALID_AGENT_BACKENDS:
         current = default_agent_backend()
-    if current != normalized and normalized == "pi":
-        # A previously used Pi process has not seen turns completed by the
-        # native backend. Start a fresh Pi branch so run_agent_turn performs
-        # an authoritative SJTUClaw history handoff instead of resuming stale
-        # Pi state.
-        session.metadata["pi_session_generation"] = secrets.token_hex(16)
-        session.metadata.pop("pi_session_owner", None)
-        session.metadata.pop("pi_initialized_generation", None)
+    if current != normalized and normalized in {"pi", "claude"}:
+        # An external runtime has not seen turns completed by another backend.
+        # Start a fresh branch so it receives an authoritative history handoff
+        # rather than resuming stale native state.
+        prefix = "pi" if normalized == "pi" else "claude"
+        session.metadata[f"{prefix}_session_generation"] = secrets.token_hex(16)
+        session.metadata.pop(f"{prefix}_session_owner", None)
+        session.metadata.pop(f"{prefix}_initialized_generation", None)
+        if prefix == "claude":
+            session.metadata.pop("claude_session_cwd", None)
     session.metadata[SESSION_BACKEND_KEY] = normalized
     session.touch()
     session_store.save(session, fsync=True)
@@ -809,14 +811,7 @@ class PiAgentClient(LLMClient):
                 files["prompt"] = prompt_path
 
             if tool_registry is not None:
-                excluded = {
-                    "list_dir", "read_file", "create_file", "overwrite_file", "edit_file",
-                    "new_shell", "run_command", "skills_list", "skill_view", "skill_manage",
-                }
-                tools = [
-                    definition for definition in tool_registry.list_compact_definitions()
-                    if definition.get("name") not in excluded
-                ]
+                tools = list_host_tool_definitions(tool_registry)
                 if tools:
                     manifest_path = runtime_dir / f"{runtime_name}.tools.json"
                     manifest_path.write_text(
@@ -873,31 +868,17 @@ class PiAgentClient(LLMClient):
             payload = json.loads(str(raw_payload or "{}"))
         except json.JSONDecodeError:
             payload = {}
-        supplied_token = str(payload.get("token") or "")
-        if bridge_token and not hmac.compare_digest(supplied_token, bridge_token):
-            return json.dumps({"ok": False, "result": "SJTUClaw 工具桥接认证失败。"}, ensure_ascii=False)
-        name = str(payload.get("toolName") or "")
-        args = payload.get("input") if isinstance(payload.get("input"), dict) else {}
-        tool = tool_registry.get_tool(name) if tool_registry is not None else None
-        if tool is None:
-            return json.dumps({"ok": False, "result": f"未知的 SJTUClaw tool: {name}"}, ensure_ascii=False)
-
-        mutating = tool.safety_level in {"write", "shell", "download"}
-        approved = trust_tools or (auto_mode and not unlimited_mode)
-        if mutating and not approved:
-            if approval_handler is None:
-                return json.dumps({"ok": False, "result": "当前通道不支持审批，操作已拒绝。"}, ensure_ascii=False)
-            request = ApprovalRequest(session_id=session_id, tool_name=name, tool_args=args)
-            try:
-                approved = approval_handler(request).status == ApprovalStatus.APPROVED.value
-            except Exception:
-                logger.exception("Pi 宿主工具审批失败，已安全拒绝")
-        if mutating and not approved:
-            return json.dumps({"ok": False, "result": "用户未批准该操作。"}, ensure_ascii=False)
-
-        result = tool_registry.execute_by_name(name, args, max_result_chars=50_000)
-        text = result.content if result.ok else f"错误: {result.error}"
-        return json.dumps({"ok": result.ok, "result": text or "(空结果)"}, ensure_ascii=False)
+        response = execute_host_tool(
+            payload,
+            session_id=session_id,
+            tool_registry=tool_registry,
+            approval_handler=approval_handler,
+            trust_tools=trust_tools,
+            auto_mode=auto_mode,
+            unlimited_mode=unlimited_mode,
+            expected_token=bridge_token,
+        )
+        return json.dumps(response, ensure_ascii=False)
 
 
 class RuntimeAgentClient:
@@ -911,6 +892,9 @@ class RuntimeAgentClient:
             else None
         )
         self._pi_client = PiAgentClient(config)
+        from claw.claude import ClaudeCodeAgentClient
+
+        self._claude_client = ClaudeCodeAgentClient(config)
 
     @property
     def config(self) -> LLMConfig:
@@ -918,7 +902,10 @@ class RuntimeAgentClient:
 
     @property
     def configured(self) -> bool:
-        return default_agent_backend() == "pi" or self._legacy_configured()
+        return (
+            default_agent_backend() in {"pi", "claude"}
+            or self._legacy_configured()
+        )
 
     def _legacy_configured(self) -> bool:
         return bool(self.config.api_key and self.config.base_url and self.config.model)
@@ -928,7 +915,7 @@ class RuntimeAgentClient:
 
     def configured_for_session(self, session_id: str, session_store) -> bool:
         return (
-            self.backend_for_session(session_id, session_store) == "pi"
+            self.backend_for_session(session_id, session_store) in {"pi", "claude"}
             or self._legacy_configured()
         )
 
@@ -936,6 +923,8 @@ class RuntimeAgentClient:
         """Compatibility hook for callers that refresh one concrete client."""
         if isinstance(client, PiAgentClient):
             self._pi_client = client
+        elif client.__class__.__name__ == "ClaudeCodeAgentClient":
+            self._claude_client = client
         else:
             self._legacy_client = client
         self._config = client.config
@@ -953,8 +942,16 @@ class RuntimeAgentClient:
     def run_agent_turn(
         self, session_id: str, user_message: str, *, session_store, **kwargs
     ) -> str:
-        if self.backend_for_session(session_id, session_store) == "pi":
+        backend = self.backend_for_session(session_id, session_store)
+        if backend == "pi":
             return self._pi_client.run_agent_turn(
+                session_id,
+                user_message,
+                session_store=session_store,
+                **kwargs,
+            )
+        if backend == "claude":
+            return self._claude_client.run_agent_turn(
                 session_id,
                 user_message,
                 session_store=session_store,
@@ -982,16 +979,29 @@ class RuntimeAgentClient:
         )
 
     def compact_session(self, session_id: str, *, session_store) -> str:
-        if self.backend_for_session(session_id, session_store) != "pi":
-            raise PiError("当前 session 未启用 Pi，不能使用 Pi 原生压缩。")
-        return self._pi_client.compact_session(
-            session_id,
-            session_store=session_store,
-        )
+        backend = self.backend_for_session(session_id, session_store)
+        if backend == "pi":
+            return self._pi_client.compact_session(
+                session_id,
+                session_store=session_store,
+            )
+        if backend == "claude":
+            return self._claude_client.compact_session(
+                session_id,
+                session_store=session_store,
+            )
+        raise PiError("当前 session 未启用外部 Agent 后端。")
 
 
 def create_agent_client(config: LLMConfig) -> LLMClient:
-    return PiAgentClient(config) if setting_value("AGENT_BACKEND", "sjtuclaw").strip().lower() == "pi" else LLMClient(config)
+    backend = setting_value("AGENT_BACKEND", "sjtuclaw").strip().lower()
+    if backend == "pi":
+        return PiAgentClient(config)
+    if backend == "claude":
+        from claw.claude import ClaudeCodeAgentClient
+
+        return ClaudeCodeAgentClient(config)
+    return LLMClient(config)
 
 
 def is_pi_backend() -> bool:

@@ -14,6 +14,13 @@ describe("desktop pet slash command", () => {
     expect(isSlashCommand("/pi off")).toBe(true);
   });
 
+  it("routes Claude Code backend commands through the command endpoint", () => {
+    expect(isSlashCommand("/claude")).toBe(true);
+    expect(isSlashCommand("/claude on")).toBe(true);
+    expect(isSlashCommand("/claude status")).toBe(true);
+    expect(isSlashCommand("/claude off")).toBe(true);
+  });
+
   it("recognizes only pet selection commands as artwork changes", () => {
     expect(isPetSelectionCommand("/pet select xiaohuang_webp")).toBe(true);
     expect(isPetSelectionCommand("  /PET SELECT xiaohuang_webp  ")).toBe(true);

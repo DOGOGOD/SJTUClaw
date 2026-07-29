@@ -79,7 +79,7 @@ def main() -> int:
             base_url="https://api.openai.com/v1",
             model="",
         )
-        logging.warning("辅助 LLM 未配置；Pi session 仍可独立运行：%s", exc)
+        logging.warning("辅助 LLM 未配置；外部 Agent session 仍可独立运行：%s", exc)
 
     client = RuntimeAgentClient(config)
     session_store = SessionStore(SESSIONS_DIR)
@@ -129,7 +129,8 @@ def main() -> int:
         compact_llm=compact_llm,
         config=compact_cfg,
         session_filter=lambda session: (
-            get_session_backend(session_store, session.session_id) != "pi"
+            get_session_backend(session_store, session.session_id)
+            not in {"pi", "claude"}
         ),
         on_complete=_show_auto_compaction_completed,
     )

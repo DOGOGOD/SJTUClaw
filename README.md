@@ -16,6 +16,7 @@ SJTUClaw 将多轮对话、工具调用、长期记忆、Skill、定时任务和
 
 - **统一 Agent Loop**：CLI、Web UI、QQ Bot、Heartbeat 和 Cron 共享 `run_agent_turn()`。
 - **可选 Pi Agent 后端**：通过官方 JSONL RPC 接入 Pi，保留其模型提供商、工具循环、Skills、Extensions、自动压缩、重试和持久会话，同时沿用 SJTUClaw 的界面、渠道与审批体验。
+- **可选 Claude Code 后端**：自动检索电脑中已安装的 Claude Code，保留原生 prompt，并沿用现有登录、模型、Skills、MCP 和权限配置，通过官方 `stream-json` 接口保留工具循环、持久会话、危险操作审批与停止控制。
 - **工具调用与安全审批**：支持文件读写、Shell、联网、下载、记忆、Skill 和 Cron 工具，并按安全级别控制执行。
 - **可控执行模式**：提供按 Session 隔离的 AUTO 与 UNLIMITED 模式，可在自动执行效率和文件系统安全边界之间明确切换。
 - **上下文与长期记忆**：支持 Session 持久化、上下文压缩、Markdown 记忆和每日 Reflection。
@@ -23,6 +24,7 @@ SJTUClaw 将多轮对话、工具调用、长期记忆、Skill、定时任务和
 - **Skill 系统**：通过 `SKILL.md` 组织可复用工作流，支持发现、加载和管理。
 - **多入口与实时反馈**：Web UI 通过 SSE 展示 Agent 事件，QQ Bot 支持私聊、群聊和内联审批。
 - **多模态会话**：Web UI 支持粘贴或上传图片，每条消息最多 4 张、单张最多 20 MB；附件按 Session 隔离保存。
+- **输出文件交付**：Agent 可把 workspace 内的图片、Markdown、PDF、Office 文档、压缩包等注册为临时下载；Web UI 自动显示图片预览或文件下载按钮，链接在一小时有效期内可跨 Gateway 重启继续使用。
 - **本地化时间与定时任务**：自动识别系统时区，支持 `CLAW_TIMEZONE` 显式覆盖，识别失败时回退到上海时区。
 - **Windows 桌面应用**：使用 pywebview 承载完整 Web UI，通过 PyInstaller 打包后无需单独安装 Python 或 Node.js。
 - **标准安装与卸载体验**：使用 Inno Setup 7 生成安装向导，支持自选安装路径、开始菜单、桌面快捷方式、覆盖升级和系统卸载入口。
@@ -37,6 +39,7 @@ SJTUClaw/
 │   ├── approval/                 # 高风险工具审批管理
 │   ├── channels/                 # 外部渠道，目前包含 QQ Bot
 │   ├── cli/                      # CLI 入口、REPL 与命令解析
+│   ├── claude/                   # 可选 Claude Code CLI 客户端与事件桥接
 │   ├── context/                  # Context Builder、Compact、治理与 Token 预算
 │   ├── gateway/                  # FastAPI Gateway、REST API、SSE 与上传服务
 │   ├── llm/                      # OpenAI Compatible 客户端与协议适配
@@ -78,7 +81,9 @@ SJTUClaw/
 │       ├── SJTUClaw.iss          # Inno Setup 安装脚本
 │       └── assets/SJTUClaw.ico   # Windows 程序与快捷方式图标
 ├── docs/
+│   ├── CODE_WIKI.md              # 模块、调用链与实现细节
 │   ├── configuration.md          # 配置说明
+│   ├── data-directory-guide.md   # 运行数据目录与生命周期
 │   ├── testing.md                # 测试与开发说明
 │   ├── windows-packaging.md      # Windows 安装包构建说明
 │   └── images/                   # README 与文档截图
@@ -135,9 +140,20 @@ python -m pip install -e .
 sjtuclaw setup
 ```
 
-也可以复制 `.env.example` 为 `.env` 手动配置。`sjtuclaw setup` 会引导配置主模型、
-联网与时区、Gateway、本地可选 Pi 参数、常用高级参数和 QQ Bot；它不会修改默认
-Agent 后端，后端切换仍由各会话中的 `/pi on`、`/pi off` 控制。
+也可以复制 `.env.example` 为 `.env` 手动配置。`sjtuclaw setup` 只引导配置主模型、
+联网与时区、Gateway、常用高级参数和 QQ Bot，不包含 Agent 后端或 Pi 配置。
+
+需要使用 Claude Code 时，只需先按[官方说明](https://code.claude.com/docs/en/installation)
+完成安装和登录。SJTUClaw 会依次检索显式配置、系统 `PATH`、官方原生安装目录
+（Windows 为 `%USERPROFILE%\.local\bin\claude.exe`）及常见 npm 安装目录。
+在任意会话中输入 `/claude on` 即可启用；无需把 Claude 凭据复制到 SJTUClaw。
+Web UI 的“设置 → LLM”也可以把 Claude Code 设为新会话默认后端，并显示自动检测结果。
+会话绑定的 workspace 只作为 Claude Code/Pi 的启动目录，不限制其原生文件与命令
+工具的访问范围；两者分别遵守自己的权限系统。SJTUClaw 只追加集成上下文，不会
+替换 Claude Code 的原生 prompt。Claude Code 还会通过本地 MCP 继续获得
+SJTUClaw 独有的 `recall`、`remember`、`cron`、Web 等工具。搜索、读取和查询操作
+直接执行；文件写入、删除、会改变外部状态的 MCP 调用及有副作用的命令会进入
+SJTUClaw 的统一审批流程。
 
 需要使用 Pi 时，先构建同级目录中的 `pi` 仓库，或在系统中安装可执行的 `pi`。Web UI 的“设置 → LLM”可配置新会话的默认 Agent backend；已有会话可用 `/pi on`、`/pi off` 独立切换，互不影响，标题栏会显示 Pi 状态徽标。Pi 可以直接复用已有的 OpenAI-compatible 模型配置，也可以通过 `PI_PROVIDER`、`PI_MODEL` 使用 Pi 自身的模型与认证配置。
 
@@ -164,6 +180,13 @@ sjtuclaw-desktop    # Desktop：本地 Gateway + pywebview 独立窗口
 Gateway 启动后访问 <http://127.0.0.1:8000>。
 
 如果需要让 Gateway 自动打开浏览器，可设置 `GATEWAY_OPEN_BROWSER=1`。监听非本机地址时，代码会强制要求设置 `GATEWAY_API_TOKEN`。
+
+需要从 Web UI 获取 Agent 生成的文件时，可以直接要求“把某文件通过 WebUI 发给我”。
+Agent 调用 `create_download` 后，普通文件会显示带文件名的下载按钮，安全的位图格式会
+同时显示预览和下载入口。下载注册表保存在 `data/downloads/registry.json`，链接默认
+有效一小时；源文件被删除、有效期结束或注册表条目被清理后，链接即失效。下载入口
+只暴露已注册文件，不允许通过下载 URL 提交任意路径读取服务器文件；默认模式下
+注册源文件仍受当前 session 的 workspace 边界约束。
 
 前端开发：
 
@@ -311,6 +334,7 @@ dist\installer\SJTUClaw-Setup-<version>.exe
 /auto on|off|status
 /unlimited on|off|status
 /pi [on|off|status]
+/claude [on|off|status]
 /cron list|status|disable|enable|delete
 /approvals|approve|reject
 /pet status|list|open|close|select|autostart
@@ -350,7 +374,6 @@ dist\installer\SJTUClaw-Setup-<version>.exe
 - [测试与开发](docs/testing.md)
 - [Windows 安装包构建](docs/windows-packaging.md)
 - [代码 Wiki](docs/CODE_WIKI.md)
-- [功能验收任务测试集](doc/SJTUClaw功能验收任务测试集.md)
 - [前端源码](webui/)
 - [Skill 目录](skills/)
 

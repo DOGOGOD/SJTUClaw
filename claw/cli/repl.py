@@ -74,13 +74,19 @@ def run_repl(
 
     def _switch_backend(target: str) -> str:
         from claw.pi import get_session_backend, load_pi_config, set_session_backend
+        from claw.claude import load_claude_code_config
 
         current = get_session_backend(
             state.session_store,
             state.current_session_id,
         )
         if target == "status":
-            return f"当前 session 的 Agent 后端：{'Pi' if current == 'pi' else 'SJTUClaw'}。"
+            label = {
+                "pi": "Pi",
+                "claude": "Claude Code",
+                "sjtuclaw": "SJTUClaw",
+            }.get(current, current)
+            return f"当前 session 的 Agent 后端：{label}。"
         if target == current:
             if target == "pi":
                 try:
@@ -88,10 +94,21 @@ def run_repl(
                 except Exception as exc:
                     return f"[错误] Pi Agent 运行环境不可用：{exc}"
                 return "当前 session 已启用 Pi，运行环境检查通过。"
+            if target == "claude":
+                try:
+                    config = load_claude_code_config()
+                except Exception as exc:
+                    return f"[错误] Claude Code 运行环境不可用：{exc}"
+                return (
+                    "当前 session 已启用 Claude Code，运行环境检查通过："
+                    f"{' '.join(config.command)}"
+                )
             return "当前 session 已使用 SJTUClaw 原生后端。"
         try:
             if target == "pi":
                 load_pi_config()
+            elif target == "claude":
+                load_claude_code_config()
             elif not (
                 state.llm_config.api_key
                 and state.llm_config.base_url
@@ -108,7 +125,11 @@ def run_repl(
         return (
             "当前 session 已接入 Pi Agent 后端。"
             if target == "pi"
-            else "当前 session 已切回 SJTUClaw 原生后端。"
+            else (
+                "当前 session 已接入 Claude Code 后端。"
+                if target == "claude"
+                else "当前 session 已切回 SJTUClaw 原生后端。"
+            )
         )
 
     state.backend_switcher = _switch_backend

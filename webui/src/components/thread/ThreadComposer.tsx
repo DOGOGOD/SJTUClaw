@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ArrowUp, Plus, FolderOpen, FolderSearch, ImageIcon, Square, X } from "lucide-react";
+import { ArrowUp, FileText, Plus, FolderOpen, FolderSearch, ImageIcon, Square, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
@@ -15,6 +15,24 @@ interface ThreadComposerProps {
   workspaceRefreshToken?: number;
   home?: boolean;
 }
+
+interface PendingAttachment {
+  file: File;
+  previewUrl: string;
+  previewableImage: boolean;
+}
+
+const MAX_ATTACHMENTS = 4;
+const MAX_IMAGE_BYTES = 20 * 1024 * 1024;
+const MAX_FILE_BYTES = 50 * 1024 * 1024;
+const PREVIEWABLE_IMAGE_TYPES = new Set([
+  "image/png",
+  "image/jpeg",
+  "image/webp",
+  "image/gif",
+  "image/bmp",
+  "image/avif",
+]);
 
 export function ThreadComposer({
   onSend,
@@ -32,7 +50,7 @@ export function ThreadComposer({
   const [wsDisplay, setWsDisplay] = useState("");
   const [wsError, setWsError] = useState("");
   const [sendError, setSendError] = useState("");
-  const [pendingImages, setPendingImages] = useState<Array<{ file: File; url: string }>>([]);
+  const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([]);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const wsRef = useRef<HTMLDivElement>(null);
@@ -40,7 +58,7 @@ export function ThreadComposer({
   const historyRef = useRef(new Map<string, string[]>());
   const historyIndexRef = useRef<number | null>(null);
   const historyDraftRef = useRef("");
-  const pendingImagesRef = useRef<Array<{ file: File; url: string }>>([]);
+  const pendingAttachmentsRef = useRef<PendingAttachment[]>([]);
 
   const historyKey = sessionId || "__home__";
 
@@ -65,18 +83,18 @@ export function ThreadComposer({
     historyIndexRef.current = null;
     historyDraftRef.current = "";
     setSendError("");
-    setPendingImages((current) => {
-      current.forEach((item) => item.url && URL.revokeObjectURL(item.url));
+    setPendingAttachments((current) => {
+      current.forEach((item) => item.previewUrl && URL.revokeObjectURL(item.previewUrl));
       return [];
     });
   }, [sessionId]);
 
   useEffect(() => {
-    pendingImagesRef.current = pendingImages;
-  }, [pendingImages]);
+    pendingAttachmentsRef.current = pendingAttachments;
+  }, [pendingAttachments]);
 
   useEffect(() => () => {
-    pendingImagesRef.current.forEach((item) => item.url && URL.revokeObjectURL(item.url));
+    pendingAttachmentsRef.current.forEach((item) => item.previewUrl && URL.revokeObjectURL(item.previewUrl));
   }, []);
 
   useEffect(() => {
@@ -113,24 +131,39 @@ export function ThreadComposer({
     setValue(nextValue);
   }, []);
 
-  const addPendingImages = useCallback((files: File[]) => {
-    const supported = files.filter((file) => file.type.startsWith("image/") && file.size <= 20 * 1024 * 1024);
-    setSendError(supported.length !== files.length ? "仅支持不超过 20 MB 的图片。" : "");
-    setPendingImages((current) => {
-      const available = Math.max(0, 4 - current.length);
+  const addPendingAttachments = useCallback((files: File[]) => {
+    const supported = files.filter((file) => (
+      file.size <= (PREVIEWABLE_IMAGE_TYPES.has(file.type) ? MAX_IMAGE_BYTES : MAX_FILE_BYTES)
+    ));
+    setPendingAttachments((current) => {
+      const available = Math.max(0, MAX_ATTACHMENTS - current.length);
+      const accepted = supported.slice(0, available);
+      if (supported.length !== files.length) {
+        setSendError("图片不能超过 20 MB，其他文件不能超过 50 MB。");
+      } else if (supported.length > available) {
+        setSendError(`每条消息最多添加 ${MAX_ATTACHMENTS} 个附件。`);
+      } else {
+        setSendError("");
+      }
       return [
         ...current,
-        ...supported.slice(0, available).map((file) => ({
+        ...accepted.map((file) => {
+          const previewableImage = PREVIEWABLE_IMAGE_TYPES.has(file.type);
+          return {
           file,
-          url: typeof URL.createObjectURL === "function" ? URL.createObjectURL(file) : "",
-        })),
+          previewableImage,
+          previewUrl: previewableImage && typeof URL.createObjectURL === "function"
+            ? URL.createObjectURL(file)
+            : "",
+          };
+        }),
       ];
     });
   }, []);
 
   const handleSend = useCallback(async () => {
     const trimmed = value.trim();
-    if ((!trimmed && pendingImages.length === 0) || disabled || sending) return;
+    if ((!trimmed && pendingAttachments.length === 0) || disabled || sending) return;
 
     const history = historyRef.current.get(historyKey) || [];
     const historyEntryIndex = trimmed ? history.length : -1;
@@ -142,27 +175,29 @@ export function ThreadComposer({
 
     // Clear immediately so slow network requests never leave stale text in the composer.
     updateValue("");
-    const sentImages = pendingImages;
-    setPendingImages([]);
+    const sentAttachments = pendingAttachments;
+    setPendingAttachments([]);
     if (textareaRef.current) textareaRef.current.style.height = "auto";
 
     try {
-      const files = sentImages.map((item) => item.file);
+      const files = sentAttachments.map((item) => item.file);
       if (files.length > 0) await onSend(trimmed, files);
       else await onSend(trimmed);
-      sentImages.forEach((item) => item.url && URL.revokeObjectURL(item.url));
+      sentAttachments.forEach((item) => item.previewUrl && URL.revokeObjectURL(item.previewUrl));
     } catch (error) {
       // A rejected send is not part of the sent-message history.
       if (historyEntryIndex >= 0 && history[historyEntryIndex] === trimmed) history.splice(historyEntryIndex, 1);
       if (valueRef.current === "") updateValue(trimmed);
-      setPendingImages((current) => {
-        const combined = [...sentImages, ...current];
-        combined.slice(4).forEach((item) => item.url && URL.revokeObjectURL(item.url));
-        return combined.slice(0, 4);
+      setPendingAttachments((current) => {
+        const combined = [...sentAttachments, ...current];
+        combined.slice(MAX_ATTACHMENTS).forEach((item) => (
+          item.previewUrl && URL.revokeObjectURL(item.previewUrl)
+        ));
+        return combined.slice(0, MAX_ATTACHMENTS);
       });
       setSendError(error instanceof Error ? error.message : "消息发送失败，请重试。");
     }
-  }, [value, pendingImages, disabled, sending, historyKey, onSend, updateValue]);
+  }, [value, pendingAttachments, disabled, sending, historyKey, onSend, updateValue]);
 
   const handleStop = useCallback(async () => {
     if (!onStop) return;
@@ -229,36 +264,36 @@ export function ThreadComposer({
   const handleAttach = useCallback(() => fileInputRef.current?.click(), []);
   const handleFileChange = useCallback(
     (e: React.ChangeEvent<HTMLInputElement>) => {
-      const files = Array.from(e.target.files || []).filter((file) => file.type.startsWith("image/"));
-      if (files.length > 0) addPendingImages(files);
+      const files = Array.from(e.target.files || []);
+      if (files.length > 0) addPendingAttachments(files);
       e.target.value = "";
     },
-    [addPendingImages]
+    [addPendingAttachments]
   );
 
   const handlePaste = useCallback(
     (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
-      const itemImages = Array.from(e.clipboardData.items || [])
-        .filter((item) => item.kind === "file" && item.type.startsWith("image/"))
+      const itemFiles = Array.from(e.clipboardData.items || [])
+        .filter((item) => item.kind === "file")
         .map((item) => item.getAsFile())
         .filter((file): file is File => file !== null);
-      const images = itemImages.length > 0
-        ? itemImages
-        : Array.from(e.clipboardData.files || []).filter((file) => file.type.startsWith("image/"));
+      const files = itemFiles.length > 0
+        ? itemFiles
+        : Array.from(e.clipboardData.files || []);
 
-      if (images.length === 0) return;
-      // An image paste is an attachment action. Prevent the browser from also
+      if (files.length === 0) return;
+      // A file paste is an attachment action. Prevent the browser from also
       // inserting a filename or other clipboard representation into the draft.
       e.preventDefault();
-      addPendingImages(images);
+      addPendingAttachments(files);
     },
-    [addPendingImages]
+    [addPendingAttachments]
   );
 
-  const removePendingImage = useCallback((index: number) => {
-    setPendingImages((current) => {
+  const removePendingAttachment = useCallback((index: number) => {
+    setPendingAttachments((current) => {
       const removed = current[index];
-      if (removed?.url) URL.revokeObjectURL(removed.url);
+      if (removed?.previewUrl) URL.revokeObjectURL(removed.previewUrl);
       return current.filter((_, itemIndex) => itemIndex !== index);
     });
   }, []);
@@ -301,7 +336,7 @@ export function ThreadComposer({
     try { await unsetWorkspace(sid); setWsPath(""); setWsDisplay(""); setWsError(""); setShowWsPicker(false); } catch {}
   };
 
-  const hasContent = value.trim().length > 0 || pendingImages.length > 0;
+  const hasContent = value.trim().length > 0 || pendingAttachments.length > 0;
 
   return (
     <div className={cn(
@@ -326,19 +361,24 @@ export function ThreadComposer({
         )}
       />
 
-      {pendingImages.length > 0 && (
-        <div className="flex gap-2 overflow-x-auto px-1 pt-2" aria-label="待发送图片">
-          {pendingImages.map((item, index) => (
-            <div key={`${item.file.name}-${item.file.lastModified}-${index}`} className="relative h-16 w-16 shrink-0 overflow-hidden rounded-xl border border-border/80 bg-muted/50">
-              {item.url ? (
-                <img src={item.url} alt={item.file.name || `图片 ${index + 1}`} className="h-full w-full object-cover" />
+      {pendingAttachments.length > 0 && (
+        <div className="flex gap-2 overflow-x-auto px-1 pt-2" aria-label="待发送附件">
+          {pendingAttachments.map((item, index) => (
+            <div key={`${item.file.name}-${item.file.lastModified}-${index}`} className="relative flex h-16 w-40 shrink-0 items-center gap-2 overflow-hidden rounded-xl border border-border/80 bg-muted/50 p-2 pr-7">
+              {item.previewableImage && item.previewUrl ? (
+                <img src={item.previewUrl} alt={item.file.name || `图片 ${index + 1}`} className="h-12 w-12 shrink-0 rounded-lg object-cover" />
+              ) : item.previewableImage ? (
+                <ImageIcon className="h-5 w-5 shrink-0 text-muted-foreground" />
               ) : (
-                <ImageIcon className="absolute inset-0 m-auto h-5 w-5 text-muted-foreground" />
+                <FileText className="h-5 w-5 shrink-0 text-muted-foreground" />
               )}
+              <span className="min-w-0 truncate text-[11px] text-foreground/80" title={item.file.name}>
+                {item.file.name || `附件 ${index + 1}`}
+              </span>
               <button
                 type="button"
-                aria-label={`移除图片 ${index + 1}`}
-                onClick={() => removePendingImage(index)}
+                aria-label={`移除附件 ${index + 1}`}
+                onClick={() => removePendingAttachment(index)}
                 className="absolute right-1 top-1 grid h-5 w-5 place-items-center rounded-full bg-black/65 text-white hover:bg-black/80"
               >
                 <X className="h-3 w-3" />
@@ -381,8 +421,8 @@ export function ThreadComposer({
       </div>
 
       {/* Attach */}
-      <input ref={fileInputRef} type="file" accept="image/*" multiple className="hidden" onChange={handleFileChange} />
-      <Button variant="ghost" size="icon-sm" onClick={handleAttach} className="h-8 w-8 shrink-0 rounded-xl" title="添加附件">
+      <input ref={fileInputRef} type="file" multiple className="hidden" aria-label="选择附件" onChange={handleFileChange} />
+      <Button variant="ghost" size="icon-sm" onClick={handleAttach} className="h-8 w-8 shrink-0 rounded-xl" title="添加附件（图片或文件）">
         <Plus className="h-3.5 w-3.5" />
       </Button>
 

@@ -98,7 +98,7 @@ describe("ThreadViewport user messages", () => {
     expect(view.container.textContent).not.toContain("\ufffd");
   });
 
-  it("turns image download links into inline message images", () => {
+  it("renders image downloads as a preview plus a separate download control", () => {
     const view = render(
       <ThreadViewport
         messages={[{
@@ -112,6 +112,87 @@ describe("ThreadViewport user messages", () => {
 
     expect(view.getByRole("img", { name: "heart.png" }).getAttribute("src"))
       .toBe("/downloads/dl_demo");
+    const preview = view.getByRole("img", { name: "heart.png" }).closest("a");
+    expect(preview?.getAttribute("href")).toBe("/downloads/dl_demo");
+    expect(preview?.getAttribute("target")).toBe("_blank");
+    const download = view.getByRole("link", { name: "下载 heart.png" });
+    expect(download.getAttribute("href")).toBe("/downloads/dl_demo?download=1");
+    expect(download.getAttribute("download")).toBe("heart.png");
+  });
+
+  it("makes generated image markdown downloadable from its inline preview", () => {
+    const view = render(
+      <ThreadViewport
+        messages={[{
+          role: "assistant",
+          content: "点击下载它：\n\n![heart.png](/downloads/dl_generated)",
+        }]}
+        loading={false}
+        sessionId="session-a"
+      />
+    );
+
+    const image = view.getByRole("img", { name: "heart.png" });
+    const preview = image.closest("a");
+    expect(preview?.getAttribute("href")).toBe("/downloads/dl_generated");
+    expect(preview?.getAttribute("target")).toBe("_blank");
+    const download = view.getByRole("link", { name: "下载 heart.png" });
+    expect(download.getAttribute("href")).toBe("/downloads/dl_generated?download=1");
+    expect(download.getAttribute("download")).toBe("heart.png");
+  });
+
+  it("deduplicates image and link markdown for the same download", () => {
+    const view = render(
+      <ThreadViewport
+        messages={[{
+          role: "assistant",
+          content: [
+            "![heart.png](/downloads/dl_same)",
+            "[下载 heart.png](/downloads/dl_same)",
+            "![heart.png](/downloads/dl_same)",
+          ].join("\n\n"),
+        }]}
+        loading={false}
+        sessionId="session-a"
+      />
+    );
+
+    expect(view.getAllByRole("img", { name: "heart.png" })).toHaveLength(1);
+    expect(view.getAllByRole("link", { name: "下载 heart.png" })).toHaveLength(1);
+  });
+
+  it("renders regular download links as file download controls", () => {
+    const view = render(
+      <ThreadViewport
+        messages={[{
+          role: "assistant",
+          content: "文件已准备好：\n\n[下载 数据库索引性能实验报告.md](/downloads/dl_report)",
+        }]}
+        loading={false}
+        sessionId="session-a"
+      />
+    );
+
+    const link = view.getByRole("link", { name: /下载 数据库索引性能实验报告\.md/ });
+    expect(link.getAttribute("href")).toBe("/downloads/dl_report");
+    expect(link.hasAttribute("download")).toBe(true);
+  });
+
+  it("renders uploaded non-image attachments as download controls", () => {
+    const view = render(
+      <ThreadViewport
+        messages={[{
+          role: "user",
+          content: "[附件 notes.txt](/sessions/session-a/attachments/att_notes)",
+        }]}
+        loading={false}
+        sessionId="session-a"
+      />
+    );
+
+    const link = view.getByRole("link", { name: /附件 notes\.txt/ });
+    expect(link.getAttribute("href")).toBe("/sessions/session-a/attachments/att_notes");
+    expect(link.hasAttribute("download")).toBe(true);
   });
 
   it("renders adjacent display math formulas with KaTeX", () => {

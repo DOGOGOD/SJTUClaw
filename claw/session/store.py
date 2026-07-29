@@ -47,8 +47,11 @@ _SESSION_PREVIEW_MAX_CHARS = 120
 
 # Metadata keys that are volatile (should not be forked)
 _FORK_VOLATILE_META = frozenset({
-    "goal_state", "pending_user_turn", "runtime_checkpoint",
-    "title", "title_user_edited",
+    "claude_initialized_generation", "claude_session_cwd",
+    "claude_session_generation", "claude_session_owner",
+    "goal_state", "pending_user_turn",
+    "pi_initialized_generation", "pi_session_generation", "pi_session_owner",
+    "runtime_checkpoint", "title", "title_user_edited",
 })
 
 # Max session id length (filesystem-safe).  Base64-encoded filenames

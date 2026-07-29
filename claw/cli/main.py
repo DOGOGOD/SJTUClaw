@@ -335,84 +335,6 @@ def _setup_gateway() -> dict[str, str]:
     return updates
 
 
-def _setup_pi() -> dict[str, str]:
-    """Configure optional Pi parameters without changing the Agent backend."""
-    env = _read_env()
-
-    print()
-    print("─" * 48)
-    print("  Pi 可选配置")
-    print("─" * 48)
-    print("  此处只准备 Pi 参数，不会切换 Agent 后端；请在会话中使用 /pi on。")
-
-    provider = _prompt_str("  Provider（留空使用 Pi 或主 LLM 配置）", env.get("PI_PROVIDER", ""))
-    model = _prompt_str("  Model（留空使用 Pi 或主 LLM 配置）", env.get("PI_MODEL", ""))
-    valid_thinking = {"", "off", "minimal", "low", "medium", "high", "xhigh", "max"}
-    default_thinking = env.get("PI_THINKING", "").strip().lower()
-    if default_thinking not in valid_thinking:
-        default_thinking = ""
-    while True:
-        thinking = _prompt_str(
-            "  Thinking（留空/off/minimal/low/medium/high/xhigh/max）",
-            default_thinking,
-        ).strip().lower()
-        if thinking in valid_thinking:
-            break
-        print("  Thinking 等级无效，请重新输入。")
-
-    trust_tools = _prompt_yn(
-        "  信任 Pi 的写入工具并跳过审批?（仅限可信环境）",
-        default=_env_bool(env, "PI_TRUST_TOOLS", False),
-    )
-    updates = {
-        "PI_PROVIDER": provider,
-        "PI_MODEL": model,
-        "PI_THINKING": thinking,
-        "PI_TRUST_TOOLS": "true" if trust_tools else "false",
-    }
-    if trust_tools:
-        print("  注意：Pi 的文件写入和 Shell 操作将不再逐次请求审批。")
-
-    try:
-        from claw.config import _ensure_dotenv_loaded
-        from claw.pi.client import _resolve_pi_command
-
-        _ensure_dotenv_loaded()
-        resolved = _resolve_pi_command()
-    except Exception:
-        resolved = ()
-    if resolved:
-        print(f"  已检测到 Pi: {' '.join(resolved)}")
-        return updates
-
-    print("  当前未检测到可运行的 Pi；仍可先保存模型参数，稍后安装 Pi。")
-    if not _prompt_yn("  现在填写 Pi 运行路径?", default=False):
-        return updates
-
-    print("  1. 填写完整启动命令")
-    print("  2. 填写 Pi cli.js 路径")
-    while True:
-        mode = _prompt_str("  路径方式", "1")
-        if mode in {"1", "2"}:
-            break
-        print("  请输入 1 或 2。")
-    if mode == "1":
-        command = _prompt_str("  Pi 启动命令", env.get("PI_COMMAND", ""))
-        if command:
-            updates["PI_COMMAND"] = command
-    else:
-        cli_path = _prompt_str("  Pi cli.js 路径", env.get("PI_CLI_PATH", ""))
-        node_path = _prompt_str(
-            "  Node.js 路径（留空则从 PATH 查找）",
-            env.get("PI_NODE_PATH", ""),
-        )
-        if cli_path:
-            updates["PI_CLI_PATH"] = cli_path
-        if node_path:
-            updates["PI_NODE_PATH"] = node_path
-    return updates
-
-
 def _setup_advanced() -> dict[str, str]:
     """Configure the small set of advanced options useful during onboarding."""
     env = _read_env()
@@ -620,16 +542,11 @@ def _cmd_setup() -> int:
     if _prompt_yn("\n  是否配置 Gateway 访问方式?", default=True):
         all_updates.update(_setup_gateway())
 
-    # Step 4: Optional Pi runtime/model parameters. Backend changes remain
-    # session-scoped commands and are intentionally not part of setup.
-    if _prompt_yn("\n  是否配置可选的 Pi 参数?", default=False):
-        all_updates.update(_setup_pi())
-
-    # Step 5: Advanced LLM/search controls
+    # Step 4: Advanced LLM/search controls
     if _prompt_yn("\n  是否配置高级模型与搜索参数?", default=False):
         all_updates.update(_setup_advanced())
 
-    # Step 6: Channels
+    # Step 5: Channels
     all_updates.update(_setup_channels())
 
     # Write

@@ -41,8 +41,14 @@
 %USERPROFILE%\.sjtuclaw\data
 ```
 
-其中包括会话、记忆、运行时设置、定时任务、用户宠物和用户技能。
+其中包括会话、记忆、运行时设置、定时任务、临时下载注册表、用户宠物和用户技能。
 安装版首次启动时也会把内置 `prompts/` 和 `skills/` 复制到该目录，之后 WebUI 中的提示词和 Skill 管理都会写入用户目录，而不是安装目录。
+
+下载注册表位于 `%USERPROFILE%\.sjtuclaw\data\downloads\registry.json`。升级或重启
+不会主动删除仍在一小时有效期内的入口，但入口引用的 workspace 原文件必须继续
+存在。卸载程序不会主动删除 `.sjtuclaw` 用户目录。
 
 安装包不会内置外部 Pi/Node 运行时。需要 Pi 后端时，应另外安装可执行的 `pi`，
 或配置 `PI_COMMAND` / `PI_CLI_PATH`（必要时再配置 `PI_NODE_PATH`）。
+安装包同样不会内置 Claude Code；安装并登录系统 Claude Code 后，SJTUClaw 会从
+`PATH`、`%USERPROFILE%\.local\bin\claude.exe` 和常见 npm 目录自动检索。

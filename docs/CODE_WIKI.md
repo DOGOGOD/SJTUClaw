@@ -42,7 +42,7 @@
   - [9.10 Gateway](#910-gateway)
   - [9.11 Rollback](#911-rollback)
   - [9.12 AUTO 与 UNLIMITED 模式](#912-auto-与-unlimited-模式)
-  - [9.13 Pi 后端切换](#913-pi-后端切换)
+  - [9.13 Pi 与 Claude Code 后端切换](#913-pi-与-claude-code-后端切换)
   - [9.14 端到端流程与模块协作](#914-端到端流程与模块协作)
 - [十、测试体系](#十测试体系)
 
@@ -193,6 +193,7 @@ SJTUClaw/
 │   ├── tools/                    # 文件、Shell、网页、附件、Memory、Cron、Skill 工具
 │   ├── workspace/                # Workspace 绑定、边界检查与回退
 │   ├── config.py                 # 配置加载与运行时入口配置
+│   ├── env_utils.py              # 数值环境变量的类型转换、范围校验与默认值回退
 │   ├── runtime_settings.py       # Web UI 可写设置与敏感配置加密持久化
 │   ├── desktop.py                # Windows 桌面壳，启动本地 Gateway 与 pywebview
 │   ├── paths.py                  # 源码版 / PyInstaller 版 / 安装版路径切换
@@ -261,7 +262,7 @@ SJTUClaw/
 | `readonly.py` | `current_time` / `list_dir` / `read_file`（safety_level=read_only）。 |
 | `update.py` | `create_file` / `overwrite_file` / `edit_file`（safety_level=write）。 |
 | `shell.py` | `new_shell` / `run_command`（safety_level=shell），跨平台 + cwd 持久化 + 越界预检。 |
-| `download.py` | `create_download`（safety_level=download），内存注册表 + Gateway 下载入口。 |
+| `download.py` | `create_download`（safety_level=download），有界持久化注册表 + Gateway 下载入口，临时链接在有效期内可跨 Gateway 重启继续使用。 |
 | `attachment.py` | `copy_attachment_to_workspace`（safety_level=write），强 session 隔离。 |
 | `memory_tools.py` | `remember`（write）/ `recall`（read_only）桥接 MemoryStore。 |
 | `cron_tool.py` | `CronTool`（read_only 但有副作用）：add/list/remove 定时任务。 |
@@ -333,7 +334,7 @@ SJTUClaw/
 
 | 文件 | 职责 |
 |------|------|
-| `main.py` | `sjtuclaw` CLI 入口：`setup` / `gateway` / `chat` 子命令；setup 以合并写入方式配置 LLM、联网/时区、Gateway、可选 Pi 参数、高级参数和 QQ。 |
+| `main.py` | `sjtuclaw` CLI 入口：`setup` / `gateway` / `chat` 子命令；setup 以合并写入方式配置 LLM、联网/时区、Gateway、高级参数和 QQ，不包含 Agent 后端或 Pi 配置。 |
 | `repl.py` | `run_repl`：交互式多轮对话主循环，注入所有依赖。 |
 | `commands.py` | 斜杠命令识别与分发，`RuntimeState` dataclass 贯穿全局。 |
 
@@ -680,7 +681,7 @@ npm run build       # 输出到项目根目录 web/
 | `GATEWAY_HOST` | 127.0.0.1 | Gateway 监听地址 |
 | `GATEWAY_PORT` | 8000 | Gateway 端口 |
 | `GATEWAY_API_TOKEN` | - | 非本机监听时必填 |
-| `AGENT_BACKEND` | sjtuclaw | 默认后端（sjtuclaw/pi） |
+| `AGENT_BACKEND` | sjtuclaw | 默认后端（sjtuclaw/pi/claude） |
 | `QQ_ENABLED` | false | 启用 QQ Bot |
 
 ---
@@ -1143,14 +1144,28 @@ def _resolve_path(path_str, workspace_manager, session_id_provider):
 [claw/tools/download.py](file:///c:/Users/GZQ/Desktop/SJTUClaw/SJTUClaw/claw/tools/download.py)：
 
 ```python
-_downloads: dict[str, Path] = {}  # downloadId -> 绝对路径
+_downloads: OrderedDict[str, tuple[Path, float]]
+# downloadId -> (绝对路径, Unix 创建时间)
 
 def register_download(file_path: Path) -> str:
     """返回 dl_<uuid.hex[:12]>"""
-    # 图片文件额外返回 inlineMarkdown 供前端内联展示
+    # 写入有界注册表并原子持久化
 ```
 
-不返回文件内容给模型，只返回 `downloadId`。Gateway 通过 `/downloads/{id}` 端点提供文件下载。
+工具不把文件内容返回给模型，而是返回 `downloadId`、`fileName` 和
+`displayMarkdown`。普通文件的展示语法是下载链接，安全位图的展示语法是内联图片；
+Gateway 的 `_decorate_download_reply()` 会为本轮新入口补齐或去重最终 Markdown，
+避免模型只把 ID 当普通文字回复。
+
+Gateway 启动时调用
+`configure_download_registry(DATA_DIR / "downloads" / "registry.json")`。
+注册表最多保存 1000 项，默认一小时过期；过期、源文件丢失及
+超容量条目会在加载、查询或新增时清理。持久化文件使用临时文件 + `replace` 原子
+更新，因此有效链接可跨 Gateway 重启继续使用。
+
+`GET /downloads/{id}` 只解析登记过的 ID。安全位图默认使用 `inline` 响应以支持
+消息预览；传入 `?download=1` 或请求普通文件时使用附件响应。前端将普通文件渲染为
+下载按钮，将图片渲染为“预览 + 下载”组合控件。
 
 #### 7.6.7 附件 Tool（Step 6 + 8）
 
@@ -1239,7 +1254,8 @@ _reflection_mgr = ReflectionManager(...)
 | `/cron/jobs` | GET/POST | 定时任务管理 |
 | `/settings/llm` | GET/PUT | LLM 配置 |
 | `/pet/state` | GET | 桌宠状态 |
-| `/downloads/{id}` | GET | 文件下载 |
+| `/downloads` | GET | 列出仍有效的临时下载入口 |
+| `/downloads/{id}` | GET | 文件预览或下载；图片可用 `?download=1` 强制附件响应 |
 
 **并发控制**：通过 `_active_turns` 字典 + `_active_turns_lock` 实现 per-session 的并发控制（同一会话同时只能有一个 turn）。
 
@@ -2179,7 +2195,7 @@ SJTUClaw/
 
 | 变量 | 说明 |
 |------|------|
-| `AGENT_BACKEND` | 默认后端（sjtuclaw/pi） |
+| `AGENT_BACKEND` | 默认后端（sjtuclaw/pi/claude） |
 | `PI_COMMAND` | Pi 启动命令 |
 | `PI_CLI_PATH` | Pi CLI 路径 |
 | `PI_NODE_PATH` | Node.js 路径 |
@@ -2629,7 +2645,7 @@ Thinking、ToolCallStart、ToolCallEnd、Approval 和 FinalEvent 可以逐步到
 
 #### 9.10.3 边界防护
 
-Gateway 中间件依次承担来源/API token 检查、滑动窗口限流、按实际流式读取字节数限制请求大小、请求 ID 与日志。上传使用分块写入和超限回滚，附件目录按 Session 分开，读取时再次校验所属关系。静态 WebUI 最后挂载，避免吞掉 API 路由。
+Gateway 中间件依次承担来源/API token 检查、滑动窗口限流、按实际流式读取字节数限制请求大小、请求 ID 与日志。上传使用分块写入和超限回滚，附件目录按 Session 分开，读取时再次校验所属关系。下载端点只接受注册表中仍有效的下载 ID，并对图片预览设置 `nosniff`；其他文件或显式下载请求使用附件响应。静态 WebUI 最后挂载，避免吞掉 API 路由。
 
 审批管理器可以在 Agent 工作线程中等待用户决定，而 HTTP 主循环继续服务。若审批回调异常或不存在，Agent Loop 按 fail-closed 记录拒绝结果。
 
@@ -2698,13 +2714,14 @@ write/shell
 
 Gateway 用 `_auto_mode[session_id]` 保存 AUTO，WorkspaceManager 用 `_unlimited_sessions` 保存 UNLIMITED；CLI 的 `RuntimeState` 也按 Session 保存 AUTO。两者均不写入 Session metadata，重启后恢复为安全默认值。删除/切换相关 Session 时也会清理内存模式，避免状态错误继承。
 
-### 9.13 Pi 后端切换
+### 9.13 Pi 与 Claude Code 后端切换
 
 #### 9.13.1 选择状态与迁移
 
-后端选择保存在 `session.metadata["agent_backend"]`，合法值为 `sjtuclaw` 或 `pi`。`AGENT_BACKEND` 只决定尚未初始化 Session 的默认值；`initialize_session_backends()` 会把默认值冻结到旧 Session，之后修改环境变量不会把所有现有会话一起切换。
+后端选择保存在 `session.metadata["agent_backend"]`，合法值为 `sjtuclaw`、`pi` 或 `claude`。`AGENT_BACKEND` 只决定尚未初始化 Session 的默认值；`initialize_session_backends()` 会把默认值冻结到旧 Session，之后修改环境变量不会把所有现有会话一起切换。
 
 `/pi on` 的顺序是先验证 Pi 配置/命令可用，再调用 `set_session_backend()`；失败时不修改 Session。切换回原生后端前也会确认原生 LLM 配置完整。
+`/claude on` 使用相同的先验证后切换顺序；它会从显式配置、`PATH`、官方原生安装目录和常见 npm 目录检索 Claude Code。
 
 #### 9.13.2 generation 与 handoff
 
@@ -2730,6 +2747,16 @@ Pi 路径不是“用 Pi 只生成一段文本”，而是由 Pi 完成自己的
 - 把事件转换为与原生 Loop 相同的 TurnEvent，供 SSE/CLI/QQ 消费。
 
 宿主工具桥接最终执行共享 `ToolRegistry`，并把需要变更状态的操作交给审批链。这样换后端只替换“谁拥有 Agent Loop”，不会替换 Session、Workspace、Rollback、Gateway 和渠道层。
+
+Claude Code 使用相同的工具筛选规则：原生已有的文件、Shell 和 Skill 能力不会重复
+暴露，`recall`、`remember`、`cron`、Web 等 SJTUClaw 独有能力则通过每回合临时
+stdio MCP 服务加入。启动参数使用 `--mcp-config` 合并该服务，但不使用
+`--strict-mcp-config`，所以用户原有 MCP 仍然有效。Claude Code 的原生 system prompt
+也不会替换，SJTUClaw 上下文仅通过 `--append-system-prompt-file` 追加。
+
+Claude 原生 Hook 和宿主工具执行层统一以“是否改变状态”分类：WebSearch、WebFetch、
+读取和查询直接放行；写入、编辑、删除、有副作用命令和变更型 MCP 调用进入审批。
+宿主 `cron` 进一步按参数区分，`list` 只读，`add`/`remove` 需要审批。
 
 #### 9.13.4 Compaction 的分叉
 

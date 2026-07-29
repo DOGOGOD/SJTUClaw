@@ -32,7 +32,7 @@ from claw.workspace.rollback import RollbackError, WorkspaceRollbackManager
 _COMMAND_PREFIXES = (
     "/session", "/memory", "/compact", "/workspace", "/approve", "/reject",
     "/approvals", "/skill", "/reflect", "/cron", "/help", "/auto",
-    "/unlimited", "/pi", "/pet", "/rollback", "/stop", "/exit",
+    "/unlimited", "/pi", "/claude", "/pet", "/rollback", "/stop", "/exit",
 )
 
 _HELP_TEXT = (
@@ -98,6 +98,10 @@ _HELP_TEXT = (
     "  /pi                      查看 Pi 状态和可用指令\n"
     "    on                       启用 Pi Agent 后端\n"
     "    status                   查看 Pi 状态和可用指令\n"
+    "    off                      切回 SJTUClaw 原生后端\n"
+    "  /claude                  查看 Claude Code 状态和可用指令\n"
+    "    on                       自动检索并启用 Claude Code 后端\n"
+    "    status                   查看 Claude Code 状态和可用指令\n"
     "    off                      切回 SJTUClaw 原生后端\n"
     "  /stop                    终止当前正在运行的 Agent 任务\n"
     "  /exit                    退出当前会话\n"
@@ -168,6 +172,9 @@ _HELP_MARKDOWN = """# SJTUClaw 可用指令
 - `/pi` / `/pi status`：查看当前 session 的 Agent 后端和可用指令
 - `/pi on`：检查 Pi 运行环境并为当前 session 启用 Pi
 - `/pi off`：仅将当前 session 切回 SJTUClaw 原生后端
+- `/claude` / `/claude status`：查看 Claude Code 后端状态
+- `/claude on`：自动检索本机 Claude Code 并为当前 session 启用
+- `/claude off`：仅将当前 session 切回 SJTUClaw 原生后端
 
 > **安全提示：** AUTO 模式只会自动批准 workspace 内的结构化文件写入；Shell 命令始终需要明确审批。UNLIMITED 模式下所有写入、覆盖、删除和 Shell 操作也都需要明确审批。
 
@@ -292,6 +299,8 @@ def handle_command(user_input: str, state: RuntimeState, *, markdown: bool = Fal
         return finish(_handle_unlimited_command(args, state, markdown=markdown))
     if root == "/pi":
         return finish(_handle_pi_command(args, state, markdown=markdown))
+    if root == "/claude":
+        return finish(_handle_claude_command(args, state, markdown=markdown))
     if root == "/help":
         if args:
             return finish("用法: /help")
@@ -347,6 +356,53 @@ def _handle_pi_command(
     }.get(action, action)
     if target not in {"pi", "sjtuclaw"}:
         return "用法: /pi [on|off|status]"
+    if state.backend_switcher is None:
+        return "[错误] 当前入口不支持运行时切换 Agent 后端。"
+    return state.backend_switcher(target)
+
+
+def _handle_claude_command(
+    args: list[str], state: RuntimeState, *, markdown: bool = False
+) -> str:
+    """Inspect or explicitly switch the current session to Claude Code."""
+    if len(args) > 1:
+        return "用法: /claude [on|off|status]"
+    action = args[0].lower() if args else "status"
+
+    if action in {"status", "show", "help", "?"}:
+        if state.backend_switcher is None:
+            status = "当前入口不支持读取 Agent 后端状态。"
+        else:
+            status = state.backend_switcher("status")
+        if markdown:
+            return (
+                "## Claude Code 后端\n\n"
+                f"**{status}**\n\n"
+                "### 可用指令\n\n"
+                "- `/claude on`：自动检索本机 Claude Code 并为当前 session 启用\n"
+                "- `/claude off`：将当前 session 切回 SJTUClaw 原生后端\n"
+                "- `/claude status`：查看当前状态和可用指令\n\n"
+                "> Claude Code 模式沿用本机现有登录、模型、Skills、MCP 与权限配置，"
+                "并通过官方 stream-json 接口保留工具循环和持久会话。"
+            )
+        return (
+            f"{status}\n\n"
+            "可用指令：\n"
+            "  /claude on      自动检索并启用 Claude Code\n"
+            "  /claude off     切回 SJTUClaw 原生后端\n"
+            "  /claude status  查看当前状态和可用指令\n\n"
+            "Claude Code 模式沿用本机现有登录、模型、Skills、MCP 与权限配置，"
+            "并保留工具循环和持久会话。"
+        )
+
+    target = {
+        "on": "claude",
+        "enable": "claude",
+        "off": "sjtuclaw",
+        "disable": "sjtuclaw",
+    }.get(action, action)
+    if target not in {"claude", "sjtuclaw"}:
+        return "用法: /claude [on|off|status]"
     if state.backend_switcher is None:
         return "[错误] 当前入口不支持运行时切换 Agent 后端。"
     return state.backend_switcher(target)
@@ -752,26 +808,26 @@ def _delete_memory(memory_id: str, state: RuntimeState) -> str:
 
 
 def _handle_compact_command(state: RuntimeState) -> str:
-    pi_compact = getattr(state.llm_client, "compact_session", None)
+    external_compact = getattr(state.llm_client, "compact_session", None)
     backend_resolver = getattr(state.llm_client, "backend_for_session", None)
-    session_uses_pi = (
-        backend_resolver(state.current_session_id, state.session_store) == "pi"
+    backend = (
+        backend_resolver(state.current_session_id, state.session_store)
         if callable(backend_resolver)
-        else callable(pi_compact)
+        else ("pi" if callable(external_compact) else "sjtuclaw")
     )
-    pi_error: str | None = None
-    if session_uses_pi and callable(pi_compact):
+    session_uses_external = backend in {"pi", "claude"}
+    backend_label = "Pi" if backend == "pi" else "Claude Code"
+    external_error: str | None = None
+    if session_uses_external and callable(external_compact):
         try:
-            return pi_compact(
+            return external_compact(
                 state.current_session_id,
                 session_store=state.session_store,
             )
         except Exception as exc:
-            # A newly-created Pi branch can legitimately be too small even
-            # though SJTUClaw's unified session already has compactable
-            # history.  Preserve Pi-native compaction as the first choice,
-            # then fall back to the host summary projection.
-            pi_error = str(exc)
+            # Preserve native compaction as the first choice, then fall back
+            # to the host summary projection when possible.
+            external_error = str(exc)
 
     session = state.session_store.get(state.current_session_id)
 
@@ -780,8 +836,8 @@ def _handle_compact_command(state: RuntimeState) -> str:
             f"当前 session 只有 {len(session.messages)} 条消息，"
             f"不超过保留窗口（{KEEP_RECENT_MESSAGES_MIN}），无需压缩。"
         )
-        if pi_error:
-            return f"Pi 原生压缩未执行：{pi_error}\n{result}"
+        if external_error:
+            return f"{backend_label} 原生压缩未执行：{external_error}\n{result}"
         return result
 
     worker_running = getattr(state.compaction_worker, "is_running", None)
@@ -796,18 +852,18 @@ def _handle_compact_command(state: RuntimeState) -> str:
             force=True,
         )
     except CompactionError as exc:
-        if pi_error:
+        if external_error:
             return (
-                f"[错误] Pi 原生压缩未完成：{pi_error}\n"
+                f"[错误] {backend_label} 原生压缩未完成：{external_error}\n"
                 f"SJTUClaw 回退压缩也未完成：{exc}"
             )
         return f"[错误] {exc}"
 
     result = outcome.result
     lines: list[str] = []
-    if pi_error:
+    if external_error:
         lines.extend([
-            f"Pi 原生压缩未执行：{pi_error}",
+            f"{backend_label} 原生压缩未执行：{external_error}",
             "已回退到 SJTUClaw 统一会话压缩。",
             "",
         ])

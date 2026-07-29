@@ -163,14 +163,14 @@ describe("ThreadComposer keyboard interactions", () => {
     });
 
     expect(onSend).not.toHaveBeenCalled();
-    expect(view.getByLabelText("待发送图片")).toBeTruthy();
+    expect(view.getByLabelText("待发送附件")).toBeTruthy();
     expect(composer.value).toBe("");
 
     fireEvent.change(composer, { target: { value: "请描述这张图" } });
     fireEvent.keyDown(composer, { key: "Enter" });
 
     await waitFor(() => expect(onSend).toHaveBeenCalledWith("请描述这张图", [image]));
-    expect(view.queryByLabelText("待发送图片")).toBeNull();
+    expect(view.queryByLabelText("待发送附件")).toBeNull();
   });
 
   it("keeps normal text paste behavior when the clipboard has no image", () => {
@@ -225,7 +225,7 @@ describe("ThreadComposer keyboard interactions", () => {
 
     await waitFor(() => expect(view.getByRole("alert").textContent).toBe("图片发送失败"));
     expect(composer.value).toBe("和图片一起发送");
-    expect(view.getByLabelText("待发送图片")).toBeTruthy();
+    expect(view.getByLabelText("待发送附件")).toBeTruthy();
   });
 
   it("removes a pending image without sending it", () => {
@@ -240,10 +240,26 @@ describe("ThreadComposer keyboard interactions", () => {
         files: [image],
       },
     });
-    fireEvent.click(view.getByLabelText("移除图片 1"));
+    fireEvent.click(view.getByLabelText("移除附件 1"));
     fireEvent.keyDown(composer, { key: "Enter" });
 
-    expect(view.queryByLabelText("待发送图片")).toBeNull();
+    expect(view.queryByLabelText("待发送附件")).toBeNull();
     expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it("accepts and sends non-image files from the attachment picker", async () => {
+    const onSend = vi.fn().mockResolvedValue(undefined);
+    const view = render(<ThreadComposer onSend={onSend} sessionId="session-a" />);
+    const file = new File(["notes"], "notes.txt", { type: "text/plain" });
+    const input = view.getByLabelText("选择附件") as HTMLInputElement;
+
+    expect(input.hasAttribute("accept")).toBe(false);
+    fireEvent.change(input, { target: { files: [file] } });
+
+    expect(view.getByLabelText("待发送附件")).toBeTruthy();
+    expect(view.getByText("notes.txt")).toBeTruthy();
+    fireEvent.click(view.getByTitle("发送"));
+
+    await waitFor(() => expect(onSend).toHaveBeenCalledWith("", [file]));
   });
 });

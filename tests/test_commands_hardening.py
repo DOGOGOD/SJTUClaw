@@ -276,6 +276,9 @@ def test_active_turn_guard_covers_mutating_commands():
     assert _mutating_command_session("/pi", "s1") is None
     assert _mutating_command_session("/pi status", "s1") is None
     assert _mutating_command_session("/pi on", "s1") == "s1"
+    assert _mutating_command_session("/claude", "s1") is None
+    assert _mutating_command_session("/claude status", "s1") is None
+    assert _mutating_command_session("/claude on", "s1") == "s1"
 
 
 class _ShellWorkspace:

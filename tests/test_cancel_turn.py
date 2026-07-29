@@ -259,6 +259,27 @@ class TestStopHelpers:
         found = _cancel_active_turn("nonexistent_session")
         assert found is False
 
+    def test_cancel_rejects_pending_approval(self):
+        from claw.approval.manager import ApprovalStatus
+        from claw.gateway.server import (
+            _approval_manager,
+            _cancel_active_turn,
+            _register_active_turn,
+            _unregister_active_turn,
+        )
+
+        session_id = "test_cancel_pending_approval"
+        event = _register_active_turn(session_id)
+        request = _approval_manager.create(session_id, "Write", {"path": "x"})
+
+        assert _cancel_active_turn(session_id) is True
+        assert event.is_set()
+        assert (
+            _approval_manager.get(request.approval_id).status
+            == ApprovalStatus.REJECTED.value
+        )
+        _unregister_active_turn(session_id)
+
     def test_cancel_all(self):
         from claw.gateway.server import (
             _register_active_turn,

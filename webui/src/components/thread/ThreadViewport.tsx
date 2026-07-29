@@ -5,7 +5,7 @@ import remarkGfm from "remark-gfm";
 import remarkBreaks from "remark-breaks";
 import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
-import { Check, Copy, Undo2 } from "lucide-react";
+import { Check, Copy, Download, Undo2 } from "lucide-react";
 import { BrandAvatar } from "@/components/BrandAvatar";
 import { PetSprite } from "@/components/PetSprite";
 import { cn } from "@/lib/utils";
@@ -73,6 +73,21 @@ function resolveImageSource(source: string, sessionId: string | null): string {
   }
   if (!sessionId) return source;
   return `/sessions/${encodeURIComponent(sessionId)}/local-image?path=${encodeURIComponent(localPath)}`;
+}
+
+function isDownloadUrl(url: string): boolean {
+  return /\/downloads\/[^/?#]+(?:[?#].*)?$/i.test(url);
+}
+
+function isAttachmentUrl(url: string): boolean {
+  return /\/sessions\/[^/?#]+\/attachments\/[^/?#]+(?:[?#].*)?$/i.test(url);
+}
+
+function forceDownloadUrl(url: string): string {
+  const hashIndex = url.indexOf("#");
+  const base = hashIndex >= 0 ? url.slice(0, hashIndex) : url;
+  const hash = hashIndex >= 0 ? url.slice(hashIndex) : "";
+  return `${base}${base.includes("?") ? "&" : "?"}download=1${hash}`;
 }
 
 function normalizeMathSegment(segment: string): string {
@@ -143,23 +158,72 @@ function normalizeMathMarkdown(markdown: string): string {
   return result + normalizeMathSegment(protectedMarkdown.slice(cursor));
 }
 
+function dedupeDownloadMarkdown(markdown: string): string {
+  const code = /(```[\s\S]*?```|~~~[\s\S]*?~~~|`[^`\n]*`)/g;
+  const dedupeSegment = (segment: string): string => {
+    const downloadMarkdown = /(!?)\[([^\]\n]*)\]\(\s*(\/downloads\/[^)\s]+)\s*\)/gi;
+    const imageUrls = new Set<string>();
+    for (const match of segment.matchAll(downloadMarkdown)) {
+      if (match[1] === "!") imageUrls.add(match[3].split(/[?#]/, 1)[0]);
+    }
+    const seen = new Set<string>();
+    return segment.replace(
+      downloadMarkdown,
+      (full, imageMarker: string, _label: string, url: string) => {
+        const key = url.split(/[?#]/, 1)[0];
+        if (imageUrls.has(key) && imageMarker !== "!") return "";
+        if (seen.has(key)) return "";
+        seen.add(key);
+        return full;
+      }
+    );
+  };
+
+  let result = "";
+  let cursor = 0;
+  for (const match of markdown.matchAll(code)) {
+    const index = match.index ?? 0;
+    result += dedupeSegment(markdown.slice(cursor, index));
+    result += match[0];
+    cursor = index + match[0].length;
+  }
+  return result + dedupeSegment(markdown.slice(cursor));
+}
+
 function MessageImage({ src, alt, sessionId }: { src?: string; alt?: string; sessionId: string | null }) {
   const [failed, setFailed] = useState(false);
   if (!src) return null;
   const resolved = resolveImageSource(src, sessionId);
-  if (failed) {
-    return <a href={resolved} target="_blank" rel="noreferrer">无法显示图片：{alt || src}</a>;
-  }
+  const isDownload = isDownloadUrl(resolved);
+  const imageName = alt || "图片";
   return (
-    <a href={resolved} target="_blank" rel="noreferrer" className="block no-underline">
-      <img
-        src={resolved}
-        alt={alt || "消息图片"}
-        loading="lazy"
-        onError={() => setFailed(true)}
-        className="my-2 max-h-[520px] max-w-full rounded-xl border border-border/60 object-contain shadow-sm"
-      />
-    </a>
+    <span className="my-2 block">
+      {failed ? (
+        <a href={resolved} target="_blank" rel="noreferrer">
+          无法显示图片：{alt || src}
+        </a>
+      ) : (
+        <a href={resolved} target="_blank" rel="noreferrer" className="block no-underline">
+          <img
+            src={resolved}
+            alt={alt || "消息图片"}
+            loading="lazy"
+            onError={() => setFailed(true)}
+            className="max-h-[520px] max-w-full rounded-xl border border-border/60 object-contain shadow-sm"
+          />
+        </a>
+      )}
+      {isDownload && (
+        <a
+          href={forceDownloadUrl(resolved)}
+          download={imageName}
+          className="mt-2 inline-flex items-center gap-2 rounded-lg border border-border/70 bg-secondary/65 px-3 py-2 font-medium no-underline shadow-sm transition hover:bg-secondary hover:text-foreground"
+        >
+          <Download className="h-4 w-4 shrink-0" aria-hidden="true" />
+          下载 {imageName}
+        </a>
+      )}
+    </span>
   );
 }
 
@@ -182,6 +246,19 @@ function MessageLink({
     : null;
   if (imageName && href) {
     return <MessageImage src={href} alt={imageName} sessionId={sessionId} />;
+  }
+  if (href && (isDownloadUrl(href) || isAttachmentUrl(href))) {
+    return (
+      <a
+        href={href}
+        download
+        className="my-2 inline-flex items-center gap-2 rounded-lg border border-border/70 bg-secondary/65 px-3 py-2 font-medium no-underline shadow-sm transition hover:bg-secondary hover:text-foreground"
+        {...props}
+      >
+        <Download className="h-4 w-4 shrink-0" aria-hidden="true" />
+        {children}
+      </a>
+    );
   }
   return (
     <a href={href} target="_blank" rel="noreferrer" {...props}>
@@ -621,7 +698,7 @@ const MessageBubble = memo(function MessageBubble({
   }
 
   const isUser = message.role === "user";
-  const markdownContent = normalizeMathMarkdown(message.content);
+  const markdownContent = normalizeMathMarkdown(dedupeDownloadMarkdown(message.content));
 
   return (
     <div className={cn("flex gap-3 py-4 message-row md:gap-4", isUser ? "justify-end" : "")}>

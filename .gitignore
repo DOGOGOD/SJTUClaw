@@ -6,45 +6,84 @@
 # Runtime data / persisted state
 data/
 log/
+/logs/
 /workspace/
 *.sqlite
 *.sqlite3
+*.sqlite-shm
+*.sqlite-wal
+*.sqlite3-shm
+*.sqlite3-wal
+*.db-shm
+*.db-wal
+*.pid
 
-# Python
+# Python bytecode / native extensions
 __pycache__/
 *.pyc
 *.pyo
+*.pyd
+*.so
+
+# Python test / analysis caches
 .pytest_cache/
 /.pytest-*/
 .pytest_tmp/
+.hypothesis/
 .coverage
 .coverage.*
 coverage.xml
 htmlcov/
 .mypy_cache/
+.pyre/
+.pytype/
 .ruff_cache/
+.tox/
+.nox/
+
+# Python environments / packaging
 .venv/
 venv/
+__pypackages__/
 *.egg-info/
+pip-wheel-metadata/
+/.python-version
 /build/
 /dist/
 /.venv-build/
 
-# Node
+# Node dependencies / package-manager state
 node_modules/
 /.pnpm-store/
+.npm/
 npm-debug.log*
 pnpm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
+# Frontend test / compiler caches
+.vite/
+*.tsbuildinfo
+.eslintcache
+/coverage/
+/webui/coverage/
+
 # Generated runtime artifacts
 /claw_shell_*.txt
 check.txt
 /skills/.usage.json
+/skills/.usage.json.lock
+/.sjtuclaw-approval-*/
 *.log
 *.tmp
 *.bak
+*.orig
+*.rej
+*.swp
+*.swo
+*~
+/tmp/
+/temp/
 
 # Web UI build output is shipped with the Gateway. Keep the complete build so
 # the tracked index never references missing hashed assets.
@@ -52,12 +91,15 @@ check.txt
 # Editors / OS
 .vscode/
 .idea/
+.fleet/
 .DS_Store
+._*
 Thumbs.db
 Desktop.ini
+$RECYCLE.BIN/
 
 # Local reports and test artifacts
 test-results/
 
-# Agent
-.claude
+# Local agent state (project instructions remain trackable)
+/.claude/

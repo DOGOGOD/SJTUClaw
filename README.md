@@ -79,7 +79,7 @@ TUI 是直接复用共享运行时的全屏终端界面，不需要先启动 Gat
 | `Ctrl+R` | 刷新状态 |
 | `Ctrl+Q` | 退出 |
 
-![SJTUClaw TUI](docs/images/readme-tui.svg)
+![SJTUClaw TUI](docs/images/readme-tui.png)
 
 完整操作说明见 [TUI 使用指南](docs/tui.md)。
 

@@ -15,8 +15,6 @@ import time
 import uuid
 from collections import deque
 from threading import Lock
-from typing import Any
-
 from fastapi import Request
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware

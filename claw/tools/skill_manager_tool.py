@@ -266,7 +266,7 @@ def _patch_skill(
         if count == 0:
             return {
                 "success": False,
-                "error": f"未找到匹配文本。请确认 old_string 与文件内容完全一致。",
+                "error": "未找到匹配文本。请确认 old_string 与文件内容完全一致。",
                 "file_preview": content[:500],
             }
         new_content = content.replace(old_string, new_string or "")
@@ -275,7 +275,7 @@ def _patch_skill(
         if count == 0:
             return {
                 "success": False,
-                "error": f"未找到匹配文本。请确认 old_string 与文件内容完全一致。",
+                "error": "未找到匹配文本。请确认 old_string 与文件内容完全一致。",
                 "file_preview": content[:500],
             }
         if count > 1:

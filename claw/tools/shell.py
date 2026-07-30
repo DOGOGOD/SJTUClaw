@@ -462,7 +462,7 @@ def _run_script(
         os.close(fd)
 
         if not _IS_WINDOWS:
-            os.chmod(tmp_script, 0o755)
+            os.chmod(tmp_script, 0o700)
 
         proc = subprocess.run(
             [_shell_exe()] + _shell_args() + [tmp_script],

@@ -12,6 +12,7 @@ import html
 import ipaddress
 import json
 import os
+import re
 import socket
 import time
 import xml.etree.ElementTree as ET
@@ -39,6 +40,7 @@ _TEXT_CONTENT_TYPES = (
     "application/atom+xml",
 )
 _PROXY_FAKE_IP_NETWORK = ipaddress.ip_network("198.18.0.0/15")
+_UNSAFE_XML_DECLARATION = re.compile(r"<!\s*(?:DOCTYPE|ENTITY)\b", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -685,16 +687,18 @@ def _search_bing(query: str, max_results: int, config: WebToolConfig) -> list[di
         config,
         params={"q": query, "format": "rss"},
     )
-    root = ET.fromstring(text)
-    candidates: list[dict[str, str]] = []
-    for item in root.findall(".//item"):
-        candidates.append(
-            {
-                "title": item.findtext("title", default=""),
-                "url": item.findtext("link", default=""),
-                "snippet": item.findtext("description", default=""),
-            }
-        )
+    if _UNSAFE_XML_DECLARATION.search(text):
+        raise RuntimeError("Bing RSS 响应包含不安全的 XML 声明")
+    # DTD and entity declarations are rejected before the standard parser runs.
+    root = ET.fromstring(text)  # nosec B314
+    candidates = [
+        {
+            "title": item.findtext("title", default=""),
+            "url": item.findtext("link", default=""),
+            "snippet": item.findtext("description", default=""),
+        }
+        for item in root.findall(".//item")
+    ]
     return _safe_search_results(candidates, max_results)
 
 

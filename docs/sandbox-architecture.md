@@ -1,129 +1,143 @@
 # microsandbox 接入架构
 
-## 目标
+SJTUClaw 可以把原生 Agent 的文件、Shell、附件复制和文件交付路由到 Session 级 microsandbox microVM。目标是让同一 Session 的操作共享状态，同时把结构化文件访问限制在 `/workspace`。
 
-这层接入同时解决两个问题：
+## 生效条件
 
-1. 没有设置 workspace 时，原生 Agent 仍能立即获得可写、可执行的工作目录；
-2. 执行不可信命令时，边界由 microVM 提供，而不再只依赖路径字符串检查。
+Sandbox 只覆盖 `sjtuclaw` 原生 Agent 后端，不覆盖 Pi 或 Claude Code 的原生工具。
 
-## 会话数据流
-
-```mermaid
-flowchart LR
-    LLM["LLM 原生工具调用"] --> Router["SandboxManager 路由"]
-    Router -->|"未绑定 workspace"| Private["session 私有命名卷"]
-    Router -->|"已绑定 workspace"| Bind["只挂载明确绑定的宿主目录"]
-    Private --> VM["microsandbox microVM<br/>/workspace"]
-    Bind --> VM
-    Image["共享只读镜像<br/>通用 Python 库"] --> VM
-    Project["/workspace/.venv<br/>项目依赖存储"] <--> VM
-    VM --> Shell["Linux /bin/sh"]
-    VM --> Files["read/list/create/overwrite/edit"]
-    Upload["当前 session 附件"] -->|"copy_from_host"| VM
-    VM -->|"copy_to_host"| Export["受管导出目录"]
-    Export --> Download["限时 downloadId"]
+```text
+SANDBOX_MODE=off       默认关闭；可用 /sandbox on 单独开启
+SANDBOX_MODE=auto      新 Session 默认尝试使用；不可用时保留宿主行为
+SANDBOX_MODE=required  强制使用；任何不满足条件的情况均拒绝执行
 ```
 
-每个 SJTUClaw session 最多拥有一个运行中的 microVM。Shell 与结构化文件工具
-复用同一实例，因此 `run_command` 生成的文件能立即被 `read_file` 和
-`create_download` 看见。异步 microsandbox SDK 固定运行在专用事件循环线程上，
-同步 Tool handler 通过线程安全 Future 调用，避免跨事件循环复用 SDK 对象。
+显式 `/sandbox on` 和 `required` 都采用 fail-closed：SDK、`msb`、镜像或虚拟化不可用时不会静默回退宿主。
 
-Python 依赖分为两层：
+Sandbox 与 UNLIMITED 不兼容。`required` 模式不能关闭 Sandbox，也不能切换到 Pi / Claude Code。
 
-- 基础镜像预装多数 session 共享的通用库，镜像构建时执行 `pip check` 和导入
-  检查；镜像作为只读 OCI lower layer 被所有 microVM 复用。
-- 每个 microVM 在 Linux rootfs 创建 `/opt/sjtuclaw/project-venv`，使用
-  `--system-site-packages` 读取镜像通用库。Shell 默认注入 `VIRTUAL_ENV` 和
-  PATH，因此普通 `pip install` 与 `python -m pip install` 会立即安装到可执行的
-  运行环境。
-- 为兼容 microsandbox 0.6.7 Windows passthrough 对只读 FUSE handle 执行
-  `sync_data()` 时产生的 EACCES，启动时由同步器把 `/workspace/.venv` 中的项目包
-  和 console scripts 恢复到运行 venv；每条 Shell 命令结束后再保存回去。同步器
-  只忽略“数据已读完、关闭只读句柄时”的 EACCES，其他 I/O 错误仍会失败。
+## 路由流程
 
-`/workspace/.venv` 使用带版本标记的 SJTUClaw 持久存储布局；已有但未受管理的
-同名目录不会被静默覆盖。初始化失败时新 microVM 会停止，错误返回给调用方。
-需要使用 Alpine 等无 Python 镜像时，可显式设置
-`SANDBOX_PROJECT_VENV=false`。
+```mermaid
+flowchart TD
+    A["原生 Agent 请求工具"] --> B{"Session 是否要求 Sandbox"}
+    B -->|否| C["WorkspaceManager 宿主路径边界"]
+    B -->|是| D{"后端为 sjtuclaw 且运行时可用"}
+    D -->|否| E["拒绝执行或按 auto 回退"]
+    D -->|是| F["按 Session 获取或创建 microVM"]
+    F --> G{"是否绑定宿主 Workspace"}
+    G -->|否| H["持久私有 Volume → /workspace"]
+    G -->|是| I["显式宿主目录 → /workspace"]
+    H --> J["文件、Shell、附件、下载共享环境"]
+    I --> J
+```
 
-`/workspace/.venv` 与 workspace 同生命周期，而不是与当前 microVM 同生命周期：
-私有 workspace 下每个 session 各有一份，宿主挂载下则由绑定目录决定。两个
-session 若绑定同一个物理目录，会看到同一份项目依赖；应避免同时对同一目录执行
-`pip install` 或卸载操作。`/sandbox off` 只停止 microVM，不删除依赖存储。
+microVM 按需创建，不是在 Session 建立时立即启动。同一进程内，一个 Session 对应一个长生命周期 microVM；不同 Session 使用不同名称、锁和持久 Volume。
 
-通用镜像由 `packaging/sandbox/Dockerfile` 和
-`requirements-common.txt` 定义。Windows 构建脚本先通过 Docker 构建，再执行
-`docker save` 和 `msb load`，因为 microsandbox 使用自己的 OCI 缓存，不能直接
-读取 Docker Desktop 的本地镜像仓库。更新通用依赖后必须重新构建、导入，并重启
-相关 microVM。
+## Workspace 类型
 
-Shell 输出通过 SDK 事件流持续排空，不会先在宿主内存中拼接完整结果。SJTUClaw
-只保留每个输出流的有界头部及用于解析 cwd 标记的少量尾部；Tool 返回最多
-64 KiB。stdout 与 stderr 合计超过 8 MiB 时会终止 guest 进程并返回明确错误，
-避免无限输出同时压垮 SDK 队列或宿主进程。输出按字节收集，展示时使用 UTF-8
-容错解码，因此任意二进制输出不会触发 SDK 的文本解码异常。
+### 私有 Workspace
 
-## 路径与挂载边界
+Session 未绑定宿主目录时，Sandbox 使用确定性的私有 Volume，并挂载到 `/workspace`。停止或重建 microVM 不删除该 Volume。
 
-- guest 工作区固定为 `/workspace`。
-- 相对结构化路径相对于 `/workspace` 解析。
-- `../`、`/etc/...`、Windows 盘符路径和 UNC 路径不会被结构化文件工具接受。
-- Shell 是 microVM 内的完整 Linux 环境，可以访问 guest `/tmp`、`/etc` 等路径；
-  这些路径不是宿主同名路径。
-- 绑定宿主 workspace 时启用 `nosuid` 和 `nodev`。挂载兼容策略默认 `auto`：
-  Windows 使用 `relaxed` stat virtualization 与 `mirror` 普通 rwx 位传播，避免
-  NTFS 挂载中 guest 新文件出现 ELOOP/EACCES、不可重新执行及 POSIX 符号链接
-  失败；其他宿主使用 `strict` 与 `private`。可通过配置显式覆盖 stat 策略。
-- 未绑定时使用确定性的 session 命名卷；正常退出只停止 microVM，删除 session
-  时才删除该卷。
-- 文件读取使用流式 API，在达到 Tool 的字节上限后停止读取。覆盖、编辑和附件
-  导入先写入目标同目录的随机临时文件，再通过 rename 提交；写入失败时旧文件
-  保持不变。
+这允许用户在不开放任何宿主目录的情况下使用文件与 Shell 工具。
 
-## 故障策略
+### 宿主绑定
 
-`off`、`auto` 与 `required` 决定新 session 的默认开关状态；未显式配置时使用
-`off`，因此新 session 默认关闭。显式设置 `auto` 会在 SDK 可发现时选择
-sandbox，`required` 始终选择 sandbox。除
-`required` 外，用户可以使用 `/sandbox on` 与 `/sandbox off` 覆盖当前 session
-的默认值；覆盖状态写入 Session metadata，不会影响其他会话，应用重启后继续
-生效。新建和 fork session 不复制该状态；删除 session 时随主记录删除。某次操作
-一旦被路由到 sandbox，创建或执行失败都会直接返回结构化错误，不在同一次调用中
-重试宿主执行。显式开启的 session 即使不处于 `required` 全局模式，在 sandbox
-运行环境不可用时也会 fail-closed；只有未显式设置、由 `auto` 配置默认选中的
-session 才允许在能力探测失败时保持旧宿主路径。
+设置 `/workspace set <目录>` 后，只把该明确目录映射到 guest `/workspace`。
 
-`/sandbox` 本身只显示 `on`、`off`、`status` 的简要说明；不会隐式查询或改变
-状态。Gateway 将当前有效状态写入 session API 和 SSE，Web UI 据此只在已生效的
-session 上显示 Sandbox 图标。
+- 结构化文件工具只接受 `/workspace` 内路径。
+- Windows 盘符、UNC 路径和越界 `..` 会被拒绝。
+- Shell 可以访问 microVM 内其他 Linux 路径，但不能借此读取未挂载的宿主目录。
 
-停止 microVM 或删除私有卷失败也会向调用方传播。交互式关闭、workspace 变更
-和后端切换只有在清理成功后才报告成功；应用退出阶段无法再重试的清理错误会
-写入日志。
+Workspace 绑定变化时，旧 microVM 会停止，并按新挂载重新创建。
 
-当前 microVM 覆盖 SJTUClaw 原生 ToolRegistry。Pi 与 Claude Code 拥有自己的
-进程和原生工具循环，尚不能仅靠宿主工具桥获得同等隔离，因此
-`required` 模式拒绝切换这两个后端。后续要覆盖它们，应把 agent 进程本身及其
-RPC/MCP 通道移入 microVM，而不是只修改启动 cwd。
+## 工具适配
 
-## 测试边界
+| 工具类别 | Sandbox 行为 |
+| --- | --- |
+| `list_dir`、`read_file` | 通过 microsandbox 文件接口读取 |
+| `create_file`、`overwrite_file`、`edit_file` | 在 guest `/workspace` 内写入 |
+| `new_shell`、`run_command` | 使用 microVM `/bin/sh`，保留 Session 当前目录 |
+| `copy_attachment_to_workspace` | 把宿主附件复制到 guest |
+| `create_download` | 把 guest 文件导出到 `data/sandbox/exports/` 后注册 |
+| `web_search`、`web_fetch` | 仍由宿主工具执行，不路由 microVM |
+| Memory、Skill、Cron | 仍使用 SJTUClaw 宿主服务 |
 
-单元测试使用同步内存后端验证：
+AUTO 只有在 Sandbox 实际生效时才会自动批准 microVM 内 Shell；宿主 Shell 仍需审批。
 
-- 无 workspace 自动创建私有卷；
-- 文件、Shell 和导出共享同一 session 文件系统；
-- workspace 绑定变化会停止旧 microVM 并按新挂载重建；
-- 结构化路径不能逃出 `/workspace`；
-- `required` 在 SDK 缺失或 UNLIMITED 下 fail-closed；
-- session 删除会停止 microVM 并移除私有卷。
-- 项目依赖同步、默认 Shell 环境、microVM 重启恢复和失败回收；
-- session 开关隔离、Web UI 状态投影和新 session 默认关闭；
-- 显式状态跨进程重启恢复、fork 不继承及不可用时 fail-closed；
-- Shell/文件读取有界、非 UTF-8 输出可容错展示；
-- 覆盖与附件导入原子提交，失败不破坏旧文件；
-- 停止或 volume 删除失败会被报告且保留可重试状态。
+## 项目 Python 环境
 
-真实 microVM 冒烟测试还依赖宿主已安装 microsandbox wheel、启用虚拟化并可取得
-所配置 OCI 镜像，因此不应混入不具备这些条件的默认单元测试。
+开启 `SANDBOX_PROJECT_VENV=true` 后，SJTUClaw 提供两层环境：
+
+```text
+/opt/sjtuclaw/runtime-venv   microVM 本地可执行 venv
+/workspace/.venv            持久化的项目包和 console scripts
+```
+
+启动 microVM 时：
+
+1. 在 Linux rootfs 创建带 `--system-site-packages` 的运行 venv。
+2. 从 `/workspace/.venv` 恢复项目包和脚本。
+3. 把 `python`、`pip` 和 console scripts 指向运行 venv。
+
+每次 Shell 命令结束后，再把新增或更新的项目包同步回 `/workspace/.venv`。这样既能读取镜像中的通用库，又能在 microVM 重建后保留 `pip install` 的项目依赖。
+
+如果 `/workspace/.venv` 已存在但不是 SJTUClaw 管理的 `sync-v1` 布局，系统会拒绝覆盖。
+
+## 资源与网络
+
+核心配置：
+
+```env
+SANDBOX_CPUS=2
+SANDBOX_MEMORY_MIB=2048
+SANDBOX_MAX_DURATION_S=21600
+SANDBOX_IDLE_TIMEOUT_S=3600
+SANDBOX_NETWORK=public
+SANDBOX_SECURITY=restricted
+SANDBOX_WORKSPACE_QUOTA_MIB=4096
+```
+
+- `SANDBOX_NETWORK=none` 关闭 guest 网络。
+- `restricted` 是推荐安全级别。
+- 写入配额限制私有 Volume 或已绑定 Workspace 中新增的数据量。
+- `SANDBOX_STAT_VIRTUALIZATION=auto` 在 Windows 使用兼容的 stat 虚拟化策略，其他平台偏向严格策略。
+
+## 生命周期与故障策略
+
+- `/sandbox on`：检查后端、UNLIMITED、SDK 和运行时后保存 Session 偏好。
+- 首次工具调用：创建 microVM、挂载 Workspace、初始化项目环境。
+- `/sandbox off`：先停止 microVM，再保存关闭状态；私有 Volume 保留。
+- 应用关闭：停止当前进程拥有的 microVM。
+- Session 删除：清理对应运行实例；持久资源按实现的删除流程处理。
+
+关键故障采用安全默认值：
+
+- 显式开启或 `required` 时，运行环境错误直接返回用户，不回退宿主。
+- 旧 microVM 停止失败时，不创建替代环境。
+- 项目 venv 初始化失败时，停止刚创建的 microVM。
+- 下载必须先导出到受管目录，不能把任意 guest 路径暴露给 Gateway。
+
+## Windows 前置条件
+
+- Windows Hypervisor Platform 已启用。
+- 安装 `microsandbox>=0.6.7,<0.7`。
+- `msb doctor` 可以成功运行。
+- 所用镜像已经由 `msb load` 导入。
+
+推荐构建项目镜像：
+
+```powershell
+.\packaging\sandbox\Build-SandboxImage.ps1
+```
+
+镜像构建和真实环境验证见 [Sandbox 基础镜像](../packaging/sandbox/README.md)。
+
+## 关键实现
+
+- `claw/sandbox/config.py`：配置解析与校验。
+- `claw/sandbox/runtime.py`：Session 生命周期、挂载、文件和 Shell 适配。
+- `claw/sandbox/project_env_sync.py`：项目依赖恢复与持久化。
+- `claw/workspace/manager.py`：宿主 Workspace 绑定和路径检查。
+- `claw/tools/`：各工具的宿主 / Sandbox 双路由。

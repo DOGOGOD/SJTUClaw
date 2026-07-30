@@ -295,7 +295,6 @@ def needs_compaction(
     after a recent LLM summarization failure.
     """
     # Cooldown check: skip if we recently failed
-    global _last_compaction_failure_ts
     if _last_compaction_failure_ts > 0:
         import time as _time
         elapsed = _time.time() - _last_compaction_failure_ts
@@ -580,7 +579,7 @@ def maybe_consolidate_by_tokens(
 
     last_summary: str | None = None
 
-    for round_num in range(_MAX_CONSOLIDATION_ROUNDS):
+    for _ in range(_MAX_CONSOLIDATION_ROUNDS):
         if estimated <= target:
             break
 

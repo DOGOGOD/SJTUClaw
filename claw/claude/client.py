@@ -431,21 +431,21 @@ def _candidate_commands() -> list[Path]:
     """Return well-known Claude Code install locations in priority order."""
     home = Path.home()
     names = ("claude.exe", "claude.cmd", "claude") if os.name == "nt" else ("claude",)
-    candidates: list[Path] = []
-
     # The native installer location is intentionally checked even when it is
     # missing from PATH.  This is the most common desktop-app failure mode.
-    for name in names:
-        candidates.append(home / ".local" / "bin" / name)
+    candidates = [home / ".local" / "bin" / name for name in names]
 
     # Older local and npm installations remain supported for migration.
-    for name in names:
-        candidates.append(home / ".claude" / "local" / name)
+    candidates.extend(home / ".claude" / "local" / name for name in names)
 
     npm_prefix = os.environ.get("npm_config_prefix", "").strip()
     if npm_prefix:
-        for name in names:
-            candidates.append(Path(npm_prefix).expanduser() / ("bin" if os.name != "nt" else "") / name)
+        candidates.extend(
+            Path(npm_prefix).expanduser()
+            / ("bin" if os.name != "nt" else "")
+            / name
+            for name in names
+        )
 
     if os.name == "nt":
         appdata = os.environ.get("APPDATA", "").strip()
@@ -1376,20 +1376,23 @@ class ClaudeCodeAgentClient(LLMClient):
         )
         process_job = _WindowsProcessJob.attach(proc)
         stderr: list[str] = []
-        threading.Thread(
+        stderr_thread = threading.Thread(
             target=self._collect_stderr,
             args=(proc, stderr),
             daemon=True,
-        ).start()
+        )
+        stderr_thread.start()
         stdout_events: queue.Queue[str | None] = queue.Queue()
-        threading.Thread(
+        stdout_thread = threading.Thread(
             target=self._collect_stdout,
             args=(proc, stdout_events),
             daemon=True,
-        ).start()
+        )
+        stdout_thread.start()
 
         if proc.stdin is None:
             self._terminate_process_tree(proc, process_job)
+            self._close_process_streams(proc, (stdout_thread, stderr_thread))
             if process_job is not None:
                 process_job.close()
             raise ClaudeCodeError("Claude Code 标准输入不可用。")
@@ -1398,6 +1401,7 @@ class ClaudeCodeAgentClient(LLMClient):
             proc.stdin.close()
         except OSError as exc:
             self._terminate_process_tree(proc, process_job)
+            self._close_process_streams(proc, (stdout_thread, stderr_thread))
             if process_job is not None:
                 process_job.close()
             raise ClaudeCodeError(f"无法向 Claude Code 发送请求：{exc}") from exc
@@ -1524,6 +1528,7 @@ class ClaudeCodeAgentClient(LLMClient):
                         self._terminate_process_tree(proc, process_job)
                 except subprocess.TimeoutExpired:
                     self._terminate_process_tree(proc, process_job)
+            self._close_process_streams(proc, (stdout_thread, stderr_thread))
             if process_job is not None:
                 process_job.close()
 
@@ -1566,6 +1571,7 @@ class ClaudeCodeAgentClient(LLMClient):
                 except (OSError, subprocess.TimeoutExpired):
                     if proc.poll() is None:
                         proc.kill()
+                        proc.wait(timeout=grace_s)
             return
 
         pid = getattr(proc, "pid", None)
@@ -1595,6 +1601,27 @@ class ClaudeCodeAgentClient(LLMClient):
             except (OSError, subprocess.TimeoutExpired):
                 if proc.poll() is None:
                     proc.kill()
+                    proc.wait(timeout=grace_s)
+
+    @staticmethod
+    def _close_process_streams(
+        proc: subprocess.Popen,
+        reader_threads: Sequence[threading.Thread] = (),
+    ) -> None:
+        """Join pipe readers and close every parent-side subprocess stream."""
+        for thread in reader_threads:
+            thread.join(timeout=1)
+        for name in ("stdin", "stdout", "stderr"):
+            stream = getattr(proc, name, None)
+            if stream is None or getattr(stream, "closed", False):
+                continue
+            try:
+                stream.close()
+            except (OSError, ValueError):
+                pass
+        for thread in reader_threads:
+            if thread.is_alive():
+                thread.join(timeout=1)
 
     @staticmethod
     def _collect_stderr(proc, output: list[str]) -> None:

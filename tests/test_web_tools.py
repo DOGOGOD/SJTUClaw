@@ -357,6 +357,18 @@ def test_search_falls_back_to_bing_when_duckduckgo_is_empty(monkeypatch):
     assert payload["fallback_errors"] == ["duckduckgo: 未返回可用结果"]
 
 
+def test_bing_search_rejects_xml_entity_declarations(monkeypatch):
+    from claw.tools import web
+
+    malicious_rss = """<?xml version="1.0"?>
+    <!DOCTYPE rss [<!ENTITY payload "expanded">]>
+    <rss><channel><item><title>&payload;</title></item></channel></rss>"""
+    monkeypatch.setattr(web, "_request_text", lambda *_args, **_kwargs: malicious_rss)
+
+    with pytest.raises(RuntimeError, match="不安全的 XML 声明"):
+        web._search_bing("unsafe", 1, WebToolConfig(max_retries=0))
+
+
 def test_search_follows_validated_bing_region_redirect(monkeypatch):
     from claw.tools import web
 

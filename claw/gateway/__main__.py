@@ -18,7 +18,6 @@ import webbrowser
 
 import uvicorn
 
-from claw.config import PROJECT_ROOT
 from claw.paths import web_dir
 from claw.utils import force_utf8_stdio
 
@@ -56,7 +55,7 @@ def main() -> int:
     if _webui_exists():
         print(f"  Web UI: {url}")
     else:
-        print(f"  Web UI: (未构建 — 运行 cd webui && npm run build)")
+        print("  Web UI: (未构建 — 运行 cd webui && npm run build)")
     print(f"  API:    {url}/sessions")
     print("=" * 56)
     print("  Press Ctrl+C to stop.")

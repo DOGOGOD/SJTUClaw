@@ -38,13 +38,11 @@ import os
 import re
 import shutil
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-from claw.config import PROJECT_ROOT
 from claw.paths import skills_dir
 
 # ---------------------------------------------------------------------------
@@ -211,13 +209,16 @@ def _parse_claw_metadata(meta: dict[str, Any]) -> dict[str, Any]:
 
 def _check_requirements(requires_bins: list[str], requires_env: list[str]) -> tuple[bool, str]:
     """Check if skill requirements are met."""
-    missing: list[str] = []
-    for cmd in requires_bins:
-        if not shutil.which(str(cmd)):
-            missing.append(f"CLI: {cmd}")
-    for var in requires_env:
-        if not os.environ.get(str(var)):
-            missing.append(f"ENV: {var}")
+    missing = [
+        f"CLI: {cmd}"
+        for cmd in requires_bins
+        if not shutil.which(str(cmd))
+    ]
+    missing.extend(
+        f"ENV: {var}"
+        for var in requires_env
+        if not os.environ.get(str(var))
+    )
     return (len(missing) == 0, ", ".join(missing))
 
 
@@ -445,13 +446,15 @@ class SkillRegistry:
             if (entry / "SKILL.md").is_file():
                 result.append(entry)
                 continue
-            for child in sorted(entry.iterdir()):
+            result.extend(
+                child
+                for child in sorted(entry.iterdir())
                 if (
                     child.is_dir()
                     and not child.name.startswith(".")
                     and (child / "SKILL.md").is_file()
-                ):
-                    result.append(child)
+                )
+            )
         return result
 
     def _record_skill_mtime(self, skill: SkillInfo) -> None:

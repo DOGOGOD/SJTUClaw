@@ -1,9 +1,6 @@
 const API_BASE = "";
 const DEFAULT_REQUEST_TIMEOUT_MS = 60_000;
 
-// Deduplication map: prevents concurrent duplicate GET requests
-const _pendingRequests = new Map<string, Promise<any>>();
-
 /** Safely read a Response body as text without consuming it twice. */
 async function _readResponseText(res: Response): Promise<string> {
   try {
@@ -36,14 +33,6 @@ async function request<T>(
   options?: RequestInit,
   timeoutMs: number | null = DEFAULT_REQUEST_TIMEOUT_MS,
 ): Promise<T> {
-  const method = options?.method || "GET";
-  const cacheKey = method === "GET" ? `${method}:${url}` : "";
-
-  // Deduplicate concurrent GET requests
-  if (cacheKey && _pendingRequests.has(cacheKey)) {
-    return _pendingRequests.get(cacheKey)!;
-  }
-
   const controller = new AbortController();
   const timeout = timeoutMs === null
     ? null
@@ -76,11 +65,9 @@ async function request<T>(
       throw err;
     } finally {
       if (timeout !== null) clearTimeout(timeout);
-      if (cacheKey) _pendingRequests.delete(cacheKey);
     }
   })();
 
-  if (cacheKey) _pendingRequests.set(cacheKey, promise);
   return promise;
 }
 
@@ -171,30 +158,34 @@ export function streamChat(
 
       const decoder = new TextDecoder();
       let buffer = "";
+      const processLine = (rawLine: string) => {
+        const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
+        if (!line.startsWith("data:")) return;
+        const jsonStr = line.slice(5).trimStart();
+        if (!jsonStr) return;
+        try {
+          const parsed = JSON.parse(jsonStr);
+          onEvent(parsed as import("@/lib/types").SSEEvent);
+        } catch {
+          // Skip unparseable lines.
+        }
+      };
+      const processCompleteLines = () => {
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+        lines.forEach(processLine);
+      };
 
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
 
         buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n");
-        // Keep the last partial line in the buffer
-        buffer = lines.pop() || "";
-
-        for (const line of lines) {
-          if (line.startsWith("data: ")) {
-            const jsonStr = line.slice(6);
-            if (jsonStr === ": keepalive") continue;
-            try {
-              const parsed = JSON.parse(jsonStr);
-              onEvent(parsed as import("@/lib/types").SSEEvent);
-            } catch {
-              // Skip unparseable lines
-            }
-          }
-          // Ignore comment lines (starting with ":")
-        }
+        processCompleteLines();
       }
+      buffer += decoder.decode();
+      processCompleteLines();
+      if (buffer) processLine(buffer);
     })
     .then(() => onDone?.())
     .catch((err) => {

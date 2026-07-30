@@ -430,7 +430,7 @@ def _setup_qq() -> dict[str, str]:
     if current_app_id and current_secret:
         print("  QQ 凭证已配置:")
         print(f"    QQ_APP_ID        = {current_app_id}")
-        print(f"    QQ_CLIENT_SECRET = ****")
+        print("    QQ_CLIENT_SECRET = ****")
         print()
         configure_credentials = _prompt_yn("  是否重新配置凭证?", default=False)
 

@@ -112,6 +112,8 @@ class TurnMetrics:
                 self.tool_cache_hits += 1
 
     def record_parallel_batch(self, batch_size: int) -> None:
+        if batch_size < 2:
+            return
         with self._lock:
             self.tool_parallel_batches += 1
             # batch_size is tracked via tool_calls (incremented per-tool

@@ -33,7 +33,7 @@ from claw.session.store import (
     SessionStore,
 )
 from claw.utils import now_iso
-from claw.workspace.manager import WorkspaceError, WorkspaceManager
+from claw.workspace.manager import WorkspaceManager
 
 
 _EXCLUDED_DIRS = frozenset(
@@ -112,12 +112,18 @@ class WorkspaceRollbackManager:
 
     # -- database ---------------------------------------------------------
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        """Yield a transactional connection and always release its handle."""
         conn = sqlite3.connect(self.db_path, timeout=30)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
-        return conn
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def _init_db(self) -> None:
         with self._connect() as conn:

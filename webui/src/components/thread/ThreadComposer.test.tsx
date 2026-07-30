@@ -49,6 +49,41 @@ describe("ThreadComposer keyboard interactions", () => {
     expect(view.getByTitle("project-two")).toBeTruthy();
   });
 
+  it("ignores an older workspace response after switching sessions", async () => {
+    const pending = new Map<
+      string,
+      (value: Awaited<ReturnType<typeof api.fetchWorkspace>>) => void
+    >();
+    vi.spyOn(api, "fetchWorkspace").mockImplementation(
+      (sessionId) => new Promise((resolve) => pending.set(sessionId, resolve)),
+    );
+    const view = render(
+      <ThreadComposer onSend={vi.fn().mockResolvedValue(undefined)} sessionId="session-a" />
+    );
+
+    view.rerender(
+      <ThreadComposer onSend={vi.fn().mockResolvedValue(undefined)} sessionId="session-b" />
+    );
+    pending.get("session-b")?.({
+      ok: true,
+      sessionId: "session-b",
+      workspace: "C:\\project-b",
+      isSet: true,
+    });
+    await waitFor(() => expect(view.getByTitle("project-b")).toBeTruthy());
+
+    pending.get("session-a")?.({
+      ok: true,
+      sessionId: "session-a",
+      workspace: "C:\\project-a",
+      isSet: true,
+    });
+    await Promise.resolve();
+
+    expect(view.getByTitle("project-b")).toBeTruthy();
+    expect(view.queryByTitle("project-a")).toBeNull();
+  });
+
   it("lets the homepage create a session with a selected workspace", async () => {
     vi.spyOn(api, "pickWorkspace").mockResolvedValue({
       ok: true,

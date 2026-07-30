@@ -273,49 +273,53 @@ class SkillUsageStore:
         now = datetime.now(timezone.utc)
         stale_cutoff = now - timedelta(days=stale_after_days)
         archive_cutoff = now - timedelta(days=archive_after_days)
+        with self._lock:
+            data = self.load_usage()
+            changes: Dict[str, str] = {}
+            dirty = False
 
-        data = self.load_usage()
-        changes: Dict[str, str] = {}
+            for name in known_skills:
+                rec = data.get(name)
+                if not isinstance(rec, dict):
+                    # Persist the seed so a never-used skill has a stable age.
+                    data[name] = _empty_record()
+                    dirty = True
+                    continue
+                if rec.get("pinned"):
+                    # Pinned skills never auto-transition.
+                    continue
 
-        for name in known_skills:
-            rec = data.get(name)
-            if not isinstance(rec, dict):
-                # No record yet — seed one so the clock starts now.
-                data[name] = _empty_record()
-                continue
-            if rec.get("pinned"):
-                # Pinned skills never auto-transition.
-                continue
+                base = _empty_record()
+                for k, v in base.items():
+                    if k not in rec:
+                        rec[k] = v
+                        dirty = True
 
-            base = _empty_record()
-            for k, v in base.items():
-                rec.setdefault(k, v)
+                current_state = rec.get("state", STATE_ACTIVE)
+                if current_state == STATE_ARCHIVED:
+                    continue
 
-            current_state = rec.get("state", STATE_ACTIVE)
-            if current_state == STATE_ARCHIVED:
-                continue
+                last_activity = latest_activity_at(rec)
+                if last_activity is None:
+                    # Never active — use created_at as the anchor.
+                    anchor = _parse_iso_timestamp(rec.get("created_at"))
+                else:
+                    anchor = _parse_iso_timestamp(last_activity)
 
-            last_activity = latest_activity_at(rec)
-            if last_activity is None:
-                # Never active — use created_at as the anchor.
-                anchor = _parse_iso_timestamp(rec.get("created_at"))
-            else:
-                anchor = _parse_iso_timestamp(last_activity)
+                if anchor is None:
+                    continue
 
-            if anchor is None:
-                continue
+                if anchor < archive_cutoff and current_state != STATE_ARCHIVED:
+                    rec["state"] = STATE_ARCHIVED
+                    rec["archived_at"] = _now_iso()
+                    changes[name] = STATE_ARCHIVED
+                elif anchor < stale_cutoff and current_state == STATE_ACTIVE:
+                    rec["state"] = STATE_STALE
+                    changes[name] = STATE_STALE
 
-            if anchor < archive_cutoff and current_state != STATE_ARCHIVED:
-                rec["state"] = STATE_ARCHIVED
-                rec["archived_at"] = _now_iso()
-                changes[name] = STATE_ARCHIVED
-            elif anchor < stale_cutoff and current_state == STATE_ACTIVE:
-                rec["state"] = STATE_STALE
-                changes[name] = STATE_STALE
-
-        if changes:
-            self.save_usage(data)
-        return changes
+            if dirty or changes:
+                self.save_usage(data)
+            return changes
 
     # ------------------------------------------------------------------
     # Reporting

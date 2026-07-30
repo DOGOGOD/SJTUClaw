@@ -19,6 +19,7 @@ from __future__ import annotations
 import contextvars
 import json
 import logging
+import math
 import re
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -221,6 +222,8 @@ def _matches_json_type(value: Any, expected_type: str) -> bool:
     """Match JSON types without treating bool as an integer in Python."""
     if expected_type in {"integer", "number"} and isinstance(value, bool):
         return False
+    if expected_type == "number" and isinstance(value, float):
+        return math.isfinite(value)
     expected = _TYPE_MAP.get(expected_type)
     return expected is None or isinstance(value, expected)
 

@@ -62,6 +62,7 @@ export function ThreadComposer({
   const historyIndexRef = useRef<number | null>(null);
   const historyDraftRef = useRef("");
   const pendingAttachmentsRef = useRef<PendingAttachment[]>([]);
+  const workspaceRequestIdRef = useRef(0);
 
   const historyKey = sessionId || "__home__";
   const wsDisplay = savedWsPath
@@ -70,13 +71,15 @@ export function ThreadComposer({
   const workspaceDraftChanged = wsPath.trim() !== savedWsPath;
 
   useEffect(() => {
+    const requestId = ++workspaceRequestIdRef.current;
+    setWsPath("");
+    setSavedWsPath("");
+    setWsError("");
     if (!sessionId) {
-      setWsPath("");
-      setSavedWsPath("");
-      setWsError("");
       return;
     }
     fetchWorkspace(sessionId).then((d) => {
+      if (workspaceRequestIdRef.current !== requestId) return;
       const workspace = d.workspace || "";
       setWsPath(workspace);
       setSavedWsPath(workspace);
@@ -342,6 +345,7 @@ export function ThreadComposer({
     }
     setWorkspaceBusy(true);
     try {
+      ++workspaceRequestIdRef.current;
       if (sessionId) {
         await setWorkspace(sessionId, path);
       } else {
@@ -368,6 +372,7 @@ export function ThreadComposer({
     const sid = sessionId;
     setWorkspaceBusy(true);
     try {
+      ++workspaceRequestIdRef.current;
       await unsetWorkspace(sid);
       setWsPath("");
       setSavedWsPath("");

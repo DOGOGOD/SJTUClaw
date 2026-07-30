@@ -924,9 +924,9 @@ class CronService:
 
                     try:
 
-                        line = line.strip()
+                        stripped_line = line.strip()
 
-                        action = json.loads(line)
+                        action = json.loads(stripped_line)
 
                         if "action" not in action:
 

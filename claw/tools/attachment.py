@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
 from claw.tools.base import Tool, ToolResult
-from claw.workspace.manager import WorkspaceManager, WorkspaceError
+from claw.workspace.manager import WorkspaceManager
 
 if TYPE_CHECKING:
     from claw.sandbox import SandboxManager

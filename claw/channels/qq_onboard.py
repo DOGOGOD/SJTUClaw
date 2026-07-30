@@ -325,9 +325,9 @@ if __name__ == "__main__":
 
     print()
     print(f"  配置已写入: {_env_path}")
-    print(f"    QQ_ENABLED=true")
+    print("    QQ_ENABLED=true")
     print(f"    QQ_APP_ID={result['app_id']}")
-    print(f"    QQ_CLIENT_SECRET=****")
+    print("    QQ_CLIENT_SECRET=****")
     if result.get("user_openid"):
         print(f"    QQ_ALLOW_FROM={result['user_openid']}")
     print()

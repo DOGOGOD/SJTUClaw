@@ -13,6 +13,7 @@ import json
 import os
 import stat
 import sys
+import uuid
 from pathlib import Path
 
 _CHUNK_SIZE = 1024 * 1024
@@ -45,17 +46,24 @@ def _write_bytes(
     mtime_ns: int,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.sjtuclaw-sync-{os.getpid()}")
-    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    temporary = path.with_name(
+        f".{path.name}.sjtuclaw-sync-{os.getpid()}-{uuid.uuid4().hex}"
+    )
     try:
-        view = memoryview(payload)
-        while view:
-            written = os.write(fd, view)
-            view = view[written:]
+        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+        try:
+            view = memoryview(payload)
+            while view:
+                written = os.write(fd, view)
+                if written <= 0:
+                    raise OSError("failed to make progress while writing")
+                view = view[written:]
+        finally:
+            _close_ignoring_readonly_flush(fd)
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
     finally:
-        _close_ignoring_readonly_flush(fd)
-    os.chmod(temporary, mode)
-    os.replace(temporary, path)
+        temporary.unlink(missing_ok=True)
     try:
         os.utime(path, ns=(mtime_ns, mtime_ns), follow_symlinks=False)
     except NotImplementedError:

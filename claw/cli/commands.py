@@ -783,7 +783,6 @@ def _format_memory_list(extra_args: list[str], state: RuntimeState) -> str:
             return "用法: /memory list [--category <类别>]"
         category = extra_args[1]
 
-    from claw.memory.store import MEMORY_CATEGORIES
     _LABELS: dict[str, str] = {
         "user_preference": "pref",
         "project": "proj",

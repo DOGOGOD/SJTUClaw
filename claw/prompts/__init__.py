@@ -19,7 +19,7 @@ from pathlib import Path
 
 from claw.config import PROJECT_ROOT
 from claw.paths import prompts_dir
-from claw.prompts.templates import render, render_file
+from claw.prompts.templates import render_file
 
 # ---------------------------------------------------------------------------
 # Paths

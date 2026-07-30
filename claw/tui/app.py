@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-from collections import Counter
 import json
-import os
-from typing import Any
+from collections import Counter
+from typing import Any, ClassVar
 
 from rich.text import Text
 from textual import events, on, work
@@ -37,7 +36,6 @@ from claw.tui.widgets import (
     WelcomePanel,
 )
 
-
 COMMANDS: tuple[tuple[str, str], ...] = (
     ("/session", "创建、切换、重命名或删除 Session"),
     ("/memory", "管理长期记忆与检索"),
@@ -62,13 +60,13 @@ COMMANDS: tuple[tuple[str, str], ...] = (
 )
 
 COMMAND_WINDOW_SIZE = 7
-BUSY_COMMANDS = {"/stop", "/approvals"}
+BUSY_COMMANDS = {"/stop", "/approvals", "/approve", "/reject"}
 
 
 class SessionBoard(ModalScreen[str | None]):
     """Dense, keyboard-first session operations board."""
 
-    BINDINGS = [
+    BINDINGS: ClassVar[list[Binding]] = [
         Binding("escape", "dismiss", "关闭"),
         Binding("q", "dismiss", "关闭"),
         Binding("n", "new", "新建"),
@@ -205,7 +203,9 @@ class SessionBoard(ModalScreen[str | None]):
 
 
 class RenameSessionScreen(ModalScreen[str | None]):
-    BINDINGS = [Binding("escape", "dismiss", "取消")]
+    BINDINGS: ClassVar[list[Binding]] = [
+        Binding("escape", "dismiss", "取消")
+    ]
 
     def __init__(self, session_id: str, title: str) -> None:
         super().__init__()
@@ -248,7 +248,9 @@ class RenameSessionScreen(ModalScreen[str | None]):
 
 
 class ConfirmDeleteScreen(ModalScreen[str | None]):
-    BINDINGS = [Binding("escape", "dismiss", "取消")]
+    BINDINGS: ClassVar[list[Binding]] = [
+        Binding("escape", "dismiss", "取消")
+    ]
 
     def __init__(self, session_id: str, title: str, active: bool) -> None:
         super().__init__()
@@ -287,7 +289,9 @@ class ConfirmDeleteScreen(ModalScreen[str | None]):
 class ConfirmCronDeleteScreen(ModalScreen[str | None]):
     """Require confirmation before deleting a user Cron job."""
 
-    BINDINGS = [Binding("escape", "dismiss", "取消")]
+    BINDINGS: ClassVar[list[Binding]] = [
+        Binding("escape", "dismiss", "取消")
+    ]
 
     def __init__(self, job_id: str, name: str) -> None:
         super().__init__()
@@ -328,12 +332,11 @@ class ConfirmCronDeleteScreen(ModalScreen[str | None]):
 class CronBoard(ModalScreen[str | None]):
     """Operational cron dashboard with direct actions."""
 
-    BINDINGS = [
+    BINDINGS: ClassVar[list[Binding]] = [
         Binding("escape", "dismiss", "关闭"),
         Binding("r", "refresh", "刷新"),
         Binding("space", "toggle", "启用/禁用"),
         Binding("x", "delete", "删除"),
-        Binding("enter", "run", "立即运行"),
     ]
 
     def __init__(self, runtime: LocalRuntime) -> None:
@@ -413,6 +416,10 @@ class CronBoard(ModalScreen[str | None]):
         if job:
             self.dismiss(f"::cron-run {job['id']}")
 
+    @on(DataTable.RowSelected, "#cron-table")
+    def run_selected_job(self) -> None:
+        self.action_run()
+
     @on(Button.Pressed)
     def board_button(self, event: Button.Pressed) -> None:
         actions = {
@@ -429,7 +436,9 @@ class CronBoard(ModalScreen[str | None]):
 class CommandPanel(ModalScreen[str | None]):
     """Searchable SJTUClaw command palette."""
 
-    BINDINGS = [Binding("escape", "dismiss", "关闭")]
+    BINDINGS: ClassVar[list[Binding]] = [
+        Binding("escape", "dismiss", "关闭")
+    ]
 
     def compose(self) -> ComposeResult:
         with Vertical(id="command-panel"):
@@ -509,12 +518,12 @@ class SJTUClawTUI(App[None]):
     # competes with our Ctrl+P binding. SJTUClaw owns the palette end-to-end.
     ENABLE_COMMAND_PALETTE = False
 
-    BINDINGS = [
-        Binding("ctrl+p", "command_panel", "命令面板", show=True, priority=True),
-        Binding("ctrl+s", "sessions", "Sessions", show=True),
-        Binding("ctrl+j", "cron", "Cron", show=True),
-        Binding("ctrl+r", "refresh", "刷新", show=True),
-        Binding("ctrl+c", "stop_turn", "停止", show=True, priority=True),
+    BINDINGS: ClassVar[list[Binding]] = [
+        Binding("ctrl+p", "command_panel", "命令面板", priority=True),
+        Binding("ctrl+s", "sessions", "Sessions"),
+        Binding("ctrl+j", "cron", "Cron"),
+        Binding("ctrl+r", "refresh", "刷新"),
+        Binding("ctrl+c", "stop_turn", "停止", priority=True),
         Binding("escape", "escape", "返回", show=False),
         Binding("ctrl+q", "quit", "退出", show=False),
     ]
@@ -532,14 +541,12 @@ class SJTUClawTUI(App[None]):
         self._command_index = 0
         self._rendered_session_id = ""
         self._rendered_message_fingerprints: list[tuple[str, str, str, str]] = []
+        self._approval_render_key: tuple[str, str] | None = None
+        self._command_running = False
+        self._input_histories: dict[str, list[str]] = {}
+        self._composer_drafts: dict[str, str] = {}
+        self._history_session_id = ""
         self._transcript_lock = asyncio.Lock()
-
-    def get_driver_class(self):
-        if os.name == "nt":
-            from claw.tui.windows_driver import SJTUClawWindowsDriver
-
-            return SJTUClawWindowsDriver
-        return super().get_driver_class()
 
     def compose(self) -> ComposeResult:
         yield BrandHeader(id="brand-header")
@@ -551,11 +558,12 @@ class SJTUClawTUI(App[None]):
         with Horizontal(id="workspace-shell"):
             with Vertical(id="conversation"):
                 yield VerticalScroll(id="transcript")
+                yield VerticalScroll(id="inline-approval-list")
                 yield Static("", id="command-hints")
                 with Horizontal(id="composer-shell"):
                     yield Static("›", id="prompt-mark")
                     yield Composer(id="composer", language=None, soft_wrap=True)
-                    yield Static("↵ 发送\n⇧↵ 换行", id="send-hint")
+                    yield Static("↵ 发送\n^N 换行\n↑↓ 历史", id="send-hint")
                 yield Static("", id="composer-meta", markup=False)
             with Vertical(id="insight-rail"):
                 yield Label("RUNTIME", classes="rail-title")
@@ -564,10 +572,8 @@ class SJTUClawTUI(App[None]):
                     yield Label("CRON", classes="rail-title")
                     yield RailActionButton("↗", id="open-cron", classes="icon-button")
                 yield Static("", id="cron-glance", classes="insight-card")
-                yield Label("APPROVALS", classes="rail-title section-gap")
-                yield Vertical(id="approval-list")
         yield Static(
-            "^P commands   ^S sessions   ^J cron   / inline",
+            "^P commands · ^S sessions · ^J cron · / inline",
             id="keybar",
         )
 
@@ -594,11 +600,42 @@ class SJTUClawTUI(App[None]):
         if not keep_ephemeral:
             self._ephemeral_messages.clear()
         self._refresh_status()
+        self._sync_composer_history()
         await self._render_transcript()
         self._refresh_approvals()
 
-    def _refresh_status(self) -> None:
+    def _sync_composer_history(self) -> None:
+        if self._history_session_id == self.current_session_id:
+            return
+        composer = self.query_one("#composer", Composer)
+        if self._history_session_id:
+            self._composer_drafts[self._history_session_id] = composer.text
+        history = self._input_histories.get(self.current_session_id)
+        if history is None:
+            history = [
+                str(message.get("content") or "")
+                for message in self.runtime.messages(self.current_session_id)
+                if message.get("role") == "user"
+                and str(message.get("content") or "").strip()
+            ][-Composer.HISTORY_LIMIT :]
+            self._input_histories[self.current_session_id] = history
+        composer.text = self._composer_drafts.get(self.current_session_id, "")
+        composer.set_history(history)
+        self._history_session_id = self.current_session_id
+
+    def _record_input_history(self, value: str) -> None:
+        history = self._input_histories.setdefault(self.current_session_id, [])
+        if not history or history[-1] != value:
+            history.append(value)
+            del history[:-Composer.HISTORY_LIMIT]
+        self.query_one("#composer", Composer).set_history(history)
+
+    def _refresh_status(self) -> bool:
         snapshot = self.runtime.snapshot(self.current_session_id)
+        session_changed = snapshot.session_id != self.current_session_id
+        if session_changed:
+            self.current_session_id = snapshot.session_id
+            self._approval_render_key = None
         self.query_one("#session-title", Static).update(snapshot.title)
         backend_labels = {
             "sjtuclaw": "◈ NATIVE",
@@ -616,9 +653,7 @@ class SJTUClawTUI(App[None]):
         if snapshot.unlimited_mode:
             safety.append("UNLIMITED")
         self.query_one("#safety-pill", Static).update(" · ".join(safety) or "GUARDED")
-        state = self.query_one("#run-state", Static)
-        state.update("◌ WORKING" if self.busy else "● READY")
-        state.set_classes("status-busy" if self.busy else "status-ready")
+        self._refresh_run_state()
         self.query_one("#runtime-card", Static).update(
             Text.assemble(
                 ("MODEL\n", "bold #756e79"),
@@ -647,6 +682,12 @@ class SJTUClawTUI(App[None]):
             f"{snapshot.backend} · {snapshot.workspace} · "
             f"{'sandbox' if snapshot.sandbox_mode else 'host'}"
         )
+        return session_changed
+
+    def _refresh_run_state(self) -> None:
+        state = self.query_one("#run-state", Static)
+        state.update("◌ WORKING" if self.busy else "● READY")
+        state.set_classes("status-busy" if self.busy else "status-ready")
 
     async def _render_transcript(self) -> None:
         async with self._transcript_lock:
@@ -725,7 +766,7 @@ class SJTUClawTUI(App[None]):
         current: list[tuple[str, str, str, str]],
     ) -> int:
         length = 0
-        for old, new in zip(previous, current):
+        for old, new in zip(previous, current, strict=False):
             if old != new:
                 break
             length += 1
@@ -757,41 +798,75 @@ class SJTUClawTUI(App[None]):
         return remaining
 
     def _refresh_approvals(self) -> None:
-        self._replace_approval_cards(self.runtime.pending_approvals(self.current_session_id))
+        approvals = self.runtime.pending_approvals(self.current_session_id)
+        render_key = (
+            self.current_session_id,
+            json.dumps(
+                approvals,
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            ),
+        )
+        if render_key == self._approval_render_key:
+            return
+        self._approval_render_key = render_key
+        self.query_one("#inline-approval-list").set_class(
+            bool(approvals),
+            "has-approvals",
+        )
+        self._replace_approval_cards(approvals)
 
     @work(exclusive=True, group="approval-render")
     async def _replace_approval_cards(self, approvals: list[dict[str, Any]]) -> None:
-        container = self.query_one("#approval-list", Vertical)
-        await container.remove_children()
-        if approvals:
-            await container.mount(*(ApprovalCard(item) for item in approvals))
-        else:
-            await container.mount(Static("没有等待中的操作", classes="muted"))
+        try:
+            container = self.query_one("#inline-approval-list", VerticalScroll)
+            await container.remove_children()
+            if approvals:
+                await container.mount(*(ApprovalCard(item) for item in approvals))
+                container.scroll_end(animate=False)
+        except Exception as exc:  # noqa: BLE001 - isolate Textual render failures
+            self._approval_render_key = None
+            self.log.error(f"TUI approval rendering failed: {exc}")
 
     def _poll_live_state(self) -> None:
         if self.busy:
             self._refresh_approvals()
-            self._refresh_status()
 
     def _refresh_background(self) -> None:
         if not self.busy:
-            self._refresh_status()
+            session_changed = self._refresh_status()
             self._refresh_approvals()
+            if session_changed:
+                self._sync_composer_history()
+                self.call_later(self._render_transcript)
 
     @on(Composer.Submitted)
     async def submit_composer(self, event: Composer.Submitted) -> None:
         composer = self.query_one("#composer", Composer)
-        command_name = event.value.partition(" ")[0] if event.value.startswith("/") else ""
+        command_name = (
+            event.value.partition(" ")[0].lower()
+            if event.value.startswith("/")
+            else ""
+        )
         if self.busy and command_name not in BUSY_COMMANDS:
             self.notify(
-                "当前任务仍在运行；草稿已保留。可按 Ctrl+C 停止。",
+                "当前任务仍在运行；草稿已保留。可按Ctrl+C停止。",
                 severity="warning",
                 markup=False,
             )
             return
+        if self._command_running:
+            self.notify(
+                "上一条命令仍在执行；草稿已保留。",
+                severity="warning",
+                markup=False,
+            )
+            return
+        self._record_input_history(event.value)
         composer.text = ""
         self.query_one("#command-hints", Static).display = False
-        if event.value == "/exit":
+        if command_name == "/exit":
             self.exit()
             return
         if self.busy and command_name == "/stop":
@@ -805,9 +880,10 @@ class SJTUClawTUI(App[None]):
     @work(exclusive=True, group="turn")
     async def execute_turn(self, message: str) -> None:
         if self.busy:
-            self.notify("当前 Session 仍在运行，可按 Ctrl+C 停止。", severity="warning")
+            self.notify("当前 Session 仍在运行，可按Ctrl+C停止。", severity="warning")
             return
         self.busy = True
+        self._refresh_run_state()
         self._turn_base_message_count = len(
             self.runtime.messages(self.current_session_id)
         )
@@ -862,7 +938,7 @@ class SJTUClawTUI(App[None]):
                     break
                 await self._render_transcript()
             self._ephemeral_messages.clear()
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - runtime boundary
             detail = getattr(exc, "detail", str(exc))
             self._ephemeral_messages.append(
                 {"role": "assistant", "content": f"**运行失败**\n\n{detail}"}
@@ -907,25 +983,35 @@ class SJTUClawTUI(App[None]):
             }
         )
 
-    @work(exclusive=True, group="command")
-    async def execute_command(self, command: str) -> None:
-        command_name = command.partition(" ")[0]
+    def execute_command(self, command: str):
+        """Start one command without cancelling an earlier mutating command."""
+        if self._command_running:
+            self.notify(
+                "上一条命令仍在执行，请等待完成。",
+                severity="warning",
+                markup=False,
+            )
+            return None
+        self._command_running = True
+        try:
+            return self._execute_command(command)
+        except Exception:
+            self._command_running = False
+            raise
+
+    @work(group="command")
+    async def _execute_command(self, command: str) -> None:
+        command_name = command.partition(" ")[0].lower()
         if self.busy and command_name not in BUSY_COMMANDS:
             self.notify("任务运行中；当前仅建议使用 /stop 或处理审批。", severity="warning")
+            self._command_running = False
             return
-        if self.busy:
-            try:
+        try:
+            if self.busy:
                 response = await self.runtime.command(
                     self.current_session_id,
                     command,
                 )
-            except Exception as exc:
-                self.notify(
-                    f"命令失败：{getattr(exc, 'detail', str(exc))}",
-                    severity="error",
-                    markup=False,
-                )
-            else:
                 result = str(response.get("result") or "审批状态已刷新。")
                 self.notify(
                     result[:500],
@@ -934,33 +1020,60 @@ class SJTUClawTUI(App[None]):
                     markup=False,
                 )
                 self._refresh_approvals()
-            return
-        self._ephemeral_messages = [{"role": "user", "content": command}]
-        await self._render_transcript()
-        try:
+                return
+
+            self._ephemeral_messages = [{"role": "user", "content": command}]
+            await self._render_transcript()
             response = await self.runtime.command(self.current_session_id, command)
             switch_to = response.get("switchToSessionId")
+            actions = set(response.get("actions") or ())
+            if not switch_to and "clear_session" in actions:
+                sessions = self.runtime.list_sessions()
+                switch_to = (
+                    str(sessions[0]["sessionId"])
+                    if sessions
+                    else self.runtime.ensure_session()
+                )
             if switch_to:
-                self.current_session_id = switch_to
+                self.current_session_id = str(switch_to)
                 self._ephemeral_messages.clear()
             else:
                 self._ephemeral_messages.append(
-                    {"role": "assistant", "content": response.get("result", "")}
+                    {
+                        "role": "assistant",
+                        "content": str(response.get("result") or ""),
+                    }
                 )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - command runtime boundary
             detail = getattr(exc, "detail", str(exc))
-            self._ephemeral_messages.append(
-                {"role": "assistant", "content": f"**命令失败**\n\n{detail}"}
-            )
-            self.notify(str(detail), severity="error", markup=False)
-        await self.refresh_all(keep_ephemeral=True)
-        self.query_one("#composer", Composer).focus()
+            if self.busy:
+                self.notify(
+                    f"命令失败：{detail}",
+                    severity="error",
+                    markup=False,
+                )
+            else:
+                self._ephemeral_messages.append(
+                    {
+                        "role": "assistant",
+                        "content": f"**命令失败**\n\n{detail}",
+                    }
+                )
+                self.notify(str(detail), severity="error", markup=False)
+        finally:
+            self._command_running = False
+            try:
+                if not self.busy:
+                    await self.refresh_all(keep_ephemeral=True)
+            finally:
+                if self.is_mounted:
+                    self.query_one("#composer", Composer).focus()
 
     @work(exclusive=True, group="session-refresh")
     async def refresh_session(self) -> None:
         try:
             await self.refresh_all(keep_ephemeral=bool(self._ephemeral_messages))
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - refresh boundary
             self.notify(
                 f"刷新失败：{getattr(exc, 'detail', str(exc))}",
                 severity="error",
@@ -974,6 +1087,7 @@ class SJTUClawTUI(App[None]):
     @on(Composer.Changed, "#composer")
     def composer_changed(self, event: Composer.Changed) -> None:
         value = event.text_area.text.strip()
+        command_prefix = value.lower()
         hints = self.query_one("#command-hints", Static)
         if (
             not value.startswith("/")
@@ -987,7 +1101,7 @@ class SJTUClawTUI(App[None]):
         self._command_matches = [
             (command, description)
             for command, description in COMMANDS
-            if command.startswith(value)
+            if command.startswith(command_prefix)
         ]
         self._command_index = 0
         if not self._command_matches:
@@ -1050,19 +1164,20 @@ class SJTUClawTUI(App[None]):
 
     @on(Button.Pressed)
     def approval_button(self, event: Button.Pressed) -> None:
-        button_id = event.button.id or ""
+        approval_id = event.button.name or ""
         try:
-            if button_id.startswith("approve-"):
-                approval_id = button_id.removeprefix("approve-")
-                if self.runtime.approve(approval_id):
-                    self.notify("操作已批准。", severity="information")
-                    self._refresh_approvals()
-            elif button_id.startswith("reject-"):
-                approval_id = button_id.removeprefix("reject-")
-                if self.runtime.reject(approval_id, "用户在 TUI 中拒绝"):
-                    self.notify("操作已拒绝。", severity="warning")
-                    self._refresh_approvals()
-        except Exception as exc:
+            if event.button.has_class("approval-approve") and self.runtime.approve(
+                approval_id
+            ):
+                self.notify("操作已批准。", severity="information")
+                self._refresh_approvals()
+            elif event.button.has_class("approval-reject") and self.runtime.reject(
+                approval_id,
+                "用户在 TUI 中拒绝",
+            ):
+                self.notify("操作已拒绝。", severity="warning")
+                self._refresh_approvals()
+        except Exception as exc:  # noqa: BLE001 - approval runtime boundary
             self.notify(
                 f"审批操作失败：{getattr(exc, 'detail', str(exc))}",
                 severity="error",
@@ -1094,7 +1209,7 @@ class SJTUClawTUI(App[None]):
         was_busy = self.busy
         try:
             self.runtime.stop(self.current_session_id)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - stop runtime boundary
             self.notify(
                 f"停止失败：{getattr(exc, 'detail', str(exc))}",
                 severity="error",
@@ -1109,7 +1224,14 @@ class SJTUClawTUI(App[None]):
         )
 
     def action_escape(self) -> None:
-        self.query_one("#composer", Composer).focus()
+        composer = self.query_one("#composer", Composer)
+        hints = self.query_one("#command-hints", Static)
+        if hints.display:
+            self._command_matches = []
+            self._command_index = 0
+            composer.completion = ""
+            hints.display = False
+        composer.focus()
 
     def _handle_board_result(self, result: str | None) -> None:
         if not result:
@@ -1144,11 +1266,11 @@ class SJTUClawTUI(App[None]):
             composer.insert(command + " ")
         composer.focus()
 
-    @work(exclusive=True, group="cron-run")
+    @work(group="cron-run")
     async def run_cron_now(self, job_id: str) -> None:
         try:
             ok = await self.runtime.trigger_cron(job_id)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - cron runtime boundary
             self.notify(
                 f"Cron 运行失败：{getattr(exc, 'detail', str(exc))}",
                 severity="error",

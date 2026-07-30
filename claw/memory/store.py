@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import json
 import re
-import shutil
 import threading
 import uuid
 from dataclasses import dataclass, field, replace
@@ -168,8 +167,7 @@ def _format_yaml_frontmatter(meta: dict) -> str:
                 lines.append(f"{k}: []")
             else:
                 lines.append(f"{k}:")
-                for item in v:
-                    lines.append(f"  - {item}")
+                lines.extend(f"  - {item}" for item in v)
         elif isinstance(v, int):
             lines.append(f"{k}: {v}")
         elif isinstance(v, str) and v:
@@ -244,11 +242,11 @@ class MemoryEntry:
         # Normalise tags
         seen: set[str] = set()
         norm: list[str] = []
-        for t in self.tags:
-            t = t.strip().lower()
-            if t and t not in seen:
-                seen.add(t)
-                norm.append(t)
+        for tag in self.tags:
+            normalized_tag = tag.strip().lower()
+            if normalized_tag and normalized_tag not in seen:
+                seen.add(normalized_tag)
+                norm.append(normalized_tag)
         self.tags = sorted(norm)
 
     # -- serialisation (frontmatter dict + body) -----------------------------

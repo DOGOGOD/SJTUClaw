@@ -73,6 +73,23 @@ def test_rejects_invalid_skill_content(tmp_path, monkeypatch):
         management.validate_skill_package_bytes(data, "bad.zip")
 
 
+def test_rejects_oversized_zip_member_before_integrity_decompression(monkeypatch):
+    from claw.skills import management
+
+    data = _zip_bytes({
+        "demo-skill/SKILL.md": _skill_md(),
+        "demo-skill/assets/large.txt": b"x" * (management.MAX_FILE_BYTES + 1),
+    })
+
+    def must_not_decompress(_archive):
+        raise AssertionError("testzip ran before declared size validation")
+
+    monkeypatch.setattr(zipfile.ZipFile, "testzip", must_not_decompress)
+
+    with pytest.raises(management.SkillPackageError, match="单个文件超过"):
+        management.validate_skill_package_bytes(data, "oversized.zip")
+
+
 def test_rejects_existing_categorized_skill_without_replace(tmp_path, monkeypatch):
     from claw.skills import management
 

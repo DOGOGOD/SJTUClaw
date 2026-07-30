@@ -94,6 +94,21 @@
   input.api-key-input::-ms-reveal,
   input.api-key-input::-ms-clear { display: none; }
   ::selection { background: hsl(var(--primary) / 0.18); }
+
+  /* The browser inherits the OS checkbox palette, which can make an
+     unchecked control look black even while the app is in light mode. */
+  html:not(.dark) input.theme-checkbox:not(:checked) {
+    -webkit-appearance: none;
+    appearance: none;
+    border: 1px solid hsl(var(--input));
+    background-color: hsl(var(--card) / 0.72);
+    box-shadow: inset 0 1px 0 hsl(var(--card) / 0.9);
+  }
+
+  html:not(.dark) input.theme-checkbox:not(:checked):hover:not(:disabled) {
+    border-color: hsl(var(--primary) / 0.55);
+    background-color: hsl(var(--card) / 0.92);
+  }
 }
 
 .font-display {

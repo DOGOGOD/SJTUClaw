@@ -20,7 +20,7 @@ Helpers that previously took 6+ parameters can now accept a single
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 from claw.agent.budget import IterationBudget
 from claw.agent.metrics import TurnMetrics
@@ -44,7 +44,7 @@ class TurnContext:
 
     # -- Budget + metrics (created per-turn) --
     budget: IterationBudget = field(default_factory=IterationBudget)
-    metrics: TurnMetrics = field(default_factory=lambda: TurnMetrics())
+    metrics: TurnMetrics = field(default_factory=TurnMetrics)
 
     # -- Recovery flags --
     llm_retry_used: bool = False

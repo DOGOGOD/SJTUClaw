@@ -133,6 +133,31 @@ def test_qq_hello_clamps_untrusted_heartbeat_interval():
     assert asyncio.run(exercise()) == 0.8
 
 
+def test_qq_dispatch_keeps_background_tasks_alive_until_completion():
+    from claw.channels.qq import QQChannel, QQConfig
+
+    async def exercise():
+        channel = QQChannel(QQConfig())
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def identify():
+            started.set()
+            await release.wait()
+
+        channel._send_identify = identify
+        channel._dispatch_payload({"op": 10, "d": {}})
+        await started.wait()
+        assert len(channel._background_tasks) == 1
+
+        release.set()
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert not channel._background_tasks
+
+    asyncio.run(exercise())
+
+
 def test_qq_connect_reuses_socket_opened_by_reconnect():
     from claw.channels.qq import QQChannel, QQConfig
 

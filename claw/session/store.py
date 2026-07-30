@@ -19,7 +19,6 @@ import errno
 import json
 import os
 import re
-import shutil
 import threading
 import time
 import uuid
@@ -120,10 +119,11 @@ def _text_preview(content: Any, max_chars: int = _SESSION_PREVIEW_MAX_CHARS) -> 
     if isinstance(content, str):
         text = content
     elif isinstance(content, list):
-        parts = []
-        for block in content:
-            if isinstance(block, dict) and block.get("type") == "text":
-                parts.append(str(block.get("text", "")))
+        parts = [
+            str(block.get("text", ""))
+            for block in content
+            if isinstance(block, dict) and block.get("type") == "text"
+        ]
         text = " ".join(parts)
     else:
         return ""
@@ -243,7 +243,7 @@ class SessionStore:
                 if entry.is_dir():
                     legacy = entry / _LEGACY_FILE_NAME
                     if legacy.exists():
-                        self._migrate_legacy(legacy, entry.name)
+                        self._migrate_legacy(legacy)
                 continue
 
             try:
@@ -277,11 +277,11 @@ class SessionStore:
         try:
             with open(path, "r", encoding="utf-8") as f:
                 for line in f:
-                    line = line.strip()
-                    if not line:
+                    stripped_line = line.strip()
+                    if not stripped_line:
                         continue
                     try:
-                        data = json.loads(line)
+                        data = json.loads(stripped_line)
                     except json.JSONDecodeError:
                         skipped += 1
                         continue
@@ -369,7 +369,7 @@ class SessionStore:
     # Legacy migration (old session.json → JSONL)
     # ------------------------------------------------------------------
 
-    def _migrate_legacy(self, legacy_path: Path, dir_name: str) -> None:
+    def _migrate_legacy(self, legacy_path: Path) -> None:
         """Migrate an old ``session.json`` subdirectory to JSONL."""
         try:
             raw = legacy_path.read_text(encoding="utf-8")
@@ -702,8 +702,8 @@ class SessionStore:
         """Re-save every cached session with fsync. Returns count flushed."""
         flushed = 0
         with self._cache_lock:
-            cached = list(self._cache.items())
-        for key, session in cached:
+            cached = list(self._cache.values())
+        for session in cached:
             try:
                 self.save(session, fsync=True)
                 flushed += 1
@@ -791,9 +791,11 @@ class SessionStore:
         restored: list[Message] = []
         if isinstance(assistant_msg, dict):
             restored.append(Message.from_jsonl_dict(assistant_msg))
-        for tr in completed_tool_results:
-            if isinstance(tr, dict):
-                restored.append(Message.from_jsonl_dict(tr))
+        restored.extend(
+            Message.from_jsonl_dict(tool_result)
+            for tool_result in completed_tool_results
+            if isinstance(tool_result, dict)
+        )
         for tc in pending_tool_calls:
             if not isinstance(tc, dict):
                 continue
@@ -815,7 +817,7 @@ class SessionStore:
             restored_slice = restored[:size]
             if all(
                 _msg_key(left) == _msg_key(right)
-                for left, right in zip(existing, restored_slice)
+                for left, right in zip(existing, restored_slice, strict=True)
             ):
                 overlap = size
                 break

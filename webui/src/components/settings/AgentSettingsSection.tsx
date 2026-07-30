@@ -6,6 +6,7 @@ import {
 } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { fetchAgentSettings, saveAgentSettings } from "@/lib/api";
 import type {
@@ -299,8 +300,7 @@ export function AgentSettingsSection() {
               </select>
             </div>
             <label className="flex items-center gap-2 self-end pb-2 text-sm">
-              <input
-                type="checkbox"
+              <Checkbox
                 checked={settings.piTrustTools}
                 onChange={(event) => setSettings({ ...settings, piTrustTools: event.target.checked })}
               />
@@ -338,8 +338,7 @@ export function AgentSettingsSection() {
               </select>
             </div>
             <label className="flex items-center gap-2 text-sm md:col-span-2">
-              <input
-                type="checkbox"
+              <Checkbox
                 checked={settings.claudeTrustTools}
                 onChange={(event) => setSettings({ ...settings, claudeTrustTools: event.target.checked })}
               />

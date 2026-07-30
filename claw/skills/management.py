@@ -249,14 +249,17 @@ def find_skill_dir(name: str) -> Path | None:
 def _validate_zip(data: bytes) -> ValidatedPackage:
     try:
         with zipfile.ZipFile(io.BytesIO(data)) as zf:
-            bad = zf.testzip()
-            if bad:
-                raise SkillPackageError(f"压缩包完整性校验失败: {bad}")
             members = [
                 PackageMember(info.filename, int(info.file_size), info.is_dir())
                 for info in zf.infolist()
             ]
             _validate_members(members)
+            # Validate declared sizes before testzip() decompresses every file.
+            # This keeps malformed or bomb-like archives within the configured
+            # per-file and total expansion limits.
+            bad = zf.testzip()
+            if bad:
+                raise SkillPackageError(f"压缩包完整性校验失败: {bad}")
             skill_md_name = _find_skill_md_member(members)
             raw = zf.read(skill_md_name).decode("utf-8")
             return _validate_skill_md(raw, members, skill_md_name)
@@ -274,6 +277,10 @@ def _validate_tar(data: bytes) -> ValidatedPackage:
                 if info.issym() or info.islnk() or info.isdev():
                     raise SkillPackageError("压缩包不能包含符号链接、硬链接或设备文件")
                 members.append(PackageMember(info.name, int(info.size), info.isdir()))
+                if not info.isdir():
+                    # Fail immediately after reading a member header instead
+                    # of traversing the rest of an oversized compressed TAR.
+                    _validate_members(members)
             _validate_members(members)
             skill_md_name = _find_skill_md_member(members)
             extracted = tf.extractfile(skill_md_name)

@@ -8,7 +8,7 @@ import { SettingsView } from "@/components/settings/SettingsView";
 import { ThemeProvider, useTheme } from "@/hooks/useTheme";
 import { PetSelectionProvider, usePetSelection } from "@/contexts/PetSelectionContext";
 import { useSessions } from "@/hooks/useSessions";
-import { cn, escapeMarkdownImageAlt } from "@/lib/utils";
+import { escapeMarkdownImageAlt } from "@/lib/utils";
 import { isPetSelectionCommand, isSlashCommand } from "@/lib/commands";
 import { messagesAfterCommandRefresh, resolveCommandNavigation } from "@/lib/commandState";
 import { fetchMessages, sendMessage, sendCommand, stopChat, uploadAttachment, renameSession, fetchApprovals, approveApproval, rejectApproval, previewRollback, applyRollback, setWorkspace } from "@/lib/api";
@@ -16,7 +16,6 @@ import type { AgentBackend, ApprovalInfo } from "@/lib/types";
 import type { ChatMessage, SettingsSection, ShellView } from "@/lib/types";
 
 const SIDEBAR_WIDTH = 288;
-const SIDEBAR_COLLAPSED_WIDTH = 0;
 
 function responseBackend(value: { agentBackend?: AgentBackend; piMode?: boolean }): AgentBackend | undefined {
   return value.agentBackend ?? (value.piMode ? "pi" : undefined);

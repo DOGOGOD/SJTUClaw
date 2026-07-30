@@ -1,5 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { fetchSessions, sendMessage, uploadPet } from "./api";
+import {
+  createSession,
+  fetchSessions,
+  sendMessage,
+  streamChat,
+  uploadPet,
+} from "./api";
 
 function jsonResponse(body: unknown): Response {
   return {
@@ -49,6 +55,75 @@ describe("API request timeouts", () => {
 
     await vi.advanceTimersByTimeAsync(1_000);
     await expect(request).resolves.toMatchObject({ ok: true });
+  });
+});
+
+describe("API request freshness", () => {
+  it("does not reuse an older pending GET after a mutation", async () => {
+    let resolveFirstGet: ((response: Response) => void) | undefined;
+    let getCount = 0;
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(
+      (_input, init) => {
+        if (init?.method === "POST") {
+          return Promise.resolve(
+            jsonResponse({ ok: true, sessionId: "new-session", title: "新会话" }),
+          );
+        }
+        getCount += 1;
+        if (getCount === 1) {
+          return new Promise<Response>((resolve) => {
+            resolveFirstGet = resolve;
+          });
+        }
+        return Promise.resolve(
+          jsonResponse({
+            ok: true,
+            sessions: [{ sessionId: "new-session", title: "新会话" }],
+          }),
+        );
+      },
+    );
+
+    const older = fetchSessions();
+    await createSession();
+    const fresh = fetchSessions();
+
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    await expect(fresh).resolves.toMatchObject({
+      sessions: [{ sessionId: "new-session" }],
+    });
+
+    resolveFirstGet?.(jsonResponse({ ok: true, sessions: [] }));
+    await older;
+  });
+
+  it("flushes a final split UTF-8 SSE event without a trailing newline", async () => {
+    const payload = 'data: {"type":"final","content":"猫"}';
+    const bytes = new TextEncoder().encode(payload);
+    const splitAt = bytes.indexOf(0xe7) + 1;
+    const reader = {
+      read: vi.fn()
+        .mockResolvedValueOnce({ done: false, value: bytes.slice(0, splitAt) })
+        .mockResolvedValueOnce({ done: false, value: bytes.slice(splitAt) })
+        .mockResolvedValueOnce({ done: true, value: undefined }),
+    };
+    vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: true,
+      status: 200,
+      body: { getReader: () => reader },
+    } as unknown as Response);
+    const events: Array<{ type: string; content: string }> = [];
+
+    await new Promise<void>((resolve, reject) => {
+      streamChat(
+        { sessionId: "session-a", message: "hi" },
+        (event) => events.push(event as { type: string; content: string }),
+        reject,
+        resolve,
+      );
+    });
+
+    expect(events).toEqual([{ type: "final", content: "猫" }]);
   });
 });
 

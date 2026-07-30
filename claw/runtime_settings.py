@@ -10,10 +10,10 @@ import json
 import os
 import threading
 import uuid
-from pathlib import Path
 from typing import Any
 
 from cryptography.fernet import Fernet, InvalidToken
+from filelock import FileLock
 from claw.paths import data_dir, resource_root
 
 PROJECT_ROOT = resource_root()
@@ -34,15 +34,26 @@ _settings_lock = threading.RLock()
 def _fernet() -> Fernet:
     with _settings_lock:
         SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
-        if KEY_PATH.exists():
-            key = KEY_PATH.read_bytes().strip()
-        else:
-            key = Fernet.generate_key()
-            KEY_PATH.write_bytes(key)
-            try:
-                os.chmod(KEY_PATH, 0o600)
-            except OSError:
-                pass
+        with FileLock(str(KEY_PATH) + ".lock", timeout=10):
+            if KEY_PATH.exists():
+                key = KEY_PATH.read_bytes().strip()
+            else:
+                key = Fernet.generate_key()
+                tmp = KEY_PATH.with_name(
+                    f".{KEY_PATH.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+                )
+                try:
+                    with tmp.open("xb") as stream:
+                        stream.write(key)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    try:
+                        os.chmod(tmp, 0o600)
+                    except OSError:
+                        pass
+                    os.replace(tmp, KEY_PATH)
+                finally:
+                    tmp.unlink(missing_ok=True)
     return Fernet(key)
 
 
@@ -80,19 +91,20 @@ def load_runtime_settings(decrypt_secrets: bool = True) -> dict[str, str]:
 def update_runtime_settings(updates: dict[str, Any]) -> dict[str, str]:
     """Merge settings into the encrypted runtime settings file."""
     with _settings_lock:
-        SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
-        current = load_runtime_settings_raw()
+        with _runtime_settings_file_lock():
+            SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
+            current = load_runtime_settings_raw()
 
-        for key, value in updates.items():
-            normalized = "" if value is None else str(value).strip()
-            if key in SECRET_KEYS:
-                if normalized:
-                    current[key] = _encrypt(normalized)
-            else:
-                current[key] = normalized
+            for key, value in updates.items():
+                normalized = "" if value is None else str(value).strip()
+                if key in SECRET_KEYS:
+                    if normalized:
+                        current[key] = _encrypt(normalized)
+                else:
+                    current[key] = normalized
 
-        _write_runtime_settings_raw(current)
-        return load_runtime_settings(decrypt_secrets=True)
+            _write_runtime_settings_raw(current)
+            return load_runtime_settings(decrypt_secrets=True)
 
 
 def load_runtime_settings_raw() -> dict[str, Any]:
@@ -110,16 +122,29 @@ def load_runtime_settings_raw() -> dict[str, Any]:
 def replace_runtime_settings_raw(payload: dict[str, Any]) -> None:
     """Replace the encrypted settings payload exactly, for rollback."""
     with _settings_lock:
-        SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
-        _write_runtime_settings_raw(payload)
+        with _runtime_settings_file_lock():
+            SETTINGS_DIR.mkdir(parents=True, exist_ok=True)
+            _write_runtime_settings_raw(payload)
+
+
+def _runtime_settings_file_lock() -> FileLock:
+    """Return a lock bound to the currently configured settings path."""
+    return FileLock(str(SETTINGS_PATH) + ".lock", timeout=10)
 
 
 def _write_runtime_settings_raw(payload: dict[str, Any]) -> None:
     """Atomically write settings without sharing a temporary filename."""
     tmp = SETTINGS_PATH.with_name(f".{SETTINGS_PATH.name}.{uuid.uuid4().hex}.tmp")
     try:
-        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp.replace(SETTINGS_PATH)
+        with tmp.open("x", encoding="utf-8") as stream:
+            json.dump(payload, stream, ensure_ascii=False, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp, SETTINGS_PATH)
     finally:
         tmp.unlink(missing_ok=True)
 

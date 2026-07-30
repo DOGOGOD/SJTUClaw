@@ -9,8 +9,6 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from pathlib import Path
-
 from dotenv import load_dotenv
 from claw.paths import data_dir, env_example_path, env_path, main_dir, resource_root
 

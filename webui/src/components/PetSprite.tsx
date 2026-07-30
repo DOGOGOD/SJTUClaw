@@ -16,8 +16,6 @@ import { cn } from "@/lib/utils";
  */
 
 // ---- spritesheet 布局（与 claw/pet/app.py 一致）----
-const CELL_WIDTH = 192;
-const CELL_HEIGHT = 208;
 const SHEET_COLS = 8;
 
 // ---- 显示尺寸（缩放到适合 WebUI 首页的大小）----

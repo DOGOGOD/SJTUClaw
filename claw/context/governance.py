@@ -50,9 +50,7 @@ from typing import Any
 
 
 
-from claw.context.token_counter import count_tokens, count_tokens_for_messages
-
-from claw.session.models import Message
+from claw.context.token_counter import count_tokens
 
 
 
@@ -67,8 +65,6 @@ from claw.session.models import Message
 SNIP_SAFETY_BUFFER = 1024
 
 INFLIGHT_COMPACT_TARGET_RATIO = 0.85
-
-MICROCOMPACT_KEEP_RECENT = 10
 
 MICROCOMPACT_MIN_CHARS = 500
 
@@ -332,7 +328,7 @@ class ContextGovernor:
 
             calls = msg.get("tool_calls")
 
-            if not calls:
+            if calls is None or calls == []:
 
                 if updated is not None:
 
@@ -340,9 +336,13 @@ class ContextGovernor:
 
                 continue
 
-            kept = [tc for tc in calls if _tool_call_name_is_valid(tc)]
+            kept = (
+                [tc for tc in calls if _tool_call_name_is_valid(tc)]
+                if isinstance(calls, list)
+                else []
+            )
 
-            if len(kept) == len(calls):
+            if isinstance(calls, list) and len(kept) == len(calls):
 
                 if updated is not None:
 
@@ -412,7 +412,7 @@ class ContextGovernor:
 
                 tid = msg.get("tool_call_id")
 
-                if tid and str(tid) not in declared:
+                if not tid or str(tid) not in declared:
 
                     if updated is None:
 
@@ -748,11 +748,9 @@ class ContextGovernor:
 
             return []
 
-        primary_count = max(0, len(compactable) - MICROCOMPACT_KEEP_RECENT)
-
-        # Keep newest uncompacted; compact oldest first.
-
-        return compactable[:primary_count] + compactable[primary_count:]
+        # Candidates are already ordered oldest-first. The compaction loop
+        # preserves the newest result whenever the hard budget allows it.
+        return compactable
 
 
 

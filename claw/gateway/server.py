@@ -27,7 +27,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -36,9 +36,6 @@ from pydantic import BaseModel, Field
 from claw.agent.events import (
     ErrorEvent,
     FinalEvent,
-    ThinkingEvent,
-    ToolCallEndEvent,
-    ToolCallStartEvent,
     TurnEvent,
 )
 from claw.agent.loop import run_agent_turn
@@ -1766,7 +1763,7 @@ async def _run_explicit_skill_command(
                 _set_turn_session_id(None)
 
         reply = await asyncio.to_thread(_run)
-    except Exception as exc:
+    except Exception:
         failed = True
         logger.exception(
             "Gateway 显式 skill 调用失败: session=%s skill=%s",
@@ -2723,10 +2720,10 @@ def get_system_prompt():
 
 @app.put("/admin/system-prompt")
 def update_system_prompt(req: UpdateContentRequest):
+    global _system_prompt
     with _PROMPT_UPDATE_LOCK:
         _write_prompt_file("system_prompt.md", req.content)
-        import claw.gateway.server as _srv
-        _srv.__dict__["_system_prompt"] = req.content
+        _system_prompt = req.content
         _context_builder.update_system_prompt(req.content)
     return {"ok": True}
 
@@ -2738,10 +2735,10 @@ def get_soul():
 
 @app.put("/admin/soul")
 def update_soul(req: UpdateContentRequest):
+    global _soul
     with _PROMPT_UPDATE_LOCK:
         _write_prompt_file("soul.md", req.content)
-        import claw.gateway.server as _srv
-        _srv.__dict__["_soul"] = req.content
+        _soul = req.content
         _context_builder.update_soul(req.content)
     return {"ok": True}
 
@@ -2767,12 +2764,12 @@ def delete_session(session_id: str):
         _session_store.delete(session_id)
         try:
             _rollback_manager.disable(session_id)
-        except (RollbackError, OSError) as exc:
+        except (RollbackError, OSError):
             cleanup_warnings.append("回退数据清理失败，请查看 Gateway 日志。")
             logger.exception("删除 session 后清理回退数据失败: %s", session_id)
         try:
             _workspace_manager.unset(session_id)
-        except (WorkspaceError, OSError) as exc:
+        except (WorkspaceError, OSError):
             cleanup_warnings.append("workspace 绑定清理失败，请查看 Gateway 日志。")
             logger.exception("删除 session 后清理 workspace 失败: %s", session_id)
         finally:
@@ -2788,7 +2785,7 @@ def delete_session(session_id: str):
     if att_dir.exists():
         try:
             shutil.rmtree(str(att_dir))
-        except OSError as exc:
+        except OSError:
             cleanup_warnings.append("附件清理失败，请查看 Gateway 日志。")
             logger.exception("删除 session 后清理附件失败: %s", session_id)
     return {"ok": True, "warnings": cleanup_warnings}
@@ -3708,7 +3705,6 @@ async def poll_qq_onboard(task_id: str):
 @app.get("/qq/status")
 def qq_status():
     """Get QQ channel status."""
-    global _qq_channel
     if _qq_channel is None:
         return {
             "ok": True,
@@ -3731,10 +3727,14 @@ def qq_status():
 
 def _event_to_sse(event: TurnEvent) -> str:
     """Serialize a TurnEvent to an SSE data line."""
-    data = {"type": type(event).__name__}
-    for field_name, value in event.__dict__.items():
-        if value is not None and value != "" and value != [] and value != {}:
-            data[field_name] = value
+    data = {
+        "type": type(event).__name__,
+        **{
+            field_name: value
+            for field_name, value in event.__dict__.items()
+            if value is not None and value != "" and value != [] and value != {}
+        },
+    }
     return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
@@ -3825,7 +3825,7 @@ async def handle_chat_stream(req: ChatRequest):
         _update_cron_context(sid, req.session_id or "default")
         _pet_state.start_turn(sid, req.message)
         try:
-            reply = run_agent_turn(
+            run_agent_turn(
                 sid,
                 req.message,
                 session_store=_session_store,

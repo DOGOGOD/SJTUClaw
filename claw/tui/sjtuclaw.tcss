@@ -1,10 +1,8 @@
 $bg: #100e12;
 $surface: #171419;
-$raised: #1e1a20;
 $line: #302a33;
 $line-soft: #242027;
 $text: #eee8e2;
-$muted: #837b87;
 $red: #d83950;
 $red-bright: #f04f65;
 $gold: #e8ad52;
@@ -13,6 +11,27 @@ $green: #4bc69b;
 Screen {
     background: $bg;
     color: $text;
+}
+
+/* Textual otherwise reserves 60 columns even for a very short message. */
+Toast {
+    width: auto;
+    min-width: 0;
+    max-width: 80%;
+    padding: 1 2;
+    text-align: left;
+}
+
+Toast.-information {
+    border-left: solid $green;
+}
+
+Toast.-warning {
+    border-left: solid $gold;
+}
+
+Toast.-error {
+    border-left: solid $red;
 }
 
 #brand-header {
@@ -131,6 +150,14 @@ Screen {
     border-left: solid #397f75;
 }
 
+.message-card.role-tool-request {
+    margin-left: 2;
+    max-width: 118;
+    padding: 0 1;
+    background: #161419;
+    border-left: solid #6f5b89;
+}
+
 .message-role {
     height: 1;
     margin-bottom: 0;
@@ -141,6 +168,11 @@ Screen {
 .role-user .message-role { color: $red-bright; }
 .role-assistant .message-role { color: $gold; }
 .role-tool .message-role { color: #5fc6b5; }
+.role-tool-request .message-role { color: #b49bd6; }
+
+.tool-call-body {
+    color: #bdb2ca;
+}
 
 .message-body {
     width: 100%;
@@ -267,16 +299,28 @@ Screen {
     max-height: 13;
 }
 
-#approval-list {
-    height: 1fr;
+#inline-approval-list {
+    display: none;
+    width: 100%;
+    height: auto;
+    max-height: 14;
+    margin: 0 0 0 4;
+    padding: 0;
+    background: $bg;
+    scrollbar-size: 1 1;
+}
+
+#inline-approval-list.has-approvals {
+    display: block;
 }
 
 .approval-card {
     height: auto;
     margin-bottom: 1;
-    padding: 1;
-    background: #291e1c;
-    border: solid #70513d;
+    padding: 1 2;
+    background: #1c1819;
+    border: none;
+    border-left: thick $gold;
 }
 
 .approval-title {
@@ -286,24 +330,23 @@ Screen {
 
 .approval-detail {
     height: auto;
-    max-height: 7;
+    max-height: 8;
     margin: 1 0;
     color: #d4ccc5;
+    scrollbar-size: 1 1;
 }
 
 .approval-actions {
-    height: 3;
+    height: 1;
 }
 
 .approval-actions Button {
     width: 1fr;
-    min-width: 7;
-    height: 3;
+    min-width: 6;
+    height: 1;
     margin-right: 1;
-}
-
-.muted {
-    color: $muted;
+    padding: 0 1;
+    border: none;
 }
 
 #keybar {
@@ -516,8 +559,22 @@ Screen.compact #insight-rail {
     display: none;
 }
 
+Screen.compact #inline-approval-list .approval-card {
+    margin-bottom: 0;
+    padding: 0 1;
+}
+
+Screen.compact #inline-approval-list .approval-detail {
+    max-height: 3;
+    margin: 0;
+}
+
 Screen.narrow #transcript {
     padding: 1 0 0 1;
+}
+
+Screen.narrow #inline-approval-list {
+    margin-left: 1;
 }
 
 Screen.narrow #send-hint {
@@ -535,4 +592,8 @@ Screen.short #composer-shell {
 Screen.short #top-status {
     height: 2;
     padding-top: 0;
+}
+
+Screen.short #inline-approval-list {
+    max-height: 8;
 }

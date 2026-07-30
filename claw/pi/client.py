@@ -338,6 +338,26 @@ def _emit(callback: Callable[[Any], None] | None, event: Any) -> None:
         logger.exception("Pi 事件回调执行失败，已忽略")
 
 
+def _close_process_streams(
+    proc: subprocess.Popen,
+    reader_threads: Sequence[threading.Thread] = (),
+) -> None:
+    """Join pipe readers and close every parent-side subprocess stream."""
+    for thread in reader_threads:
+        thread.join(timeout=1)
+    for name in ("stdin", "stdout", "stderr"):
+        stream = getattr(proc, name, None)
+        if stream is None or getattr(stream, "closed", False):
+            continue
+        try:
+            stream.close()
+        except (OSError, ValueError):
+            pass
+    for thread in reader_threads:
+        if thread.is_alive():
+            thread.join(timeout=1)
+
+
 def _session_token(session_id: str, generation: str) -> str:
     digest = hashlib.sha256(f"{session_id}:{generation}".encode()).hexdigest()
     return f"sjtuclaw-{digest[:32]}"
@@ -393,9 +413,19 @@ class PiAgentClient(LLMClient):
             start_new_session=not _IS_WINDOWS,
         )
         stderr: list[str] = []
-        threading.Thread(target=self._collect_stderr, args=(proc, stderr), daemon=True).start()
+        stderr_thread = threading.Thread(
+            target=self._collect_stderr,
+            args=(proc, stderr),
+            daemon=True,
+        )
+        stderr_thread.start()
         events: queue.Queue[str | None] = queue.Queue()
-        threading.Thread(target=self._collect_stdout, args=(proc, events), daemon=True).start()
+        stdout_thread = threading.Thread(
+            target=self._collect_stdout,
+            args=(proc, events),
+            daemon=True,
+        )
+        stdout_thread.start()
         try:
             if proc.stdin is None:
                 raise PiError("Pi RPC 标准输入不可用。")
@@ -435,6 +465,8 @@ class PiAgentClient(LLMClient):
                     proc.wait(timeout=3)
                 except subprocess.TimeoutExpired:
                     proc.kill()
+                    proc.wait(timeout=3)
+            _close_process_streams(proc, (stdout_thread, stderr_thread))
 
     def _effective_config(self) -> PiRuntimeConfig:
         config = load_pi_config()
@@ -579,13 +611,19 @@ class PiAgentClient(LLMClient):
             start_new_session=not _IS_WINDOWS,
         )
         stderr: list[str] = []
-        threading.Thread(target=self._collect_stderr, args=(proc, stderr), daemon=True).start()
+        stderr_thread = threading.Thread(
+            target=self._collect_stderr,
+            args=(proc, stderr),
+            daemon=True,
+        )
+        stderr_thread.start()
         stdout_events: queue.Queue[str | None] = queue.Queue()
-        threading.Thread(
+        stdout_thread = threading.Thread(
             target=self._collect_stdout,
             args=(proc, stdout_events),
             daemon=True,
-        ).start()
+        )
+        stdout_thread.start()
         lock = threading.Lock()
 
         def send(payload):
@@ -613,7 +651,8 @@ class PiAgentClient(LLMClient):
         if images:
             payload["images"] = images
         send(payload)
-        threading.Thread(target=watch_cancel, daemon=True).start()
+        watcher_thread = threading.Thread(target=watch_cancel, daemon=True)
+        watcher_thread.start()
         deadline = time.monotonic() + config.turn_timeout_s
         accepted, streamed_text, last_assistant_text, last_error, settled = False, "", None, "", False
         tool_started_at: dict[str, float] = {}
@@ -734,12 +773,15 @@ class PiAgentClient(LLMClient):
             return final_text.strip() or "Pi 已完成本轮处理，但没有返回文本内容。"
         finally:
             watcher_stop.set()
+            watcher_thread.join(timeout=1)
             if proc.poll() is None:
                 proc.terminate()
                 try:
                     proc.wait(timeout=3)
                 except subprocess.TimeoutExpired:
                     proc.kill()
+                    proc.wait(timeout=3)
+            _close_process_streams(proc, (stdout_thread, stderr_thread))
 
     def _child_env(self, config: PiRuntimeConfig) -> dict[str, str]:
         env = os.environ.copy()

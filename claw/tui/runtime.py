@@ -11,10 +11,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, AsyncIterator
-
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -105,9 +105,12 @@ class LocalRuntime:
         response = await self.server.handle_chat_stream(request)
         buffer = ""
         async for chunk in response.body_iterator:
-            if isinstance(chunk, bytes):
-                chunk = chunk.decode("utf-8", errors="replace")
-            buffer += chunk
+            text = (
+                chunk.decode("utf-8", errors="replace")
+                if isinstance(chunk, bytes)
+                else chunk
+            )
+            buffer += text
             while "\n\n" in buffer:
                 packet, buffer = buffer.split("\n\n", 1)
                 for line in packet.splitlines():
@@ -158,7 +161,6 @@ class LocalRuntime:
                     "schedule": schedule_text,
                     "nextRun": self._format_ms(job.state.next_run_at_ms),
                     "lastStatus": job.state.last_status or "—",
-                    "message": job.payload.message,
                 }
             )
         return jobs

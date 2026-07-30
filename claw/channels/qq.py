@@ -29,7 +29,7 @@ import mimetypes
 import os
 import time
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Coroutine
 
 import aiohttp
 
@@ -158,6 +158,7 @@ class QQChannel(BaseChannel):
         self._http_client: Any = None  # httpx.AsyncClient for REST API (persistent)
         self._listen_task: asyncio.Task | None = None
         self._heartbeat_task: asyncio.Task | None = None
+        self._background_tasks: set[asyncio.Task[Any]] = set()
         self._heartbeat_interval: float = 30.0
         self._session_id: str | None = None
         self._last_seq: int | None = None
@@ -222,6 +223,12 @@ class QQChannel(BaseChannel):
             except asyncio.CancelledError:
                 pass
             self._listen_task = None
+        background_tasks = tuple(self._background_tasks)
+        for task in background_tasks:
+            task.cancel()
+        if background_tasks:
+            await asyncio.gather(*background_tasks, return_exceptions=True)
+        self._background_tasks.clear()
         if self._ws and not self._ws.closed:
             await self._ws.close()
         self._ws = None
@@ -233,6 +240,32 @@ class QQChannel(BaseChannel):
             await self._http_client.aclose()
             self._http_client = None
         logger.info("[%s] Stopped", self._log_tag)
+
+    def _spawn_background_task(
+        self,
+        coroutine: Coroutine[Any, Any, Any],
+        *,
+        operation: str,
+    ) -> asyncio.Task[Any]:
+        """Keep fire-and-forget work alive and surface unexpected failures."""
+        task = asyncio.create_task(coroutine)
+        self._background_tasks.add(task)
+
+        def _task_done(completed: asyncio.Task[Any]) -> None:
+            self._background_tasks.discard(completed)
+            if completed.cancelled():
+                return
+            error = completed.exception()
+            if error is not None:
+                logger.error(
+                    "[%s] Background task %s failed",
+                    self._log_tag,
+                    operation,
+                    exc_info=(type(error), error, error.__traceback__),
+                )
+
+        task.add_done_callback(_task_done)
+        return task
 
     # ------------------------------------------------------------------
     # Listen loop — persistent across reconnects
@@ -552,9 +585,15 @@ class QQChannel(BaseChannel):
             interval_ms = min(300_000.0, max(1_000.0, interval_ms))
             self._heartbeat_interval = interval_ms / 1000.0 * 0.8
             if self._session_id and self._last_seq is not None:
-                asyncio.create_task(self._send_resume())
+                self._spawn_background_task(
+                    self._send_resume(),
+                    operation="resume",
+                )
             else:
-                asyncio.create_task(self._send_identify())
+                self._spawn_background_task(
+                    self._send_identify(),
+                    operation="identify",
+                )
             return
 
         # op 0 = Dispatch
@@ -566,9 +605,15 @@ class QQChannel(BaseChannel):
                 "GROUP_AT_MESSAGE_CREATE",
                 "DIRECT_MESSAGE_CREATE",
             }:
-                asyncio.create_task(self._on_ws_event(t, d))
+                self._spawn_background_task(
+                    self._on_ws_event(t, d),
+                    operation=t,
+                )
             elif t == "INTERACTION_CREATE":
-                asyncio.create_task(self._on_interaction(d))
+                self._spawn_background_task(
+                    self._on_interaction(d),
+                    operation=t,
+                )
             return
 
         # op 11 = Heartbeat ACK
@@ -579,7 +624,10 @@ class QQChannel(BaseChannel):
         if op == 7:
             logger.info("[%s] Server requested reconnect", self._log_tag)
             if self._ws and not self._ws.closed:
-                asyncio.create_task(self._ws.close())
+                self._spawn_background_task(
+                    self._ws.close(),
+                    operation="server-requested-close",
+                )
             return
 
         # op 9 = Invalid Session
@@ -589,7 +637,10 @@ class QQChannel(BaseChannel):
                 self._session_id = None
                 self._last_seq = None
             if self._ws and not self._ws.closed:
-                asyncio.create_task(self._ws.close())
+                self._spawn_background_task(
+                    self._ws.close(),
+                    operation="invalid-session-close",
+                )
             return
 
     def _handle_ready(self, d: Any) -> None:

@@ -13,7 +13,6 @@ Key improvements over v3/v4:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 import uuid
 
 # ---------------------------------------------------------------------------

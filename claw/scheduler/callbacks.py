@@ -6,8 +6,6 @@ These are the handler functions called by CronService when system jobs fire.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
-
 from claw.scheduler.types import CronJob
 
 

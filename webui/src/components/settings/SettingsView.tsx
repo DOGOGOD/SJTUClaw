@@ -24,6 +24,7 @@ import {
 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { useAppDialog } from "@/components/ui/app-dialog";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/input";
 import { cn, formatTime } from "@/lib/utils";
@@ -953,12 +954,11 @@ function SkillsSection() {
           </div>
           <div className="flex flex-wrap items-center justify-between gap-3">
             <label className="flex min-w-0 items-center gap-2 text-xs text-muted-foreground">
-              <input
-                type="checkbox"
+              <Checkbox
                 checked={replace}
                 disabled={busy}
                 onChange={(e) => setReplace(e.target.checked)}
-                className="h-3.5 w-3.5 shrink-0 rounded border-border"
+                className="h-3.5 w-3.5"
               />
               <span className="leading-relaxed">同名 Skill 已存在时，先安全删除旧版本再安装</span>
             </label>

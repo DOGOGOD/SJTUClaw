@@ -1,6 +1,8 @@
 from pathlib import Path
 import sys
 
+import pytest
+
 from claw.sandbox import project_env_sync
 
 
@@ -78,3 +80,17 @@ def test_project_environment_restore_and_save_round_trip(
     project_env_sync.save(project, runtime)
 
     assert reads == []
+
+
+def test_write_bytes_cleans_up_temporary_file_when_write_stalls(
+    tmp_path,
+    monkeypatch,
+):
+    destination = tmp_path / "package.py"
+    monkeypatch.setattr(project_env_sync.os, "write", lambda _fd, _view: 0)
+
+    with pytest.raises(OSError, match="failed to make progress"):
+        project_env_sync._write_bytes(destination, b"content", 0o644, 0)
+
+    assert not destination.exists()
+    assert list(tmp_path.glob(".package.py.sjtuclaw-sync-*")) == []

@@ -2,451 +2,220 @@
 
 面向个人与教学场景的本地 AI Agent Runtime。
 
-SJTUClaw 将多轮对话、工具调用、长期记忆、Skill、定时任务和桌面宠物整合为一个可扩展的 Agent 工作台。项目提供 Windows 桌面应用、CLI、Web UI、REST API 和 QQ Bot 多种入口，适合学习 Agent Runtime，也适合搭建个人自动化助手。
+SJTUClaw 把多轮对话、工具调用、长期记忆、Skill、定时任务和桌面宠物整合到同一套运行时中，并提供 Windows 桌面应用、Web UI、TUI、CLI、REST API 与 QQ Bot。
 
-## 界面预览
+![SJTUClaw Web UI](docs/images/readme-webui.png)
 
-![SJTUClaw Web UI 首页](docs/images/readme-webui.png)
+## 主要能力
 
-![SJTUClaw 设置界面](docs/images/readme-settings.png)
+- 三种按 Session 切换的 Agent 后端：SJTUClaw 原生 Agent、Pi、Claude Code。
+- 18 个内置工具，覆盖文件、Shell、联网、记忆、Skill、Cron、附件和文件交付。
+- Session 持久化、自动标题、分叉、上下文压缩、长期记忆与每日 Reflection。
+- Workspace 路径边界、操作审批、AUTO / UNLIMITED 模式和可选 microsandbox microVM。
+- Workspace 回退：同时恢复工作区文件和会话分支。
+- Web UI 实时事件流、图片附件、生成文件下载、模型与 Agent 设置。
+- Cron、Heartbeat、QQ Bot 和桌面宠物等后台能力。
+- Windows 桌面打包与标准安装程序。
 
-![SJTUClaw 宠物功能设置](docs/images/readme-pet.png)
-
-## 核心功能
-
-- **统一 Agent Loop**：CLI、Web UI、QQ Bot、Heartbeat 和 Cron 共享 `run_agent_turn()`。
-- **可选 Pi Agent 后端**：通过官方 JSONL RPC 接入 Pi，保留其模型提供商、工具循环、Skills、Extensions、自动压缩、重试和持久会话，同时沿用 SJTUClaw 的界面、渠道与审批体验。
-- **可选 Claude Code 后端**：自动检索电脑中已安装的 Claude Code，保留原生 prompt，并沿用现有登录、模型、Skills、MCP 和权限配置，通过官方 `stream-json` 接口保留工具循环、持久会话、危险操作审批与停止控制。
-- **工具调用与安全审批**：支持文件读写、Shell、联网、下载、记忆、Skill 和 Cron 工具，并按安全级别控制执行。
-- **可选 microVM 沙箱**：原生 Agent 可通过 microsandbox 在 session 级 microVM 中共享文件与 Shell；未设置 workspace 时自动获得私有 `/workspace`，设置后只挂载明确绑定的目录。
-- **可控执行模式**：提供按 Session 隔离的 AUTO 与 UNLIMITED 模式，可在自动执行效率和文件系统安全边界之间明确切换。
-- **上下文与长期记忆**：支持 Session 持久化、上下文压缩、Markdown 记忆和每日 Reflection。
-- **Workspace 回退**：设置 workspace 后自动创建逐回合检查点，同时恢复文件和对话；未设置 workspace 时保持关闭。
-- **Skill 系统**：通过 `SKILL.md` 组织可复用工作流，支持发现、加载和管理。
-- **多入口与实时反馈**：Web UI 通过 SSE 展示 Agent 事件，QQ Bot 支持私聊、群聊和内联审批。
-- **多模态会话**：Web UI 支持粘贴或上传图片，每条消息最多 4 张、单张最多 20 MB；附件按 Session 隔离保存。
-- **输出文件交付**：Agent 可把 workspace 内的图片、Markdown、PDF、Office 文档、压缩包等注册为下载；Web UI 自动显示图片预览或文件下载按钮，只要源文件仍存在，链接即可跨时间和 Gateway 重启继续使用。
-- **本地化时间与定时任务**：自动识别系统时区，支持 `CLAW_TIMEZONE` 显式覆盖，识别失败时回退到上海时区。
-- **Windows 桌面应用**：使用 pywebview 承载完整 Web UI，通过 PyInstaller 打包后无需单独安装 Python 或 Node.js。
-- **标准安装与卸载体验**：使用 Inno Setup 7 生成安装向导，支持自选安装路径、开始菜单、桌面快捷方式、覆盖升级和系统卸载入口。
-- **桌面宠物**：支持角色选择、独立窗口、状态展示和随 Gateway 启动。
-
-## 项目结构
-
-```text
-SJTUClaw/
-├── claw/                         # Python 主程序
-│   ├── agent/                    # Agent Loop、预算、事件与健康监控
-│   ├── approval/                 # 高风险工具审批管理
-│   ├── channels/                 # 外部渠道，目前包含 QQ Bot
-│   ├── cli/                      # CLI 入口、REPL 与命令解析
-│   ├── claude/                   # 可选 Claude Code CLI 客户端与事件桥接
-│   ├── context/                  # Context Builder、Compact、治理与 Token 预算
-│   ├── gateway/                  # FastAPI Gateway、REST API、SSE 与上传服务
-│   ├── llm/                      # OpenAI Compatible 客户端与协议适配
-│   ├── memory/                   # 长期记忆存储与 Reflection
-│   ├── pet/                      # 桌面宠物进程、状态与资源管理
-│   ├── pi/                       # 可选 Pi Agent RPC 客户端与工具桥接
-│   ├── scheduler/                # Cron、Heartbeat、任务分发与状态持久化
-│   ├── sandbox/                  # microsandbox 配置、生命周期与文件/Shell 适配
-│   ├── session/                  # Session/Message 模型、标题与 JSONL Store
-│   ├── skills/                   # Skill Registry、安装、统计与状态管理
-│   ├── tools/                    # 文件、Shell、网页、附件、Memory、Cron、Skill 等工具
-│   ├── workspace/                # Workspace 绑定、边界检查与回退
-│   ├── config.py                 # 配置加载与运行时入口配置
-│   ├── runtime_settings.py       # Web UI 可写设置与敏感配置持久化
-│   ├── desktop.py                # Windows 桌面壳，启动本地 Gateway 与 pywebview
-│   ├── paths.py                  # 源码版、PyInstaller 版、安装版路径切换
-│   ├── main.py                   # 应用主入口
-│   └── utils.py                  # 通用工具函数
-├── prompts/                      # identity、system prompt、soul、tool contract 等文本资源
-├── skills/                       # 内置 Skill 目录
-│   ├── course-report/
-│   ├── material-summary/
-│   └── presentation-outline/
-├── webui/                        # React + TypeScript + Vite 前端源码
-│   ├── src/
-│   │   ├── components/           # 线程、侧边栏、设置、宠物与通用 UI
-│   │   ├── contexts/             # React Context
-│   │   ├── hooks/                # 会话、主题与拖拽等 hooks
-│   │   ├── lib/                  # API 客户端、类型、命令与工具函数
-│   │   ├── globals.css
-│   │   └── main.tsx
-│   ├── public/                   # 前端静态资源与宠物图片
-│   ├── package.json
-│   └── vite.config.ts
-├── web/                          # 已构建的 Web UI 静态产物，供 Gateway/桌面版直接加载
-├── packaging/
-│   ├── sandbox/                  # 通用 microVM 镜像、依赖清单与构建导入脚本
-│   └── windows/
-│       ├── build.ps1             # 一键构建脚本
-│       ├── SJTUClaw.spec         # PyInstaller 打包规格
-│       ├── SJTUClaw.iss          # Inno Setup 安装脚本
-│       └── assets/SJTUClaw.ico   # Windows 程序与快捷方式图标
-├── docs/
-│   ├── CODE_WIKI.md              # 模块、调用链与实现细节
-│   ├── configuration.md          # 配置说明
-│   ├── data-directory-guide.md   # 运行数据目录与生命周期
-│   ├── sandbox-architecture.md   # microsandbox 路由、挂载与依赖分层
-│   ├── testing.md                # 测试与开发说明
-│   ├── windows-packaging.md      # Windows 安装包构建说明
-│   └── images/                   # README 与文档截图
-├── tests/                        # pytest 后端测试与少量前端/集成测试
-├── data/                         # 源码运行时数据目录
-├── build/                        # 本地构建中间产物
-├── dist/                         # PyInstaller 与安装包输出目录
-├── requirements.txt              # Python 依赖列表
-├── pyproject.toml                # Python 项目元数据与 `sjtuclaw` CLI 入口
-├── .env.example                  # 环境变量模板
-└── 中期报告.md                    # 当前阶段报告
-```
-
-结构说明：
-
-- `claw/` 是核心运行时，桌面端、CLI、Web、QQ 和调度器最终都会汇入同一套 Agent Loop。
-- `webui/` 是完整前端工程，开发时由 Vite 提供热更新，发布时构建到 `web/`。
-- `packaging/windows/` 负责 Windows 桌面端分发，先用 PyInstaller 冻结 Python 程序，再用 Inno Setup 生成标准安装包。
-- `prompts/`、`skills/` 和 `data/` 分别对应静态 Prompt 资源、内置 Skill 资源和源码运行时的可写数据。
-- `docs/` 放配置、测试和打包文档；`中期报告.md` 是课程阶段性说明，内容会比 README 更简洁。
-
-## 使用方式
+## 快速开始
 
 ### Windows 桌面版
 
-运行发布目录中的 SJTUClaw 安装程序，按照安装向导选择安装位置和是否创建桌面快捷方式。安装后可从开始菜单或桌面启动 SJTUClaw，程序会自动启动本地 Gateway，并在独立桌面窗口中打开完整 Web UI。
+运行发布的 SJTUClaw 安装程序。首次启动后，在“设置”中选择 Agent 后端并完成对应配置。
 
-安装版的可写数据默认保存在：
+安装版数据默认保存在：
 
 ```text
 %USERPROFILE%\.sjtuclaw\data
 ```
 
-其中包括会话、记忆、模型设置、定时任务、用户 Skill 和宠物资源。重新安装或覆盖升级不会主动删除这些用户数据。卸载可通过 Windows“已安装的应用”、开始菜单中的“卸载 SJTUClaw”，或安装目录内的卸载程序完成。
-
-> 安装包适用于 64 位 Windows。首次使用仍需在设置界面配置可用的 OpenAI Compatible 模型服务。
+覆盖升级和卸载不会主动删除这里的用户数据。
 
 ### 源码运行
 
-#### 环境要求
+要求 Python 3.11+；只有开发 Web UI 时才需要 Node.js 18+。
 
-- Python 3.11+
-- Node.js 18+（仅前端开发或重新构建 Web UI 时需要）
-- OpenAI 兼容的模型服务，例如 OpenAI、Ollama、vLLM 或 LM Studio
-
-#### 安装与配置
-
-```bash
+```powershell
 python -m venv .venv
-source .venv/bin/activate       # Windows: .venv\Scripts\activate
+.\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
 python -m pip install -e .
 sjtuclaw setup
 ```
 
-也可以复制 `.env.example` 为 `.env` 手动配置。
-如需 microVM 隔离，改用 `python -m pip install -e ".[sandbox]"`，并在 Windows
-启用 Windows Hypervisor Platform。推荐先启动 Docker Desktop 并构建、导入包含
-通用 Python 库的镜像：
+也可以复制 `.env.example` 为 `.env` 后手动填写配置。
+
+启动入口：
+
+```text
+sjtuclaw chat       CLI 对话
+sjtuclaw tui        全屏终端界面
+sjtuclaw gateway    Gateway、Web UI 和 REST API
+sjtuclaw-desktop    本地 Gateway + 桌面窗口
+```
+
+Gateway 默认地址为 <http://127.0.0.1:8000>。
+
+## Agent 后端
+
+| 后端 | 适合场景 | 前置条件 |
+| --- | --- | --- |
+| `sjtuclaw` | 使用项目自带的 Agent Loop 和工具系统 | OpenAI Compatible API |
+| `pi` | 使用 Pi 的模型、工具循环、Skills 和会话能力 | 本机可用的 Pi CLI |
+| `claude` | 使用 Claude Code 的原生工具、Skills、MCP 和登录状态 | 本机已安装并登录 Claude Code |
+
+在会话中切换：
+
+```text
+/pi on
+/claude on
+/pi off          # 切回原生后端
+/claude off      # 切回原生后端
+```
+
+默认后端可以在 Web UI“设置 → Agent”或 `AGENT_BACKEND` 中配置。外部后端仍复用 SJTUClaw 的 Session、入口、审批桥接和宿主工具，但它们自己的原生执行环境不属于 microsandbox 隔离范围。
+
+## Workspace、安全模式与 Sandbox
+
+默认情况下，文件和 Shell 操作被限制在当前 Session 绑定的 Workspace 中，并按操作风险触发审批。
+
+| 模式 | 审批行为 | 路径边界 | 是否持久化 |
+| --- | --- | --- | --- |
+| 默认 | 写入和 Shell 逐次审批 | Workspace 或 Sandbox `/workspace` | — |
+| AUTO | 自动批准所有 `write` 级工具；实际运行在 microVM 内的 Shell 也自动批准 | 不变 | 随 Session 保存 |
+| UNLIMITED | 写入、删除和 Shell 仍逐次审批 | 解除宿主 Workspace 边界 | 仅当前进程 |
+| Sandbox | 原生文件、Shell、附件和下载工具路由到 Session 级 microVM | 私有卷或显式绑定目录 | 显式开关随 Session 保存 |
+
+常用命令：
+
+```text
+/workspace set <目录>
+/workspace show
+/auto on
+/unlimited on
+/sandbox on
+/sandbox status
+```
+
+设置 Workspace 后，每个用户回合开始前会创建检查点：
+
+```text
+/rollback
+/rollback 2
+/rollback list
+/rollback undo
+```
+
+如需 microVM，安装可选依赖并准备镜像：
 
 ```powershell
+python -m pip install -e ".[sandbox]"
 .\packaging\sandbox\Build-SandboxImage.ps1
 ```
 
-若脚本无法自动找到 `msb.exe`，使用
-`-MsbPath D:\path\to\msb.exe` 显式指定。完整步骤见
-[Sandbox 基础镜像](packaging/sandbox/README.md)。
+完整边界和故障策略见 [Sandbox 架构](docs/sandbox-architecture.md)。
 
-#### 切换 Agent 后端
-
-使用前请先安装并配置好 Pi Agent 或 Claude Code。在当前会话中输入：
+## 常用会话命令
 
 ```text
-/pi on          # 切换到 Pi Agent
-/claude on      # 切换到 Claude Code
-/pi off         # 切回 SJTUClaw 原生后端
-/claude off     # 切回 SJTUClaw 原生后端
+/help                         查看完整命令
+/session new|list|switch      管理会话
+/memory add|list|search       管理长期记忆
+/reflect status|now           管理每日反思
+/compact                      压缩当前会话上下文
+/skill list|show|usage        管理 Skill
+/cron list|status             管理定时任务
+/pet status|list|open|close   管理桌面宠物
+/approvals                    查看待审批操作
+/stop                         停止当前任务
 ```
 
-切换仅对当前会话生效；可用 `/pi status` 或 `/claude status` 查看状态。也可以在
-Web UI 的“设置 → LLM”中设置新会话的默认后端。
+## Web UI 与文件交付
 
-完整配置项、时区覆盖方式和安全建议见 [配置说明](docs/configuration.md)。
+Web UI 使用 SSE 展示思考、工具调用、审批和最终回复。单条用户消息最多上传 4 张图片，每张最多 20 MB；附件按 Session 隔离保存。
 
-#### 启动
-
-```bash
-sjtuclaw chat       # CLI 交互对话
-sjtuclaw tui        # 全屏终端界面（推荐用于终端交互）
-sjtuclaw gateway    # Gateway、Web UI 与 REST API
-sjtuclaw-desktop    # Desktop：本地 Gateway + pywebview 独立窗口
-```
-
-#### Terminal UI
-
-![SJTUClaw TUI](docs/images/readme-tui.svg)
-
-`sjtuclaw tui` 提供面向长时间 Agent 工作流的全屏终端界面。它直接复用 Gateway
-运行时，因此 Session、记忆、上下文压缩、Workspace、Sandbox、回退、审批、
-Skills、反思、Cron、桌宠、AUTO / UNLIMITED 模式，以及 Pi / Claude Code
-后端切换都与 CLI 和 Web UI 保持同一行为。
-
-核心快捷键：
-
-```text
-Ctrl+P  搜索命令       Ctrl+S  搜索/选择 Session
-Ctrl+J  Cron 看板      /       行内命令
-Ctrl+R  刷新状态       Ctrl+C  停止当前任务
-Shift+Enter  输入换行
-```
-
-主界面将大部分空间留给对话与 Composer，不常驻显示 Session 侧栏；按 `Ctrl+S`
-打开可搜索的 Session Picker。宽终端中右侧显示 Runtime、Cron 与审批摘要，较窄
-终端会自动收起辅助栏。按 `Ctrl+P` 打开可搜索的 SJTUClaw 命令面板；输入 `/`
-后可用上下方向键滚动全部命令。启动页会随机展示一条计算机科学名言。
-
-Gateway 启动后访问 <http://127.0.0.1:8000>。
-
-如果需要让 Gateway 自动打开浏览器，可设置 `GATEWAY_OPEN_BROWSER=1`。监听非本机地址时，代码会强制要求设置 `GATEWAY_API_TOKEN`。
-
-需要从 Web UI 获取 Agent 生成的文件时，可以直接要求“把某文件通过 WebUI 发给我”。
-Agent 调用 `create_download` 后，普通文件会显示带文件名的下载按钮，安全的位图格式会
-同时显示预览和下载入口。下载注册表保存在 `data/downloads/registry.json`，链接不再
-按时间过期；源文件被删除或最旧的注册表条目因超过 1000 条上限被清理后，链接才会失效。下载入口
-只暴露已注册文件，不允许通过下载 URL 提交任意路径读取服务器文件；默认模式下
-注册源文件仍受当前 session 的 workspace 边界约束。
+Agent 调用 `create_download` 后，Web UI 会显示图片预览或普通文件下载按钮。注册信息保存在 `data/downloads/registry.json`，最多保留 1000 条；源文件被删除后链接失效。
 
 前端开发：
 
-```bash
+```powershell
 cd webui
 npm install
-npm run dev         # http://127.0.0.1:5173
+npm run dev
 ```
 
-前端测试与生产构建：
+测试与生产构建：
 
-```bash
+```powershell
 npx vitest run
-npm run build       # 输出到项目根目录 web/
+npm run build
 ```
 
-源码方式默认以项目根目录作为 Agent 主目录，并在项目内使用 `data/`、`prompts/` 和 `skills/`；安装版则以当前用户主目录下的 `.sjtuclaw` 作为 Agent 主目录，并使用 `.sjtuclaw/data`（Windows 示例：`C:\Users\<用户名>\.sjtuclaw\data`）保存可写数据。日志、环境配置与运行时文件也统一位于 `.sjtuclaw`。两种方式共用同一套 Agent、Tool、Memory、Skill、Scheduler、Workspace 回退和 Gateway 代码，主要区别在启动入口、资源路径和运行数据位置。
+构建结果写入项目根目录的 `web/`，由 Gateway 和桌面版直接加载。
 
-`requirements.txt` 提供可复现的完整 Python 开发环境，包含核心运行时、Desktop、PyInstaller 和 pytest。若只希望安装最小核心运行时，可改用 `python -m pip install -e .`；只添加 Desktop 支持可使用 `python -m pip install -e ".[desktop]"`。
+## 桌面宠物
 
-### 桌面宠物与自定义宠物包
-
-在 Web UI 的“设置 → Pet”中可以开启或关闭桌面宠物、选择角色、设置是否随 Gateway 启动，以及导入或删除自定义宠物。自定义宠物必须以 ZIP 压缩包导入，包内只能包含 `pet.json` 和一张 `spritesheet.webp` 或 `spritesheet.png`。两个文件可以直接位于 ZIP 根目录，也可以放在一个与宠物 ID 同名的顶层目录中：
-
-```text
-shin-chan.zip
-└── shin-chan/                 # 这一层可以省略
-    ├── pet.json
-    └── spritesheet.webp
-```
-
-`pet.json` 示例：
+内置月薪喵、线条小狗、蜡笔小新和黄油小熊。自定义宠物以 ZIP 导入，包内包含 `pet.json` 和一张 `spritesheet.webp` 或 `spritesheet.png`。
 
 ```json
 {
-  "id": "shin-chan",
-  "displayName": "蜡笔小新",
-  "description": "陪伴你完成任务的桌面宠物。",
+  "id": "my-pet",
+  "displayName": "我的宠物",
+  "description": "角色性格与互动口吻。",
   "spriteVersionNumber": 2,
   "spritesheetPath": "spritesheet.webp"
 }
 ```
 
-字段要求：
+- v1：8 × 9，固定 1536 × 1872。
+- v2：8 × 11，固定 1536 × 2288，并增加 16 个观察方向。
+- 新宠物建议使用 v2；导入时会校验路径、文件集合、压缩比、图片格式、透明通道、尺寸和动画格。
 
-- `id`：1–64 个字符，只允许小写字母 `a-z`、数字 `0-9`、下划线 `_` 和短横线 `-`，不能使用 Windows 系统保留名称；例如应写成 `shin-chan`，不能写成 `Shin-chan`。
-- `displayName`：界面显示名称，可以使用中文，不能为空，最长 100 个字符。
-- `description`：可选说明，最长 1000 个字符。它也是 LLM 生成宠物互动台词时的角色设定，建议写清性格、口吻、自称和与用户的关系。
-- `spriteVersionNumber`：必须是数字 `1` 或 `2`，并与图集尺寸匹配。
-- `spritesheetPath`：必须是 `spritesheet.webp` 或 `spritesheet.png`。
-
-| 图集版本 | 布局 | 固定尺寸 | 功能 |
-|---------|------|----------|------|
-| v1 | 8 列 × 9 行 | 1536 × 1872 | 9 行基础动画；保留用于兼容现有宠物 |
-| v2 | 8 列 × 11 行 | 1536 × 2288 | 包含全部基础动画，并增加两行共 16 个观察方向 |
-
-目前内置“月薪喵”“线条小狗”“蜡笔小新”和“黄油小熊”：前三者为 v1，
-“黄油小熊”为 v2。新制作的宠物建议使用 v2；`spriteVersionNumber` 必须写成
-JSON 数字，例如 `2`，不能写成字符串 `"2"`。
-
-导入时，Gateway 会在写入用户宠物目录前检查 ZIP 完整性、路径安全、重复或额外文件、加密与异常压缩比、压缩包大小、`pet.json` 字段、图片真实格式、透明通道、图集尺寸、必用动画帧以及未使用格子的透明性。校验失败时，具体原因会直接显示在添加宠物弹窗中。相同 ID 的宠物不能重复安装，自定义宠物也不能覆盖内置宠物。
-
-宠物导入成功后，Gateway 会调用当前配置的 LLM，根据 `displayName` 和 `description` 生成 12 条符合角色人设的“被点击/轻戳”回复。回复不会写入宠物压缩包，而是按宠物 ID 独立保存到 `data/pet/replies/<pet-id>.json`；桌面宠物被点击时，只会从当前宠物自己的回复中随机选择一句。按 ID 分文件的结构也便于后续删除宠物时同步清理其台词，而不影响其他宠物。
-
-如果尚未配置 LLM，或者模型调用失败、返回格式不正确，导入仍会成功，系统会为该宠物单独保存通用备用台词，并在 Web UI 中显示提示。之后重新导入同一宠物前仍需先删除原宠物；当前版本不会自动重新生成已经保存的备用台词。
-
-### AUTO 与 UNLIMITED 模式
-
-SJTUClaw 默认对写入和 Shell 等高风险工具进行审批。未启用 microsandbox 时，
-文件及命令操作限制在当前 Session 绑定的 workspace 内；启用后由 microVM
-承载绑定目录或 session 私有 workspace。AUTO 和 UNLIMITED 是两个相互独立、
-按 Session 生效的审批/路径模式；新建 Session 时二者默认均为关闭状态。AUTO
-会随 session 持久保存，UNLIMITED 属于临时权限提升，进程重启后自动关闭。
-
-| 模式 | 作用 | 审批行为 | 文件系统边界 |
-|------|------|----------|--------------|
-| 默认模式 | 使用完整安全保护 | 写入和 Shell 操作逐次审批 | 绑定的 workspace，或 sandbox 私有 `/workspace` |
-| AUTO | 减少 workspace 内操作的人工确认 | 自动批准结构化文件写入；microsandbox 实际生效时也自动批准其中的 Shell，宿主 Shell 和 Skill 加载确认仍保留 | 仍严格限制在当前 workspace，越界操作由工具拒绝 |
-| UNLIMITED | 解除 workspace 路径限制 | 写入、覆盖、删除和 Shell 操作始终逐次审批，AUTO 无法跳过 | 可访问 workspace 外路径 |
-
-启用或查看 AUTO 模式：
+## 项目结构
 
 ```text
-/auto on       # 开启
-/auto off      # 关闭
-/auto status   # 查看当前 Session 的状态
+claw/                 Python 运行时
+  agent/              Agent Loop、事件、预算和健康监控
+  context/            上下文构建、预算和压缩
+  tools/              内置工具与安全护栏
+  session/            Session 模型与 JSONL 存储
+  memory/             长期记忆与 Reflection
+  scheduler/          Cron、Heartbeat 和任务分发
+  workspace/          Workspace 边界与回退
+  sandbox/            microsandbox 生命周期与路由
+  gateway/            FastAPI、REST、SSE 和静态站点
+  pi/                 Pi RPC 适配
+  claude/             Claude Code 适配与审批桥接
+  channels/           QQ Bot
+  pet/                桌面宠物
+webui/                React + TypeScript 前端
+web/                  已构建前端
+prompts/              运行时 Prompt 资源
+skills/               内置 Skill
+packaging/            Sandbox 与 Windows 打包
+tests/                后端、前端和集成测试
+docs/                 项目文档与 Code Wiki
 ```
 
-启用或查看 UNLIMITED 模式：
-
-```text
-/unlimited on       # 允许访问 workspace 外路径
-/unlimited off      # 恢复 workspace 边界
-/unlimited status   # 查看当前 Session 的状态
-```
-
-> AUTO 不等于取消安全边界：它省略 workspace 内结构化文件写入的逐次审批，并在 microsandbox 实际生效时省略 microVM 内 Shell 操作的审批；未进入 microVM 的宿主 Shell 仍需明确审批。UNLIMITED 才会解除路径边界，但不会取消危险操作审批。
-
-### microsandbox microVM
-
-安装 `sandbox` 可选依赖后，默认 `SANDBOX_MODE=off`，新 session 不会自动启动
-microVM；可使用 `/sandbox on` 为当前 session 开启。设置 `SANDBOX_MODE=auto`
-后，SJTUClaw 原生 Agent 的文件、Shell、附件和下载工具会共享同一 session
-microVM。未绑定 workspace 时使用持久化私有卷；绑定后只把该目录挂载为 guest
-`/workspace`。如需保证绝不回退到宿主执行，设置 `SANDBOX_MODE=required`；
-该模式禁止 UNLIMITED，并拒绝使用尚未纳入 microVM 的 Pi / Claude Code 后端。
-
-直接输入 `/sandbox` 可查看命令说明；使用 `/sandbox status` 查看当前状态，
-使用 `/sandbox on` 或 `/sandbox off` 单独控制当前 session，其他 session 不受
-影响。Web UI 会在已生效的 session 上显示 Sandbox 图标。关闭会停止当前
-microVM，但保留其私有 workspace 数据。显式开关会随 session 持久保存；重启后
-若显式开启但 microsandbox 不可用，文件和 Shell 工具会 fail-closed，绝不会静默
-回退宿主执行。`required` 模式不允许关闭。
-
-新建或 fork 出的 session 不继承其他 session 的 AUTO、Sandbox 或 UNLIMITED
-权限状态；删除 session 会同时删除其 AUTO/Sandbox 偏好。
-
-推荐使用 [Sandbox 基础镜像](packaging/sandbox/README.md) 预装 numpy、pandas、
-scipy、matplotlib、Pillow、网络与常用文档处理库。Sandbox 启动时在 Linux
-rootfs 创建运行 venv，并通过 `--system-site-packages` 复用镜像通用库；Shell
-中的 `python` 和 `pip` 默认使用它。项目新增包与 console scripts 会在命令结束后
-同步到 `/workspace/.venv`，下次 microVM 启动时自动恢复，因此不会随临时 rootfs
-消失。直接执行 `pip install <package>` 或 `python -m pip install <package>`
-即可，不需要手动激活 `/workspace/.venv`。
-
-依赖跟随 workspace，而不是跟随 sandbox 开关：未绑定宿主 workspace 时，每个
-session 的私有卷独立保存文件和依赖；绑定宿主目录时，`.venv` 位于该目录中，
-绑定同一目录的 session 会看到相同的项目依赖。详细配置和架构见
-[配置说明](docs/configuration.md) 与
-[sandbox 接入架构](docs/sandbox-architecture.md)。
-
-### Workspace 回退
-
-为 Session 设置 workspace 后，系统会自动在每次用户消息执行前创建检查点；未设置 workspace 时不启用回退。Web UI 会在可回退的用户消息下显示返回箭头，也可以在 Web UI 或 CLI 使用：
-
-```text
-/rollback                 # 回退一轮
-/rollback 3               # 回退到倒数第 3 个用户回合之前
-/rollback <checkpointId>  # 回退到指定检查点
-/rollback list            # 列出可用检查点
-/rollback status          # 查看状态
-/rollback undo            # 撤销最近一次回退
-```
-
-一次回退会原子性地恢复 workspace 文件和对应的完整对话状态。文件内容按 SHA-256 去重保存在独立对象库中，元数据、会话快照和操作日志保存在 SQLite；不会修改或依赖 workspace 中的 Git 仓库。上下文 compact 只推进摘要边界，不删除原始消息，摘要和边界会随 Session 一起持久化；后台 compact 结果还会校验 Session revision，因此不会覆盖回退后的状态。
-
-`/rollback undo` 是单步撤销：回退后如果开始了新的用户回合，旧 undo 安全点会自动失效。会话快照会压缩存储；分支失效、切换或取消 workspace 时，系统会清理不可达检查点并对内容对象执行引用扫描回收。
-
-回退只覆盖已绑定的 workspace。开启 UNLIMITED 后发生在 workspace 外的改动不会被恢复，预览和执行结果会明确提示这一点。切换或取消 workspace 会使旧绑定的检查点失效。
-
-### 构建 Windows 安装包
-
-准备 Python 3.11+、Node.js 18+ 和 Inno Setup 7 后，在项目根目录执行：
+## 开发与验证
 
 ```powershell
-.\packaging\windows\build.ps1
+python -m pytest tests/ -v
+cd webui
+npx vitest run
+npm run build
 ```
 
-构建脚本会先安装依赖、构建 WebUI、检查 Tkinter，再运行 PyInstaller；它会从 `PATH` 和常见安装目录自动查找 Inno Setup。找不到 Inno Setup 时仍会保留可运行的 PyInstaller 目录版，也可以使用 `-SkipInstaller` 主动跳过安装向导。
-
-> 修改 Python 或 WebUI 源码后必须重新运行构建脚本。`dist/` 中已有的 EXE 和安装包不会自动包含最新源码。
-
-构建产物：
-
-```text
-dist\SJTUClaw\SJTUClaw.exe
-dist\installer\SJTUClaw-Setup-<version>.exe
-```
-
-详细说明见 [Windows 安装包构建](docs/windows-packaging.md)。
-
-### 常用操作
-
-```text
-/session new|list|switch|rename|delete
-/workspace set|show|unset
-/rollback [n|checkpointId]|list|status|undo|help
-/compact
-/memory add|list|search|update|delete|status
-/reflect status|enable|disable|time|now
-/skill list|show|usage|<name>
-/auto on|off|status
-/unlimited on|off|status
-/pi [on|off|status]
-/claude [on|off|status]
-/cron list|status|disable|enable|delete
-/approvals|approve|reject
-/pet status|list|open|close|select|autostart
-/stop
-/help
-/exit
-```
-
-`/compact` 会立即压缩当前会话中可安全归档的完整旧轮次，不需要等待
-`COMPACT_MAX_MESSAGE_TOKENS` 自动阈值；最近消息保留窗口仍会保留。系统不会因
-会话空闲而自动压缩。手动压缩完成后，CLI 和 WebUI 都会输出包含消息计数与
-摘要预览的“压缩简报”；达到阈值的后台自动压缩完成后，两端会显示“自动压缩
-已完成”。压缩只在完整旧轮次边界推进摘要，若当前任务仍在运行，`/compact`
-不会停止或截断该任务。
-
-也可以直接用自然语言创建定时任务、保存记忆或请求使用 Skill。
-
-## 技术栈
-
-| 层次 | 技术 |
-|------|------|
-| 后端 | Python 3.11、FastAPI、Uvicorn |
-| LLM | OpenAI 兼容 API、httpx、aiohttp |
-| Agent | 自研 Agent Loop、ToolRegistry、上下文压缩、审批管理 |
-| 存储 | JSONL Session、SQLite 回退元数据、SHA-256 对象库、Markdown + YAML 记忆 |
-| 调度 | croniter、Heartbeat |
-| 前端 | React 18、TypeScript、Vite、Tailwind CSS |
-| 渲染 | react-markdown、KaTeX、代码高亮 |
-| 通道 | Windows 桌面应用、CLI、Web UI、REST API、QQ Bot WebSocket |
-| 桌面 | pywebview、PyInstaller、Inno Setup 7、tkinter、Pillow |
-| 测试 | pytest、Vitest |
+详细测试范围、真实 Sandbox 测试和格式检查见 [测试与开发](docs/testing.md)。
 
 ## 文档
 
 - [配置说明](docs/configuration.md)
-- [运行数据目录说明](docs/data-directory-guide.md)
+- [数据目录](docs/data-directory-guide.md)
+- [Sandbox 架构](docs/sandbox-architecture.md)
 - [测试与开发](docs/testing.md)
-- [Windows 安装包构建](docs/windows-packaging.md)
-- [代码 Wiki](docs/CODE_WIKI.md)
-- [前端源码](webui/)
-- [Skill 目录](skills/)
+- [Windows 打包](docs/windows-packaging.md)
+- [Sandbox 基础镜像](packaging/sandbox/README.md)
+- [Code Wiki](docs/CODE_WIKI.md)：面向代码阅读者的详细架构、调用链、数据模型与模块说明
 
-## 测试
-
-后端回归测试：
-
-```bash
-python -m pytest tests/ -v
-```
-
-前端测试和构建命令见 [测试与开发](docs/testing.md)。
+项目版本：`0.5.0`。

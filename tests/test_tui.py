@@ -4,19 +4,20 @@ import asyncio
 from dataclasses import replace
 from types import SimpleNamespace
 
+from rich.cells import cell_len
 from textual.widgets import Static
 
 from claw.cli.commands import _COMMAND_PREFIXES
 from claw.tui.app import (
+    COMMANDS,
     CommandPanel,
     ConfirmCronDeleteScreen,
     ConfirmDeleteScreen,
     CronBoard,
     RenameSessionScreen,
-    SJTUClawTUI,
     SessionBoard,
+    SJTUClawTUI,
 )
-from claw.tui.app import COMMANDS
 from claw.tui.runtime import LocalRuntime, RuntimeSnapshot
 
 
@@ -87,7 +88,6 @@ class FakeRuntime:
                 "schedule": "0 22 * * * · Asia/Shanghai",
                 "nextRun": "07-30 22:00",
                 "lastStatus": "ok",
-                "message": "复盘今天的工作",
             }
         ]
 
@@ -142,6 +142,30 @@ class FakeRuntime:
         return True
 
 
+class ApprovalRuntime(FakeRuntime):
+    def __init__(self) -> None:
+        super().__init__()
+        self.approvals = [
+            {
+                "approvalId": "approval-1",
+                "toolName": "remember",
+                "toolArgs": {
+                    "category": "project",
+                    "content": "用户正在开发 SJTUClaw 项目",
+                },
+            }
+        ]
+        self.approved: list[str] = []
+
+    def pending_approvals(self, session_id: str):
+        return list(self.approvals)
+
+    def approve(self, approval_id: str):
+        self.approved.append(approval_id)
+        self.approvals.clear()
+        return True
+
+
 def test_tui_command_atlas_covers_every_cli_namespace() -> None:
     assert {command for command, _description in COMMANDS} == set(_COMMAND_PREFIXES)
 
@@ -168,7 +192,9 @@ def test_tui_mounts_transcript_first_cockpit_without_session_sidebar() -> None:
             message = app.query_one(".message-card")
             assert transcript.region.right == insight_rail.region.x
             assert insight_rail.region.x - message.region.right <= 1
-            assert "F1" not in str(app.query_one("#keybar", Static).render())
+            keybar = str(app.query_one("#keybar", Static).render())
+            assert "F1" not in keybar
+            assert "   " not in keybar
         assert runtime.closed
 
     asyncio.run(scenario())
@@ -191,13 +217,133 @@ def test_tui_command_hints_and_responsive_layout() -> None:
     asyncio.run(scenario())
 
 
-def test_shift_enter_inserts_newline_without_submitting() -> None:
+def test_escape_closes_inline_command_hints_without_losing_draft() -> None:
+    async def scenario() -> None:
+        app = SJTUClawTUI(runtime=FakeRuntime())
+        async with app.run_test(size=(120, 36)) as pilot:
+            await pilot.press("/", "c", "r", "o")
+            await pilot.pause()
+            hints = app.query_one("#command-hints", Static)
+            assert hints.display
+
+            await pilot.press("escape")
+            await pilot.pause()
+
+            assert not hints.display
+            assert app.query_one("#composer").text == "/cro"
+            assert app.query_one("#composer").completion == ""
+
+    asyncio.run(scenario())
+
+
+def test_up_down_navigate_sent_messages_and_restore_draft() -> None:
+    async def scenario() -> None:
+        runtime = FakeRuntime()
+        runtime._messages["session-alpha"].extend(
+            [
+                {"role": "user", "content": "第二个问题"},
+                {"role": "assistant", "content": "第二个回答"},
+            ]
+        )
+        app = SJTUClawTUI(runtime=runtime)
+        async with app.run_test(size=(120, 36)) as pilot:
+            composer = app.query_one("#composer")
+            await pilot.press("临", "时", "草", "稿", "up")
+            assert composer.text == "第二个问题"
+
+            await pilot.press("up")
+            assert composer.text == "解释 SSA"
+
+            await pilot.press("down")
+            assert composer.text == "第二个问题"
+
+            await pilot.press("down")
+            assert composer.text == "临时草稿"
+
+    asyncio.run(scenario())
+
+
+def test_multiline_arrows_move_cursor_before_opening_history() -> None:
+    async def scenario() -> None:
+        app = SJTUClawTUI(runtime=FakeRuntime())
+        async with app.run_test(size=(120, 36)) as pilot:
+            composer = app.query_one("#composer")
+            await pilot.press(
+                "第",
+                "一",
+                "行",
+                "ctrl+n",
+                "第",
+                "二",
+                "行",
+                "up",
+            )
+
+            assert composer.text == "第一行\n第二行"
+            assert composer.cursor_location[0] == 0
+
+            await pilot.press("up")
+            assert composer.text == "解释 SSA"
+
+    asyncio.run(scenario())
+
+
+def test_sent_message_is_added_to_history() -> None:
+    async def scenario() -> None:
+        app = SJTUClawTUI(runtime=FakeRuntime())
+        async with app.run_test(size=(120, 36)) as pilot:
+            await pilot.press("新", "消", "息", "enter")
+            for _ in range(10):
+                await pilot.pause()
+                if not app.busy:
+                    break
+            assert not app.busy
+
+            await pilot.press("up")
+            assert app.query_one("#composer").text == "新消息"
+
+    asyncio.run(scenario())
+
+
+def test_history_and_drafts_are_isolated_by_session() -> None:
+    async def scenario() -> None:
+        app = SJTUClawTUI(runtime=FakeRuntime())
+        async with app.run_test(size=(120, 36)) as pilot:
+            composer = app.query_one("#composer")
+            await pilot.press("甲", "会", "话", "草", "稿", "ctrl+s")
+            await pilot.pause()
+            await pilot.press("down", "enter")
+            for _ in range(10):
+                await pilot.pause()
+                if app.current_session_id == "session-beta":
+                    break
+
+            assert app.current_session_id == "session-beta"
+            assert composer.text == ""
+            await pilot.press("up")
+            assert composer.text == ""
+
+            await pilot.press("ctrl+s")
+            await pilot.pause()
+            await pilot.press("enter")
+            for _ in range(10):
+                await pilot.pause()
+                if app.current_session_id == "session-alpha":
+                    break
+
+            assert app.current_session_id == "session-alpha"
+            assert composer.text == "甲会话草稿"
+
+    asyncio.run(scenario())
+
+
+def test_ctrl_n_inserts_newline_without_submitting() -> None:
     async def scenario() -> None:
         runtime = FakeRuntime()
         app = SJTUClawTUI(runtime=runtime)
         async with app.run_test(size=(120, 36)) as pilot:
             initial_messages = len(runtime.messages("session-alpha"))
-            await pilot.press("第", "一", "行", "shift+enter", "第", "二", "行")
+            await pilot.press("第", "一", "行", "ctrl+n", "第", "二", "行")
             await pilot.pause()
 
             assert app.query_one("#composer").text == "第一行\n第二行"
@@ -207,17 +353,20 @@ def test_shift_enter_inserts_newline_without_submitting() -> None:
     asyncio.run(scenario())
 
 
-def test_windows_shift_enter_keeps_modifier_before_textual_parsing() -> None:
-    if __import__("os").name != "nt":
-        return
-    from claw.tui.windows_driver import (
-        SHIFT_PRESSED,
-        VK_RETURN,
-        translate_windows_key,
-    )
+def test_ctrl_m_does_not_submit_composer() -> None:
+    async def scenario() -> None:
+        runtime = FakeRuntime()
+        app = SJTUClawTUI(runtime=runtime)
+        async with app.run_test(size=(120, 36)) as pilot:
+            initial_messages = len(runtime.messages("session-alpha"))
+            await pilot.press("不", "要", "发", "送", "ctrl+m")
+            await pilot.pause()
 
-    assert translate_windows_key("\r", SHIFT_PRESSED, VK_RETURN) == "\x1b[13;2u"
-    assert translate_windows_key("\r", 0, VK_RETURN) == "\r"
+            assert app.query_one("#composer").text == "不要发送"
+            assert len(runtime.messages("session-alpha")) == initial_messages
+            assert not app.busy
+
+    asyncio.run(scenario())
 
 
 def test_tui_inline_command_palette_scrolls_through_every_command() -> None:
@@ -304,7 +453,7 @@ def test_busy_turn_preserves_new_draft_on_enter() -> None:
 
             assert app.query_one("#composer").text == "不要丢失"
             assert any(
-                notification.message == "当前任务仍在运行；草稿已保留。可按 Ctrl+C 停止。"
+                notification.message == "当前任务仍在运行；草稿已保留。可按Ctrl+C停止。"
                 for notification in app._notifications
             )
 
@@ -316,6 +465,7 @@ def test_busy_approvals_command_does_not_cancel_or_replace_live_turn() -> None:
         def __init__(self) -> None:
             super().__init__()
             self.release = asyncio.Event()
+            self.commands: list[str] = []
 
         async def stream(self, session_id: str, message: str):
             yield {"type": "ThinkingEvent", "iteration": 1}
@@ -328,6 +478,10 @@ def test_busy_approvals_command_does_not_cancel_or_replace_live_turn() -> None:
             )
             yield {"type": "_done"}
 
+        async def command(self, session_id: str, command: str):
+            self.commands.append(command)
+            return await super().command(session_id, command)
+
     async def scenario() -> None:
         runtime = SlowRuntime()
         app = SJTUClawTUI(runtime=runtime)
@@ -336,10 +490,12 @@ def test_busy_approvals_command_does_not_cancel_or_replace_live_turn() -> None:
             await pilot.pause()
             assert app.busy
 
-            command_worker = app.execute_command("/approvals")
+            command_worker = app.execute_command("/APPROVE approval-1")
+            assert command_worker is not None
             await command_worker.wait()
             await pilot.pause()
             assert app.busy
+            assert runtime.commands == ["/APPROVE approval-1"]
             assert any(
                 message.get("content") == "长任务"
                 for message in app._ephemeral_messages
@@ -347,6 +503,40 @@ def test_busy_approvals_command_does_not_cancel_or_replace_live_turn() -> None:
 
             runtime.release.set()
             await turn_worker.wait()
+
+    asyncio.run(scenario())
+
+
+def test_second_command_does_not_cancel_running_command() -> None:
+    class SlowCommandRuntime(FakeRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.command_started = asyncio.Event()
+            self.release_command = asyncio.Event()
+            self.commands: list[str] = []
+
+        async def command(self, session_id: str, command: str):
+            self.commands.append(command)
+            self.command_started.set()
+            await self.release_command.wait()
+            return {"result": f"执行：{command}", "actions": []}
+
+    async def scenario() -> None:
+        runtime = SlowCommandRuntime()
+        app = SJTUClawTUI(runtime=runtime)
+        async with app.run_test(size=(120, 36)) as pilot:
+            first_worker = app.execute_command("/memory")
+            assert first_worker is not None
+            await asyncio.wait_for(runtime.command_started.wait(), timeout=1)
+
+            second_worker = app.execute_command("/cron")
+            assert second_worker is None
+            assert runtime.commands == ["/memory"]
+
+            runtime.release_command.set()
+            await first_worker.wait()
+            await pilot.pause()
+            assert not app._command_running
 
     asyncio.run(scenario())
 
@@ -381,6 +571,78 @@ def test_ctrl_c_uses_short_deduplicated_status_text() -> None:
             assert len(notifications) == 1
             assert notifications[0].message == "当前没有运行中的任务。"
             assert "`" not in notifications[0].message
+
+    asyncio.run(scenario())
+
+
+def test_short_notifications_size_to_their_message() -> None:
+    async def scenario() -> None:
+        app = SJTUClawTUI(runtime=FakeRuntime())
+        async with app.run_test(size=(120, 36), notifications=True) as pilot:
+            message = "当前没有运行中的任务。"
+            app.notify(message, markup=False)
+            await pilot.pause()
+
+            toast = app.query_one("Toast")
+            assert 0 < toast.region.width < 40
+            assert str(toast.render()) == message
+            assert toast.content_region.width >= cell_len(message)
+
+    asyncio.run(scenario())
+
+
+def test_unchanged_approvals_are_not_remounted() -> None:
+    async def scenario() -> None:
+        runtime = ApprovalRuntime()
+        runtime.approvals[0]["toolArgs"]["content"] = "审批内容" * 400 + "END"
+        app = SJTUClawTUI(runtime=runtime)
+        async with app.run_test(size=(140, 42)) as pilot:
+            await pilot.pause()
+            inline = app.query_one("#inline-approval-list")
+            original_card = inline.query_one(".approval-card")
+            detail = original_card.query_one(".approval-detail")
+            approve = original_card.query_one(".approval-approve")
+            conversation = app.query_one("#conversation")
+
+            assert inline.parent is conversation
+            assert len(app.query("#approval-list")) == 0
+            assert len(app.query("#insight-rail .approval-card")) == 0
+            assert inline.display
+            assert "END" in str(detail.query_one(Static).render())
+            assert detail.virtual_size.height > detail.size.height
+            assert approve.region.height == 1
+
+            app.busy = True
+            app._poll_live_state()
+            app._poll_live_state()
+            await pilot.pause()
+
+            assert inline.query_one(".approval-card") is original_card
+
+    asyncio.run(scenario())
+
+
+def test_small_terminal_keeps_approval_actions_visible() -> None:
+    async def scenario() -> None:
+        runtime = ApprovalRuntime()
+        app = SJTUClawTUI(runtime=runtime)
+        async with app.run_test(size=(60, 16)) as pilot:
+            await pilot.pause()
+            inline = app.query_one("#inline-approval-list")
+            approve = inline.query_one(".approval-approve")
+            composer = app.query_one("#composer-shell")
+
+            assert app.screen.has_class("compact")
+            assert not app.query_one("#insight-rail").display
+            assert inline.display
+            assert inline.region.height > 0
+            assert approve.region.height == 1
+            assert not approve.region.overlaps(composer.region)
+
+            assert await pilot.click(approve)
+            await pilot.pause()
+            assert runtime.approved == ["approval-1"]
+            assert not inline.display
 
     asyncio.run(scenario())
 
@@ -438,6 +700,98 @@ def test_tui_opens_each_keyboard_dashboard() -> None:
             assert app.screen.query_one("#dialog-cancel").has_focus
             await pilot.press("escape")
             await pilot.press("escape")
+
+    asyncio.run(scenario())
+
+
+def test_deleting_active_session_switches_to_a_live_session() -> None:
+    class DeleteRuntime(FakeRuntime):
+        async def command(self, session_id: str, command: str):
+            assert command == "/session delete session-alpha"
+            self.sessions = [
+                item
+                for item in self.sessions
+                if item["sessionId"] != "session-alpha"
+            ]
+            self._messages.pop("session-alpha")
+            return {
+                "result": "当前 session 已删除。",
+                "actions": ["reload_sessions", "clear_session"],
+            }
+
+    async def scenario() -> None:
+        runtime = DeleteRuntime()
+        app = SJTUClawTUI(runtime=runtime)
+        async with app.run_test(size=(120, 36)) as pilot:
+            worker = app.execute_command("/session delete session-alpha")
+            assert worker is not None
+            await worker.wait()
+            await pilot.pause()
+
+            assert app.current_session_id == "session-beta"
+            assert app._ephemeral_messages == []
+            assert app.query_one("#welcome-panel") is not None
+
+    asyncio.run(scenario())
+
+
+def test_cron_enter_runs_selected_job() -> None:
+    class CronRuntime(FakeRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.triggered_jobs: list[str] = []
+
+        async def trigger_cron(self, job_id: str):
+            self.triggered_jobs.append(job_id)
+            return True
+
+    async def scenario() -> None:
+        runtime = CronRuntime()
+        app = SJTUClawTUI(runtime=runtime)
+        async with app.run_test(size=(120, 36)) as pilot:
+            await pilot.press("ctrl+j")
+            await pilot.pause()
+            assert isinstance(app.screen, CronBoard)
+
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.pause()
+
+            assert runtime.triggered_jobs == ["job-1"]
+            assert not isinstance(app.screen, CronBoard)
+
+    asyncio.run(scenario())
+
+
+def test_persisted_tool_request_renders_name_and_arguments() -> None:
+    async def scenario() -> None:
+        runtime = FakeRuntime()
+        runtime._messages["session-alpha"].append(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {
+                            "name": "remember",
+                            "arguments": '{"category":"project","content":"TUI"}',
+                        },
+                    }
+                ],
+            }
+        )
+        app = SJTUClawTUI(runtime=runtime)
+        async with app.run_test(size=(120, 36)) as pilot:
+            await pilot.pause()
+            card = app.query_one("#message-2")
+            assert "TOOL REQUEST · remember" in str(
+                card.query_one(".message-role", Static).render()
+            )
+            detail = str(card.query_one(".tool-call-body", Static).render())
+            assert '"category": "project"' in detail
+            assert '"content": "TUI"' in detail
 
     asyncio.run(scenario())
 

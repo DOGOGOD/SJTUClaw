@@ -14,6 +14,7 @@ SJTUClaw 把多轮对话、工具调用、长期记忆、Skill、定时任务和
 - Workspace 路径边界、操作审批、AUTO / UNLIMITED 模式和可选 microsandbox microVM。
 - Workspace 回退：同时恢复工作区文件和会话分支。
 - Web UI 实时事件流、图片附件、生成文件下载、模型与 Agent 设置。
+- 成熟的键盘优先 TUI：流式对话、Session / Cron 看板、命令面板和内联审批。
 - Cron、Heartbeat、QQ Bot 和桌面宠物等后台能力。
 - Windows 桌面打包与标准安装程序。
 
@@ -55,6 +56,32 @@ sjtuclaw-desktop    本地 Gateway + 桌面窗口
 ```
 
 Gateway 默认地址为 <http://127.0.0.1:8000>。
+
+## TUI
+
+```powershell
+sjtuclaw tui
+```
+
+TUI 是直接复用共享运行时的全屏终端界面，不需要先启动 Gateway。它支持流式对话、工具执行状态、Markdown 回复、待审批操作、Session 管理、Cron 管理和全部 Slash Command。
+
+常用按键：
+
+| 按键 | 功能 |
+| --- | --- |
+| `Enter` | 发送 |
+| `Ctrl+N` | 输入换行 |
+| `↑` / `↓` | 浏览当前 Session 的发送历史 |
+| `Ctrl+P` | 搜索命令 |
+| `Ctrl+S` | 打开 Session Board |
+| `Ctrl+J` | 打开 Cron Board |
+| `Ctrl+C` | 停止当前任务 |
+| `Ctrl+R` | 刷新状态 |
+| `Ctrl+Q` | 退出 |
+
+![SJTUClaw TUI](docs/images/readme-tui.svg)
+
+完整操作说明见 [TUI 使用指南](docs/tui.md)。
 
 ## Agent 后端
 
@@ -184,6 +211,7 @@ claw/                 Python 运行时
   workspace/          Workspace 边界与回退
   sandbox/            microsandbox 生命周期与路由
   gateway/            FastAPI、REST、SSE 和静态站点
+  tui/                Textual 全屏终端界面
   pi/                 Pi RPC 适配
   claude/             Claude Code 适配与审批桥接
   channels/           QQ Bot
@@ -211,6 +239,7 @@ npm run build
 ## 文档
 
 - [配置说明](docs/configuration.md)
+- [TUI 使用指南](docs/tui.md)
 - [数据目录](docs/data-directory-guide.md)
 - [Sandbox 架构](docs/sandbox-architecture.md)
 - [测试与开发](docs/testing.md)

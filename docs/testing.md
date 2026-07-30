@@ -8,7 +8,7 @@
 python -m pytest tests/ -v
 ```
 
-当前测试套件可收集 730 项测试；本轮验证基线为 `726 passed, 4 skipped, 2 subtests passed`。
+当前测试套件可收集 741 项测试；本轮验证基线为 `737 passed, 4 skipped, 2 subtests passed`。
 
 覆盖范围包括：
 
@@ -29,7 +29,10 @@ python -m pytest tests/test_gateway_fixes.py -v
 python -m pytest tests/test_security_hardening.py -v
 python -m pytest tests/test_sandbox_integration.py -v
 python -m pytest tests/test_pi_integration.py tests/test_claude_code_integration.py -v
+python -m pytest tests/test_tui.py -v
 ```
+
+TUI 测试使用 Textual Pilot 覆盖响应式布局、输入历史、命令补全、Session / Cron 看板、流式事件、审批、停止任务、并发命令保护和运行时清理，不要求真实终端交互。
 
 只检查收集：
 

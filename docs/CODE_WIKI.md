@@ -11,6 +11,7 @@ Code Wiki 按“一个页面解释一个核心知识实体”组织。建议按�
 | 理解一次请求如何完成 | Agent Runtime → Tool System → Session and Context |
 | 修改安全、审批或文件边界 | Tool System → Security Boundaries → Persistence Layout |
 | 修改 Web UI 或 Gateway | Gateway and Clients → Agent Runtime → Persistence Layout |
+| 修改 TUI | Terminal UI → Gateway and Clients → Agent Runtime |
 | 修改记忆、Skill 或定时任务 | Memory Skill Scheduler → Session and Context |
 | 接入新的 Agent 后端 | External Backends → Agent Runtime → Security Boundaries |
 | 构建 Windows 版本 | Windows Distribution → Persistence Layout → Sandbox 架构 |
@@ -46,6 +47,9 @@ Code Wiki 按“一个页面解释一个核心知识实体”组织。建议按�
   路径切换、原子写入、文件锁、数据目录、回退对象和运行设置加密。
 
 ### 产品与分发
+
+- [Terminal UI](code-wiki/products/terminal-ui.md)
+  Textual 组件树、LocalRuntime、流式事件、Session / Cron 看板、审批和响应式交互。
 
 - [Windows Distribution](code-wiki/products/windows-distribution.md)
   pywebview 桌面壳、静态 Web 资源、PyInstaller、Inno Setup 和安装版路径。
@@ -117,7 +121,7 @@ flowchart TB
 | `claw/scheduler/` | Cron Store、定时器、调度与 Heartbeat | `CronService` |
 | `claw/gateway/` | FastAPI 应用、SSE、上传下载与设置 | `claw.gateway.server:app` |
 | `claw/cli/` | 配置向导、REPL 和 Slash Command | `claw.cli.main:main` |
-| `claw/tui/` | Textual 全屏终端 | `SJTUClawTUI` |
+| `claw/tui/` | Textual 终端驾驶舱与进程内运行时适配 | `SJTUClawTUI`、`LocalRuntime` |
 | `claw/pi/` | Pi JSONL RPC 和 Session 路由 | `PiAgentClient` |
 | `claw/claude/` | Claude Code stream-json、Hook 和 MCP | `ClaudeCodeAgentClient` |
 | `claw/channels/` | 外部消息渠道 | `QQChannel` |
@@ -135,7 +139,7 @@ Desktop 不是另一套 Runtime。`claw/desktop.py` 启动本地 Gateway，再�
 
 ### CLI / TUI
 
-CLI 直接组装与 Gateway 相同的核心对象。TUI 的 `LocalRuntime` 复用 Gateway 的共享运行时对象和命令处理，不通过浏览器。
+CLI 直接组装与 Gateway 相同的核心对象。TUI 的 `LocalRuntime` 在进程内调用 Gateway 的规范处理函数，不启动 HTTP 服务；完整实现见 [[products/terminal-ui]]。
 
 ### 外部子进程
 

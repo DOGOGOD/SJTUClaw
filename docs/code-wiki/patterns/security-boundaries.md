@@ -325,6 +325,7 @@ Trust Tools 会弱化第二类审批，因此配置名明确带 `TRUST_TOOLS`。
 - [[concepts/external-backends]]
 - [[patterns/persistence-layout]]
 - [[concepts/agent-runtime]]
+- [[products/terminal-ui]]
 
 ## 源码依据
 

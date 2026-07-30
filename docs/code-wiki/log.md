@@ -35,3 +35,29 @@
 - Tool System ↔ Security Boundaries ↔ External Backends
 - Memory, Skill and Scheduler ↔ Session and Context ↔ Persistence Layout
 - Gateway and Clients ↔ Windows Distribution ↔ Persistence Layout
+
+## 2026-07-30: Ingest completed TUI implementation
+
+**Source**: `claw/tui/`, `claw/cli/commands.py`, `claw/gateway/server.py`, `tests/test_tui.py`
+
+**New pages**:
+
+- `docs/tui.md`
+- `docs/code-wiki/products/terminal-ui.md`
+
+**Updated pages**:
+
+- `README.md`
+- `docs/CODE_WIKI.md`
+- `docs/testing.md`
+- `中期报告.md`
+- `docs/code-wiki/concepts/gateway-clients.md`
+- `docs/code-wiki/concepts/agent-runtime.md`
+- `docs/code-wiki/concepts/memory-skill-scheduler.md`
+- `docs/code-wiki/patterns/security-boundaries.md`
+
+**New cross-references**:
+
+- Terminal UI ↔ Gateway and Clients ↔ Agent Runtime
+- Terminal UI ↔ Memory, Skill and Scheduler
+- Terminal UI ↔ Security Boundaries ↔ Persistence Layout

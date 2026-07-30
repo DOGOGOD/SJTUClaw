@@ -279,6 +279,7 @@ Heartbeat Session 只保留配置数量的近期消息，避免监控对话无�
 - [[concepts/agent-runtime]]
 - [[concepts/tool-system]]
 - [[patterns/persistence-layout]]
+- [[products/terminal-ui]]
 
 ## 源码依据
 

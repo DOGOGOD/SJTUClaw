@@ -224,6 +224,7 @@ claude   → ClaudeCodeAgentClient.run_agent_turn()
 - [[concepts/tool-system]]
 - [[concepts/external-backends]]
 - [[patterns/security-boundaries]]
+- [[products/terminal-ui]]
 
 ## 源码依据
 

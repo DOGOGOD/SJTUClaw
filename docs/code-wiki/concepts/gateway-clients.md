@@ -249,33 +249,9 @@ Desktop 没有独立业务 API；它是 Gateway + Web UI 的 Windows 容器。
 
 ## TUI
 
-`claw/tui/` 使用 Textual 8.2.8。
+`claw/tui/` 使用 Textual 8.2.8 构建键盘优先终端驾驶舱。`LocalRuntime` 不发起 HTTP 请求，而是在进程内复用 Gateway 的 Session、Streaming Turn、Slash Command、Approval 和 Cron 处理逻辑。
 
-`LocalRuntime` 直接访问共享 Runtime 对象，提供：
-
-- Session 列表与消息
-- Streaming Turn
-- Slash Command
-- 审批
-- Cron Board
-- 停止任务
-- 运行时状态快照
-
-常用快捷键：
-
-```text
-Ctrl+P        命令面板
-Ctrl+S        Session Picker
-Ctrl+J        Cron 看板
-Ctrl+R        刷新
-Ctrl+C        停止任务
-Ctrl+N        输入换行
-↑ / ↓         查看上一条 / 下一条已发送消息
-```
-
-`Ctrl+N` 使用独立终端控制码，不依赖终端保留 Shift 状态。
-`Ctrl+M` 没有绑定；若终端把它与 Enter 合并，TUI 无法区分两者。
-输入 `/` 打开命令候选时，`↑` / `↓` 优先用于选择候选。
+TUI 已具备完整的 Session / Cron 看板、可搜索命令面板、流式工具状态、内联审批、逐 Session 草稿与输入历史、响应式布局和安全退出清理。组件、事件与状态同步算法见 [[products/terminal-ui]]。
 
 ## CLI
 
@@ -328,6 +304,7 @@ Slash Command 由 `claw/cli/commands.py` 集中定义，Web 与 TUI 复用同一
 - [[concepts/agent-runtime]]
 - [[concepts/external-backends]]
 - [[patterns/security-boundaries]]
+- [[products/terminal-ui]]
 - [[products/windows-distribution]]
 
 ## 源码依据

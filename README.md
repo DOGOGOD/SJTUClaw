@@ -59,6 +59,32 @@ sjtuclaw-desktop    本地 Gateway + 桌面窗口
 
 Gateway 默认地址为 <http://127.0.0.1:8000>。
 
+## 总体架构
+
+所有入口共享 Session、上下文和安全边界，并按 Session 选择 Agent 后端。原生 Agent Loop 会持续调用模型与工具，直到生成最终回复：
+
+```mermaid
+flowchart TB
+    Entry["入口<br/>Desktop · Web / API · TUI · CLI · QQ · Cron"]
+    Runtime["共享运行时<br/>Session · Context · Events"]
+    Router{"按 Session 选择后端"}
+
+    Entry --> Runtime --> Router
+    Router --> Native["SJTUClaw Agent Loop<br/>构建上下文 · 调用模型"]
+    Router --> External["Pi / Claude Code<br/>原生 Agent Loop"]
+
+    Native --> Decision{"最终回复 / 工具调用"}
+    Decision -->|工具调用| Tools["校验 · 审批 · 执行工具"]
+    Tools --> Native
+    Decision -->|最终回复| Result["保存 Session · 发布事件"]
+    External --> Result
+
+    Runtime -.-> Services["共享能力<br/>Memory · Skills · Scheduler"]
+    Tools -.-> Boundary["安全边界<br/>Approval · Workspace · Sandbox"]
+```
+
+更具体的调用链、数据模型和模块职责见 [Code Wiki](docs/CODE_WIKI.md)。
+
 ## TUI
 
 ```powershell
@@ -103,23 +129,6 @@ TUI 是直接复用共享运行时的全屏终端界面，不需要先启动 Gat
 ```
 
 默认后端可以在 Web UI“设置 → Agent”或 `AGENT_BACKEND` 中配置。外部后端仍复用 SJTUClaw 的 Session、入口、审批桥接和宿主工具，但它们自己的原生执行环境不属于 microsandbox 隔离范围。
-
-## 总体架构
-
-所有入口共享同一套会话、上下文和安全边界，再按 Session 路由到不同的 Agent 后端：
-
-```mermaid
-flowchart TB
-    Entry["入口<br/>Desktop · Web / API · TUI · CLI · QQ · Cron"]
-    Runtime["共享运行时<br/>Session · Context · Events"]
-    Router{"Agent 路由"}
-    Backends["SJTUClaw · Pi · Claude Code"]
-    Capabilities["能力与边界<br/>Tools · Memory · Skills · Scheduler<br/>Approval · Workspace · Sandbox"]
-
-    Entry --> Runtime --> Router --> Backends --> Capabilities
-```
-
-更具体的调用链、数据模型和模块职责见 [Code Wiki](docs/CODE_WIKI.md)。
 
 ## Workspace、安全模式与 Sandbox
 

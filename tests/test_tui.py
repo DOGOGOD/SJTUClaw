@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
+from types import SimpleNamespace
 
 from textual.widgets import Static
 
 from claw.cli.commands import _COMMAND_PREFIXES
 from claw.tui.app import (
     CommandPanel,
+    ConfirmCronDeleteScreen,
     ConfirmDeleteScreen,
     CronBoard,
     RenameSessionScreen,
@@ -15,7 +17,7 @@ from claw.tui.app import (
     SessionBoard,
 )
 from claw.tui.app import COMMANDS
-from claw.tui.runtime import RuntimeSnapshot
+from claw.tui.runtime import LocalRuntime, RuntimeSnapshot
 
 
 class FakeRuntime:
@@ -54,9 +56,6 @@ class FakeRuntime:
             auto_mode=False,
             sandbox_mode=True,
             unlimited_mode=False,
-            cron_running=True,
-            cron_jobs=1,
-            pending_approvals=0,
         )
 
     async def start(self) -> None:
@@ -94,15 +93,6 @@ class FakeRuntime:
 
     def pending_approvals(self, session_id: str):
         return []
-
-    async def send(self, session_id: str, message: str):
-        self._messages[session_id].extend(
-            [
-                {"role": "user", "content": message},
-                {"role": "assistant", "content": "收到。"},
-            ]
-        )
-        return {"sessionId": session_id, "messages": self._messages[session_id]}
 
     async def stream(self, session_id: str, message: str):
         yield {"type": "ThinkingEvent", "iteration": 1}
@@ -262,6 +252,10 @@ def test_ctrl_p_opens_sjtuclaw_command_panel_and_inserts_selection() -> None:
             await pilot.press("ctrl+p")
             await pilot.pause()
             assert isinstance(app.screen, CommandPanel)
+            first_panel = app.screen
+            await pilot.press("ctrl+p")
+            await pilot.pause()
+            assert app.screen is first_panel
             table = app.screen.query_one("#command-table")
             assert table.row_count == len(COMMANDS)
             assert all(
@@ -277,6 +271,82 @@ def test_ctrl_p_opens_sjtuclaw_command_panel_and_inserts_selection() -> None:
             assert not isinstance(app.screen, CommandPanel)
             assert app.query_one("#composer").text == "/cron "
             assert app.query_one("#composer").has_focus
+
+    asyncio.run(scenario())
+
+
+def test_command_panel_preserves_existing_draft_instead_of_corrupting_it() -> None:
+    async def scenario() -> None:
+        app = SJTUClawTUI(runtime=FakeRuntime())
+        async with app.run_test(size=(120, 36)) as pilot:
+            await pilot.press("保", "留", "草", "稿", "ctrl+p")
+            await pilot.pause()
+            await pilot.press("c", "r", "o", "n", "enter")
+            await pilot.pause()
+
+            assert app.query_one("#composer").text == "保留草稿"
+            assert any(
+                notification.message
+                == "已有草稿，命令未插入；请发送或清空草稿后重试。"
+                for notification in app._notifications
+            )
+
+    asyncio.run(scenario())
+
+
+def test_busy_turn_preserves_new_draft_on_enter() -> None:
+    async def scenario() -> None:
+        app = SJTUClawTUI(runtime=FakeRuntime())
+        async with app.run_test(size=(120, 36)) as pilot:
+            app.busy = True
+            await pilot.press("不", "要", "丢", "失", "enter")
+            await pilot.pause()
+
+            assert app.query_one("#composer").text == "不要丢失"
+            assert any(
+                notification.message == "当前任务仍在运行；草稿已保留。可按 Ctrl+C 停止。"
+                for notification in app._notifications
+            )
+
+    asyncio.run(scenario())
+
+
+def test_busy_approvals_command_does_not_cancel_or_replace_live_turn() -> None:
+    class SlowRuntime(FakeRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.release = asyncio.Event()
+
+        async def stream(self, session_id: str, message: str):
+            yield {"type": "ThinkingEvent", "iteration": 1}
+            await self.release.wait()
+            self._messages[session_id].extend(
+                [
+                    {"role": "user", "content": message},
+                    {"role": "assistant", "content": "完成。"},
+                ]
+            )
+            yield {"type": "_done"}
+
+    async def scenario() -> None:
+        runtime = SlowRuntime()
+        app = SJTUClawTUI(runtime=runtime)
+        async with app.run_test(size=(120, 36)) as pilot:
+            turn_worker = app.execute_turn("长任务")
+            await pilot.pause()
+            assert app.busy
+
+            command_worker = app.execute_command("/approvals")
+            await command_worker.wait()
+            await pilot.pause()
+            assert app.busy
+            assert any(
+                message.get("content") == "长任务"
+                for message in app._ephemeral_messages
+            )
+
+            runtime.release.set()
+            await turn_worker.wait()
 
     asyncio.run(scenario())
 
@@ -362,6 +432,11 @@ def test_tui_opens_each_keyboard_dashboard() -> None:
             await pilot.pause()
             assert isinstance(app.screen, CronBoard)
             assert app.screen.query_one("#cron-table").row_count == 1
+            await pilot.press("x")
+            await pilot.pause()
+            assert isinstance(app.screen, ConfirmCronDeleteScreen)
+            assert app.screen.query_one("#dialog-cancel").has_focus
+            await pilot.press("escape")
             await pilot.press("escape")
 
     asyncio.run(scenario())
@@ -379,6 +454,27 @@ def test_tui_streams_turn_events_and_finishes_cleanly() -> None:
             assert app._ephemeral_messages == []
             assert runtime.messages("session-alpha")[-1]["content"] == "收到。"
             assert len(app.query(".message-card")) == 4
+
+    asyncio.run(scenario())
+
+
+def test_transcript_reuses_unchanged_message_widgets() -> None:
+    async def scenario() -> None:
+        runtime = FakeRuntime()
+        app = SJTUClawTUI(runtime=runtime)
+        async with app.run_test(size=(120, 36)) as pilot:
+            await pilot.pause()
+            first_card = app.query_one("#message-0")
+
+            await app._render_transcript()
+            assert app.query_one("#message-0") is first_card
+
+            runtime._messages["session-alpha"].append(
+                {"role": "assistant", "content": "只追加尾部。"}
+            )
+            await app._render_transcript()
+            assert app.query_one("#message-0") is first_card
+            assert len(app.query(".message-card")) == 3
 
     asyncio.run(scenario())
 
@@ -403,3 +499,75 @@ def test_stream_never_renders_persisted_and_ephemeral_message_twice() -> None:
         (message["role"], message["content"]) for message in remaining
     }
     assert remaining == [{"role": "tool", "content": "仍在运行"}]
+
+
+def test_runtime_start_rolls_back_cron_when_reflection_fails() -> None:
+    class CronService:
+        def __init__(self) -> None:
+            self.started = False
+            self.stopped = False
+
+        def start(self, *, loop) -> None:
+            self.started = True
+
+        def stop(self) -> None:
+            self.stopped = True
+
+    class ReflectionService:
+        def start(self) -> None:
+            raise RuntimeError("reflection failed")
+
+    async def scenario() -> None:
+        cron = CronService()
+        runtime = LocalRuntime.__new__(LocalRuntime)
+        runtime.server = SimpleNamespace(
+            _cron_service=cron,
+            _reflection_mgr=ReflectionService(),
+        )
+        runtime._started = False
+
+        try:
+            await runtime.start()
+        except RuntimeError as exc:
+            assert str(exc) == "reflection failed"
+        else:
+            raise AssertionError("runtime.start() should fail")
+
+        assert cron.started
+        assert cron.stopped
+        assert not runtime._started
+
+    asyncio.run(scenario())
+
+
+def test_runtime_close_attempts_every_cleanup_after_one_failure() -> None:
+    calls: list[str] = []
+
+    class CronService:
+        def stop(self) -> None:
+            calls.append("cron")
+            raise RuntimeError("cron failed")
+
+    class ReflectionService:
+        def stop(self) -> None:
+            calls.append("reflection")
+
+    class SandboxManager:
+        def close_all(self) -> None:
+            calls.append("sandbox")
+
+    async def scenario() -> None:
+        runtime = LocalRuntime.__new__(LocalRuntime)
+        runtime.server = SimpleNamespace(
+            _cron_service=CronService(),
+            _reflection_mgr=ReflectionService(),
+            _sandbox_manager=SandboxManager(),
+        )
+        runtime._started = True
+
+        await runtime.close()
+
+        assert calls == ["cron", "reflection", "sandbox"]
+        assert not runtime._started
+
+    asyncio.run(scenario())

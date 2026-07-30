@@ -281,7 +281,6 @@ export interface PetInfo {
 }
 
 export interface LLMSettings {
-  backend: AgentBackend;
   baseUrl: string;
   apiKeyMasked: string;
   apiKeyConfigured: boolean;
@@ -290,6 +289,20 @@ export interface LLMSettings {
   contextUsageRatio: number;
   maxOutputTokens: number;
   consolidationRatio: number;
+}
+
+export interface AgentInstallation {
+  id: AgentBackend;
+  name: string;
+  description: string;
+  installed: boolean;
+  command: string;
+  status: string;
+}
+
+export interface AgentSettings {
+  backend: AgentBackend;
+  agents: AgentInstallation[];
   piProvider: string;
   piModel: string;
   piThinking: string;
@@ -297,8 +310,6 @@ export interface LLMSettings {
   claudeModel: string;
   claudePermissionMode: string;
   claudeTrustTools: boolean;
-  claudeDetected: boolean;
-  claudeCommand: string;
 }
 
 export interface QQChannelSettings {
@@ -326,6 +337,6 @@ export interface UserAvatarSettings {
   customImage: string;
 }
 
-export type SettingsSection = "prompt" | "soul" | "memory" | "cron" | "skills" | "workspace" | "pet" | "channel" | "llm";
+export type SettingsSection = "prompt" | "soul" | "memory" | "cron" | "skills" | "workspace" | "pet" | "channel" | "agent" | "llm";
 
 export type ShellView = "chat" | "settings";

@@ -320,13 +320,13 @@ SessionBoard,
 CronBoard,
 CommandPanel,
 RenameSessionScreen,
-ConfirmDeleteScreen {
+ConfirmDeleteScreen,
+ConfirmCronDeleteScreen {
     align: center middle;
     background: #070609 70%;
 }
 
-#board,
-#help-card {
+#board {
     width: 88%;
     height: 80%;
     max-width: 132;

@@ -10,9 +10,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, AsyncIterator
+
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -25,9 +29,6 @@ class RuntimeSnapshot:
     auto_mode: bool
     sandbox_mode: bool
     unlimited_mode: bool
-    cron_running: bool
-    cron_jobs: int
-    pending_approvals: int
 
 
 class LocalRuntime:
@@ -42,17 +43,38 @@ class LocalRuntime:
     async def start(self) -> None:
         if self._started:
             return
-        self.server._cron_service.start(loop=asyncio.get_running_loop())
-        self.server._reflection_mgr.start()
+        cron_started = False
+        try:
+            self.server._cron_service.start(loop=asyncio.get_running_loop())
+            cron_started = True
+            self.server._reflection_mgr.start()
+        except Exception:
+            if cron_started:
+                try:
+                    self.server._cron_service.stop()
+                except Exception:
+                    logger.exception(
+                        "TUI 启动回滚时停止 Cron 服务失败"
+                    )
+            raise
         self._started = True
 
     async def close(self) -> None:
         if not self._started:
             return
-        self.server._cron_service.stop()
-        self.server._reflection_mgr.stop()
-        self.server._sandbox_manager.close_all()
-        self._started = False
+        try:
+            cleanup_steps = (
+                ("Cron 服务", self.server._cron_service.stop),
+                ("记忆反思服务", self.server._reflection_mgr.stop),
+                ("Sandbox", self.server._sandbox_manager.close_all),
+            )
+            for label, cleanup in cleanup_steps:
+                try:
+                    cleanup()
+                except Exception:
+                    logger.exception("TUI 关闭时清理 %s 失败", label)
+        finally:
+            self._started = False
 
     def ensure_session(self) -> str:
         return self.server._session_store.ensure_default_session().session_id
@@ -74,10 +96,6 @@ class LocalRuntime:
             return []
         session = self.server._session_store.get(session_id)
         return self.server._visible_messages(session)
-
-    async def send(self, session_id: str, message: str) -> dict[str, Any]:
-        request = self.server.ChatRequest(session_id=session_id, message=message)
-        return await self.server.handle_chat(request)
 
     async def stream(
         self, session_id: str, message: str
@@ -157,7 +175,6 @@ class LocalRuntime:
             workspace_text = "sandbox:/workspace"
         else:
             workspace_text = str(workspace or "未绑定")
-        cron_status = self.server._cron_service.status()
         return RuntimeSnapshot(
             session_id=session_id,
             title=session.title,
@@ -167,9 +184,6 @@ class LocalRuntime:
             auto_mode=self.server._auto_mode.get(session_id, False),
             sandbox_mode=self.server._session_sandbox_mode(session_id),
             unlimited_mode=self.server._workspace_manager.is_unlimited(session_id),
-            cron_running=bool(cron_status["enabled"]),
-            cron_jobs=int(cron_status["jobs"]),
-            pending_approvals=len(self.pending_approvals(session_id)),
         )
 
     @staticmethod

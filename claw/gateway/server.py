@@ -3174,17 +3174,7 @@ def _float_setting(name: str, default: float) -> float:
 
 def _llm_settings_payload() -> dict[str, Any]:
     api_key = setting_value("LLM_API_KEY", "").strip()
-    backend = setting_value("AGENT_BACKEND", "sjtuclaw").strip().lower()
-    if backend not in {"sjtuclaw", "pi", "claude"}:
-        backend = "sjtuclaw"
-    try:
-        from claw.claude import resolve_claude_code_command
-
-        claude_command = " ".join(resolve_claude_code_command())
-    except Exception:
-        claude_command = ""
     return {
-        "backend": backend,
         "baseUrl": setting_value("LLM_BASE_URL", "https://api.openai.com/v1").strip(),
         "apiKeyMasked": _masked(api_key),
         "apiKeyConfigured": bool(api_key),
@@ -3193,6 +3183,71 @@ def _llm_settings_payload() -> dict[str, Any]:
         "contextUsageRatio": _float_setting("LLM_CONTEXT_USAGE_RATIO", 0.8),
         "maxOutputTokens": _int_setting("LLM_MAX_OUTPUT_TOKENS", 4096),
         "consolidationRatio": _float_setting("LLM_CONSOLIDATION_RATIO", 0.5),
+    }
+
+
+def _agent_installations_payload() -> list[dict[str, Any]]:
+    from claw.claude import resolve_claude_code_command
+    from claw.pi import resolve_pi_command
+
+    agents: list[dict[str, Any]] = [
+        {
+            "id": "sjtuclaw",
+            "name": "SJTUClaw",
+            "description": "内置 Agent，使用 LLM 设置中的模型与上下文配置。",
+            "installed": True,
+            "command": "内置运行时",
+            "status": "随 SJTUClaw 提供",
+        }
+    ]
+    probes = (
+        (
+            "claude",
+            "Claude Code",
+            "沿用本机 Claude Code 的登录、模型、Skills 与 MCP 配置。",
+            resolve_claude_code_command,
+        ),
+        (
+            "pi",
+            "Pi Agent",
+            "通过官方 RPC 接入 Pi coding agent 的完整工具循环。",
+            resolve_pi_command,
+        ),
+    )
+    for agent_id, name, description, resolver in probes:
+        try:
+            command = " ".join(resolver())
+            agents.append(
+                {
+                    "id": agent_id,
+                    "name": name,
+                    "description": description,
+                    "installed": True,
+                    "command": command,
+                    "status": "已检测到可用命令",
+                }
+            )
+        except Exception as exc:
+            agents.append(
+                {
+                    "id": agent_id,
+                    "name": name,
+                    "description": description,
+                    "installed": False,
+                    "command": "",
+                    "status": str(exc),
+                }
+            )
+    return agents
+
+
+def _agent_settings_payload() -> dict[str, Any]:
+    backend = setting_value("AGENT_BACKEND", "sjtuclaw").strip().lower()
+    if backend not in {"sjtuclaw", "pi", "claude"}:
+        backend = "sjtuclaw"
+    return {
+        "backend": backend,
+        "agents": _agent_installations_payload(),
         "piProvider": setting_value("PI_PROVIDER", "").strip(),
         "piModel": setting_value("PI_MODEL", "").strip(),
         "piThinking": setting_value("PI_THINKING", "").strip(),
@@ -3206,8 +3261,6 @@ def _llm_settings_payload() -> dict[str, Any]:
             "CLAUDE_CODE_TRUST_TOOLS",
             "false",
         ).strip().lower() in {"1", "true", "yes", "on"},
-        "claudeDetected": bool(claude_command),
-        "claudeCommand": claude_command,
     }
 
 
@@ -3286,7 +3339,9 @@ def _apply_llm_runtime_config() -> None:
     global _config
     settings = _llm_settings_payload()
     api_key = setting_value("LLM_API_KEY", "").strip()
-    backend = settings["backend"]
+    backend = setting_value("AGENT_BACKEND", "sjtuclaw").strip().lower()
+    if backend not in {"sjtuclaw", "pi", "claude"}:
+        backend = "sjtuclaw"
     if backend == "sjtuclaw" and not api_key:
         raise HTTPException(status_code=400, detail="请填写 LLM API Key")
     if backend == "sjtuclaw" and not settings["model"]:
@@ -3347,7 +3402,6 @@ async def _ensure_qq_runtime_started() -> None:
 
 
 class LLMSettingsRequest(BaseModel):
-    backend: str = "sjtuclaw"
     base_url: str = Field(alias="baseUrl")
     api_key: str | None = Field(default=None, alias="apiKey")
     model: str
@@ -3355,6 +3409,10 @@ class LLMSettingsRequest(BaseModel):
     context_usage_ratio: float = Field(alias="contextUsageRatio")
     max_output_tokens: int = Field(alias="maxOutputTokens")
     consolidation_ratio: float = Field(alias="consolidationRatio")
+
+
+class AgentSettingsRequest(BaseModel):
+    backend: str = "sjtuclaw"
     pi_provider: str = Field(default="", alias="piProvider")
     pi_model: str = Field(default="", alias="piModel")
     pi_thinking: str = Field(default="", alias="piThinking")
@@ -3388,6 +3446,50 @@ def get_llm_settings():
 
 @app.put("/settings/llm")
 def update_llm_settings(req: LLMSettingsRequest):
+    if req.base_url.strip():
+        _validate_url(req.base_url.strip(), "Base_url")
+    backend = setting_value("AGENT_BACKEND", "sjtuclaw").strip().lower()
+    if backend == "sjtuclaw" and not req.model.strip():
+        raise HTTPException(status_code=400, detail="请填写 LLM 模型名称")
+    if req.context_window < 1024:
+        raise HTTPException(status_code=400, detail="Context window 不能小于 1024")
+    if req.context_usage_ratio <= 0 or req.context_usage_ratio > 1:
+        raise HTTPException(status_code=400, detail="Context usage ratio 必须在 0 到 1 之间")
+    if req.max_output_tokens < 1:
+        raise HTTPException(status_code=400, detail="Max output tokens 必须大于 0")
+    if req.consolidation_ratio <= 0 or req.consolidation_ratio > 1:
+        raise HTTPException(status_code=400, detail="Consolidation ratio 必须在 0 到 1 之间")
+
+    previous_settings = load_runtime_settings_raw()
+    updates: dict[str, Any] = {
+        "LLM_BASE_URL": req.base_url,
+        "LLM_MODEL": req.model,
+        "LLM_CONTEXT_WINDOW": req.context_window,
+        "LLM_CONTEXT_USAGE_RATIO": req.context_usage_ratio,
+        "LLM_MAX_OUTPUT_TOKENS": req.max_output_tokens,
+        "LLM_CONSOLIDATION_RATIO": req.consolidation_ratio,
+    }
+    if req.api_key:
+        updates["LLM_API_KEY"] = req.api_key
+    update_runtime_settings(updates)
+    try:
+        _apply_llm_runtime_config()
+    except HTTPException:
+        replace_runtime_settings_raw(previous_settings)
+        raise
+    except Exception as exc:
+        replace_runtime_settings_raw(previous_settings)
+        raise HTTPException(status_code=400, detail=f"LLM 配置应用失败: {exc}") from exc
+    return {"ok": True, "settings": _llm_settings_payload()}
+
+
+@app.get("/settings/agent")
+def get_agent_settings():
+    return {"ok": True, "settings": _agent_settings_payload()}
+
+
+@app.put("/settings/agent")
+def update_agent_settings(req: AgentSettingsRequest):
     backend = req.backend.strip().lower()
     pi_thinking = req.pi_thinking.strip().lower()
     claude_permission_mode = req.claude_permission_mode.strip() or "default"
@@ -3409,28 +3511,19 @@ def update_llm_settings(req: LLMSettingsRequest):
             status_code=400,
             detail="Claude Code permission mode 无效",
         )
-    if req.base_url.strip():
-        _validate_url(req.base_url.strip(), "Base_url")
-    if backend == "sjtuclaw" and not req.model.strip():
-        raise HTTPException(status_code=400, detail="请填写 LLM 模型名称")
-    if req.context_window < 1024:
-        raise HTTPException(status_code=400, detail="Context window 不能小于 1024")
-    if req.context_usage_ratio <= 0 or req.context_usage_ratio > 1:
-        raise HTTPException(status_code=400, detail="Context usage ratio 必须在 0 到 1 之间")
-    if req.max_output_tokens < 1:
-        raise HTTPException(status_code=400, detail="Max output tokens 必须大于 0")
-    if req.consolidation_ratio <= 0 or req.consolidation_ratio > 1:
-        raise HTTPException(status_code=400, detail="Consolidation ratio 必须在 0 到 1 之间")
+
+    installation = {
+        item["id"]: item for item in _agent_installations_payload()
+    }.get(backend)
+    if not installation or not installation["installed"]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{installation['name'] if installation else backend} 尚未安装或不可用",
+        )
 
     previous_settings = load_runtime_settings_raw()
     updates: dict[str, Any] = {
         "AGENT_BACKEND": backend,
-        "LLM_BASE_URL": req.base_url,
-        "LLM_MODEL": req.model,
-        "LLM_CONTEXT_WINDOW": req.context_window,
-        "LLM_CONTEXT_USAGE_RATIO": req.context_usage_ratio,
-        "LLM_MAX_OUTPUT_TOKENS": req.max_output_tokens,
-        "LLM_CONSOLIDATION_RATIO": req.consolidation_ratio,
         "PI_PROVIDER": req.pi_provider.strip(),
         "PI_MODEL": req.pi_model.strip(),
         "PI_THINKING": pi_thinking,
@@ -3441,8 +3534,6 @@ def update_llm_settings(req: LLMSettingsRequest):
             "true" if req.claude_trust_tools else "false"
         ),
     }
-    if req.api_key:
-        updates["LLM_API_KEY"] = req.api_key
     update_runtime_settings(updates)
     try:
         _apply_llm_runtime_config()
@@ -3451,8 +3542,8 @@ def update_llm_settings(req: LLMSettingsRequest):
         raise
     except Exception as exc:
         replace_runtime_settings_raw(previous_settings)
-        raise HTTPException(status_code=400, detail=f"LLM 配置应用失败: {exc}") from exc
-    return {"ok": True, "settings": _llm_settings_payload()}
+        raise HTTPException(status_code=400, detail=f"Agent 配置应用失败: {exc}") from exc
+    return {"ok": True, "settings": _agent_settings_payload()}
 
 
 @app.get("/settings/ui/avatar")

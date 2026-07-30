@@ -19,7 +19,7 @@ dependencies = [
     "qrcode>=7.0",
     "cryptography>=41.0",
     "tzlocal>=5.0",
-    "textual>=8.2,<9",
+    "textual==8.2.8",
 ]
 
 [project.scripts]
@@ -45,3 +45,4 @@ include = ["claw*"]
 [tool.setuptools.package-data]
 "claw.pet" = ["assets/*/pet.json", "assets/*/spritesheet.webp", "assets/*/spritesheet.png"]
 "claw.pi" = ["*.ts"]
+"claw.tui" = ["*.tcss"]

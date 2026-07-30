@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import sys
 import threading
 from asyncio import AbstractEventLoop, get_running_loop, run_coroutine_threadsafe
 from ctypes import byref, wintypes
@@ -123,7 +122,7 @@ class SJTUClawWindowsDriver(WindowsDriver):
     def start_application_mode(self) -> None:
         loop = get_running_loop()
         self._restore_console = win32.enable_application_mode()
-        self._writer_thread = WriterThread(sys.__stdout__)
+        self._writer_thread = WriterThread(self._file)
         self._writer_thread.start()
 
         self.write("\x1b[?1049h")

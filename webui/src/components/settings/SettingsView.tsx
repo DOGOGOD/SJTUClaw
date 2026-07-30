@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   AlertCircle,
   ArrowLeft,
@@ -6,6 +6,7 @@ import {
   Brain,
   CheckCircle2,
   Clock,
+  Cpu,
   Database,
   Eye,
   EyeOff,
@@ -48,6 +49,7 @@ import type {
   LLMSettings,
 } from "@/lib/types";
 import { PetSettingsSection } from "@/components/settings/PetSettingsSection";
+import { AgentSettingsSection } from "@/components/settings/AgentSettingsSection";
 
 interface SettingsViewProps {
   theme: "light" | "dark";
@@ -63,7 +65,8 @@ const SECTIONS: { key: SettingsSection; label: string; Icon: typeof FileText }[]
   { key: "soul", label: "Soul", Icon: Brain },
   { key: "memory", label: "Memory", Icon: Database },
   { key: "channel", label: "Channel", Icon: RadioTower },
-  { key: "llm", label: "LLM", Icon: Bot },
+  { key: "agent", label: "Agent", Icon: Bot },
+  { key: "llm", label: "LLM", Icon: Cpu },
   { key: "cron", label: "Cron Jobs", Icon: Clock },
   { key: "skills", label: "Skills", Icon: Wrench },
   { key: "pet", label: "Pet", Icon: PawPrint },
@@ -72,6 +75,16 @@ const SECTIONS: { key: SettingsSection; label: string; Icon: typeof FileText }[]
 export function SettingsView({
   theme, activeSection, onToggleTheme, onBackToChat, onSectionChange, activeSessionId,
 }: SettingsViewProps) {
+  const activeNavItemRef = useRef<HTMLButtonElement | null>(null);
+
+  useEffect(() => {
+    activeNavItemRef.current?.scrollIntoView({
+      behavior: "auto",
+      block: "nearest",
+      inline: "center",
+    });
+  }, [activeSection]);
+
   return (
     <div className="flex h-full min-h-0 flex-col bg-background md:flex-row">
       {/* Settings sidebar */}
@@ -86,6 +99,7 @@ export function SettingsView({
           {SECTIONS.map((s) => (
             <button
               key={s.key}
+              ref={activeSection === s.key ? activeNavItemRef : undefined}
               onClick={() => onSectionChange(s.key)}
               className={cn(
                 "flex shrink-0 items-center gap-2.5 rounded-xl px-3 py-2 text-[13px] text-left transition-colors duration-150",
@@ -117,6 +131,7 @@ export function SettingsView({
           {activeSection === "soul" && <SoulSection />}
           {activeSection === "memory" && <MemorySection />}
           {activeSection === "channel" && <ChannelSection />}
+          {activeSection === "agent" && <AgentSettingsSection />}
           {activeSection === "llm" && <LLMSection />}
           {activeSection === "cron" && <CronSection activeSessionId={activeSessionId} />}
           {activeSection === "skills" && <SkillsSection />}
@@ -430,7 +445,6 @@ function LLMSection() {
         return "Base_url 必须是完整 URL";
       }
     }
-    if (settings.backend === "sjtuclaw" && !settings.model.trim()) return "请填写模型名称";
     if (!Number.isFinite(settings.contextWindow) || settings.contextWindow < 1024) return "Context window 不能小于 1024";
     if (settings.contextUsageRatio <= 0 || settings.contextUsageRatio > 1) return "Context usage ratio 必须在 0 到 1 之间";
     if (settings.maxOutputTokens < 1) return "Max output tokens 必须大于 0";
@@ -454,7 +468,7 @@ function LLMSection() {
       });
       setSettings(data.settings);
       setApiKey("");
-      setMessage("已保存；后端默认值用于新会话，当前会话可用 /pi 或 /claude 切换");
+      setMessage("LLM 配置已保存并动态应用");
       setTimeout(() => setMessage(""), 2600);
     } catch (err) {
       setError(loadErrorMessage(err));
@@ -472,94 +486,9 @@ function LLMSection() {
   );
 
   return (
-    <Section title="Agent 与 LLM 设置" desc="配置新会话的默认 Agent 后端；已有会话保持各自状态，可用 /pi 或 /claude 单独切换。">
+    <Section title="LLM 设置" desc="配置内置 Agent 使用的大语言模型连接、上下文窗口与输出参数。">
       <div className="rounded-xl border border-border/60 bg-card/40 p-4">
         <div className="grid gap-3">
-          <div>
-            <FieldLabel>新会话默认 Agent backend</FieldLabel>
-            <select
-              className="mt-1 h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
-              value={settings.backend}
-              onChange={(e) => setSettings({ ...settings, backend: e.target.value as "sjtuclaw" | "pi" | "claude" })}
-            >
-              <option value="sjtuclaw">SJTUClaw 内置 Agent</option>
-              <option value="pi">Pi Agent</option>
-              <option value="claude">Claude Code</option>
-            </select>
-          </div>
-          {settings.backend === "pi" && (
-            <div className="grid gap-3 rounded-lg border border-border/50 bg-background/40 p-3 md:grid-cols-2">
-              <div>
-                <FieldLabel>Pi provider（可选）</FieldLabel>
-                <Input className="mt-1" value={settings.piProvider} onChange={(e) => setSettings({ ...settings, piProvider: e.target.value })} placeholder="留空则复用下方 LLM 或 Pi auth" />
-              </div>
-              <div>
-                <FieldLabel>Pi model（可选）</FieldLabel>
-                <Input className="mt-1" value={settings.piModel} onChange={(e) => setSettings({ ...settings, piModel: e.target.value })} placeholder="provider 原生模型 ID" />
-              </div>
-              <div>
-                <FieldLabel>Pi thinking</FieldLabel>
-                <select
-                  className="mt-1 h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
-                  value={settings.piThinking}
-                  onChange={(e) => setSettings({ ...settings, piThinking: e.target.value })}
-                >
-                  <option value="">使用 Pi 默认值</option>
-                  {['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].map((level) => <option key={level} value={level}>{level}</option>)}
-                </select>
-              </div>
-              <label className="flex items-center gap-2 self-end pb-2 text-sm">
-                <input type="checkbox" checked={settings.piTrustTools} onChange={(e) => setSettings({ ...settings, piTrustTools: e.target.checked })} />
-                信任 Pi 的写入和 Shell 工具（跳过审批）
-              </label>
-            </div>
-          )}
-          {settings.backend === "claude" && (
-            <div className="grid gap-3 rounded-lg border border-border/50 bg-background/40 p-3 md:grid-cols-2">
-              <div className="md:col-span-2">
-                <FieldLabel>本机 Claude Code</FieldLabel>
-                <p className={`mt-1 text-sm ${settings.claudeDetected ? "text-emerald-600 dark:text-emerald-400" : "text-destructive"}`}>
-                  {settings.claudeDetected
-                    ? `已自动检测：${settings.claudeCommand}`
-                    : "暂未检测到；请先安装 Claude Code，或在 .env 中设置 CLAUDE_CODE_PATH"}
-                </p>
-              </div>
-              <div>
-                <FieldLabel>Claude model（可选）</FieldLabel>
-                <Input
-                  className="mt-1"
-                  value={settings.claudeModel}
-                  onChange={(e) => setSettings({ ...settings, claudeModel: e.target.value })}
-                  placeholder="留空则沿用 Claude Code 默认模型"
-                />
-              </div>
-              <div>
-                <FieldLabel>Claude permission mode</FieldLabel>
-                <select
-                  className="mt-1 h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
-                  value={settings.claudePermissionMode}
-                  onChange={(e) => setSettings({ ...settings, claudePermissionMode: e.target.value })}
-                >
-                  <option value="default">default（推荐，危险操作需审批）</option>
-                  <option value="acceptEdits">acceptEdits（编辑仍需 SJTUClaw 审批）</option>
-                  <option value="plan">plan</option>
-                  <option value="dontAsk">dontAsk</option>
-                  <option value="auto">auto</option>
-                </select>
-              </div>
-              <label className="flex items-center gap-2 text-sm md:col-span-2">
-                <input
-                  type="checkbox"
-                  checked={settings.claudeTrustTools}
-                  onChange={(e) => setSettings({ ...settings, claudeTrustTools: e.target.checked })}
-                />
-                信任 Claude Code 的所有工具（跳过 SJTUClaw 与 Claude Code 审批，仅限可信环境）
-              </label>
-              <p className="text-xs text-muted-foreground md:col-span-2">
-                搜索、读取和查询无需 SJTUClaw 审批；写入、删除及其他会改变状态的操作仍会请求确认。
-              </p>
-            </div>
-          )}
           <div>
             <FieldLabel>Base_url</FieldLabel>
             <Input className="mt-1" value={settings.baseUrl} onChange={(e) => setSettings({ ...settings, baseUrl: e.target.value })} placeholder="https://api.example.com/v1" />

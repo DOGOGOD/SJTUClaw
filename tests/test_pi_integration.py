@@ -417,7 +417,6 @@ def test_apply_runtime_config_accepts_pi_without_legacy_credentials(monkeypatch)
     from claw.gateway import server
 
     settings = {
-        "backend": "pi",
         "baseUrl": "https://api.openai.com/v1",
         "model": "",
         "contextWindow": 32000,
@@ -427,7 +426,11 @@ def test_apply_runtime_config_accepts_pi_without_legacy_credentials(monkeypatch)
     }
     configured = []
     monkeypatch.setattr(server, "_llm_settings_payload", lambda: settings)
-    monkeypatch.setattr(server, "setting_value", lambda *_args: "")
+    monkeypatch.setattr(
+        server,
+        "setting_value",
+        lambda name, *_args: "pi" if name == "AGENT_BACKEND" else "",
+    )
     monkeypatch.setattr(server._llm_client, "set_config", configured.append)
 
     server._apply_llm_runtime_config()
@@ -438,19 +441,13 @@ def test_apply_runtime_config_accepts_pi_without_legacy_credentials(monkeypatch)
 def test_settings_reject_invalid_pi_thinking_before_applying_runtime():
     from claw.gateway import server
 
-    request = server.LLMSettingsRequest(
+    request = server.AgentSettingsRequest(
         backend="pi",
-        baseUrl="",
-        model="",
-        contextWindow=32000,
-        contextUsageRatio=0.8,
-        maxOutputTokens=4096,
-        consolidationRatio=0.5,
         piThinking="turbo",
     )
 
     with pytest.raises(HTTPException, match="Pi thinking level 无效") as exc_info:
-        server.update_llm_settings(request)
+        server.update_agent_settings(request)
 
     assert exc_info.value.status_code == 400
 

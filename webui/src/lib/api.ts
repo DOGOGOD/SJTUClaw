@@ -284,7 +284,6 @@ export async function fetchLLMSettings(): Promise<{ ok: boolean; settings: impor
 }
 
 export async function saveLLMSettings(data: {
-  backend: "sjtuclaw" | "pi" | "claude";
   baseUrl: string;
   apiKey?: string;
   model: string;
@@ -292,6 +291,19 @@ export async function saveLLMSettings(data: {
   contextUsageRatio: number;
   maxOutputTokens: number;
   consolidationRatio: number;
+}): Promise<{ ok: boolean; settings: import("@/lib/types").LLMSettings }> {
+  return request("/settings/llm", {
+    method: "PUT",
+    body: JSON.stringify(data),
+  });
+}
+
+export async function fetchAgentSettings(): Promise<{ ok: boolean; settings: import("@/lib/types").AgentSettings }> {
+  return request("/settings/agent");
+}
+
+export async function saveAgentSettings(data: {
+  backend: import("@/lib/types").AgentBackend;
   piProvider: string;
   piModel: string;
   piThinking: string;
@@ -299,8 +311,8 @@ export async function saveLLMSettings(data: {
   claudeModel: string;
   claudePermissionMode: string;
   claudeTrustTools: boolean;
-}): Promise<{ ok: boolean; settings: import("@/lib/types").LLMSettings }> {
-  return request("/settings/llm", {
+}): Promise<{ ok: boolean; settings: import("@/lib/types").AgentSettings }> {
+  return request("/settings/agent", {
     method: "PUT",
     body: JSON.stringify(data),
   });

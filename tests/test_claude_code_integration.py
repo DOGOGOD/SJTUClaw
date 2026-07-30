@@ -789,19 +789,13 @@ def test_claude_settings_reject_unsafe_or_unsupported_permission_modes(
 
     from claw.gateway import server
 
-    request = server.LLMSettingsRequest(
+    request = server.AgentSettingsRequest(
         backend="claude",
-        baseUrl="",
-        model="",
-        contextWindow=32000,
-        contextUsageRatio=0.8,
-        maxOutputTokens=4096,
-        consolidationRatio=0.5,
         claudePermissionMode=permission_mode,
     )
 
     with pytest.raises(HTTPException, match="permission mode 无效"):
-        server.update_llm_settings(request)
+        server.update_agent_settings(request)
 
 
 def test_runtime_router_dispatches_claude_session(tmp_path):

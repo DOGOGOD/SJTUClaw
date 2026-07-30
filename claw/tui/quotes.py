@@ -11,7 +11,11 @@ QUOTES: tuple[tuple[str, str], ...] = (
     ("The best way to predict the future is to invent it.", "Alan Kay"),
     ("Talk is cheap. Show me the code.", "Linus Torvalds"),
     ("Make it work, make it right, make it fast.", "Kent Beck"),
-    ("The purpose of abstraction is not to be vague, but to create a new semantic level.", "Edsger W. Dijkstra"),
+    (
+        "The purpose of abstraction is not to be vague, "
+        "but to create a new semantic level.",
+        "Edsger W. Dijkstra",
+    ),
     ("Any sufficiently advanced technology is indistinguishable from magic.", "Arthur C. Clarke"),
     ("First, solve the problem. Then, write the code.", "John Johnson"),
     ("Controlling complexity is the essence of computer programming.", "Brian Kernighan"),

@@ -10,6 +10,7 @@ from claw.pi.client import (
     initialize_session_backends,
     is_pi_backend,
     load_pi_config,
+    resolve_pi_command,
     set_session_backend,
 )
 
@@ -23,5 +24,6 @@ __all__ = [
     "initialize_session_backends",
     "is_pi_backend",
     "load_pi_config",
+    "resolve_pi_command",
     "set_session_backend",
 ]

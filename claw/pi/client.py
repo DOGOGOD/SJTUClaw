@@ -281,10 +281,14 @@ def _preferred_windows_bash() -> Path | None:
     return None
 
 
-def _resolve_pi_command() -> tuple[str, ...]:
+def resolve_pi_command() -> tuple[str, ...]:
+    """Find the Pi coding agent command available to the current process."""
     raw = setting_value("PI_COMMAND", "").strip()
     if raw:
-        return tuple(part.strip('"') for part in shlex.split(raw, posix=False))
+        command = tuple(part.strip('"') for part in shlex.split(raw, posix=False))
+        if not command or not command[0]:
+            raise PiError("PI_COMMAND 为空。")
+        return command
     cli_raw = setting_value("PI_CLI_PATH", "").strip()
     node = setting_value("PI_NODE_PATH", "").strip() or shutil.which("node")
     cli = Path(cli_raw).expanduser().resolve() if cli_raw else _default_pi_repo() / "packages" / "coding-agent" / "dist" / "cli.js"
@@ -298,6 +302,10 @@ def _resolve_pi_command() -> tuple[str, ...]:
     raise PiError("找不到可运行的 Pi。请先构建相邻 pi 仓库，或设置 PI_COMMAND / PI_CLI_PATH。")
 
 
+# Kept as a private alias for integrations that imported the old helper.
+_resolve_pi_command = resolve_pi_command
+
+
 def load_pi_config() -> PiRuntimeConfig:
     cwd = setting_value("PI_CWD", "").strip()
     sessions = setting_value("PI_SESSION_DIR", "").strip()
@@ -307,7 +315,7 @@ def load_pi_config() -> PiRuntimeConfig:
     except ValueError:
         timeout = 1800.0
     return PiRuntimeConfig(
-        command=_resolve_pi_command(),
+        command=resolve_pi_command(),
         cwd=Path(cwd).expanduser().resolve() if cwd else MAIN_DIR.resolve(),
         session_dir=Path(sessions).expanduser().resolve() if sessions else (DATA_DIR / "pi" / "sessions").resolve(),
         provider=setting_value("PI_PROVIDER", "").strip(),

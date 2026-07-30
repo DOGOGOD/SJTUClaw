@@ -3,7 +3,8 @@
 Usage:
     sjtuclaw gateway              Start the HTTP + WebSocket gateway
     sjtuclaw setup                Interactive setup wizard
-    sjtuclaw chat                 Start interactive CLI chat (default)
+    sjtuclaw tui                  Start the full-screen terminal UI
+    sjtuclaw chat                 Start interactive CLI chat
 
 Follows the CLI structure: ``sjtuclaw gateway``, ``sjtuclaw setup``, etc.
 """
@@ -592,26 +593,41 @@ def _cmd_chat() -> int:
     return chat_main()
 
 
+def _cmd_tui() -> int:
+    """Start the full-screen terminal interface."""
+    from claw.tui import main as tui_main
+    return tui_main()
+
+
 def main() -> int:
     force_utf8_stdio()
     parser = argparse.ArgumentParser(
         prog="sjtuclaw",
         description="SJTUClaw — AI Agent with QQ Bot support",
     )
-    sub = parser.add_subparsers(dest="command", help="Available commands")
+    sub = parser.add_subparsers(
+        dest="command",
+        help="Available commands",
+        required=True,
+    )
 
     sub.add_parser("gateway", help="Start the HTTP + WebSocket gateway")
     sub.add_parser("chat",    help="Start interactive CLI chat")
+    sub.add_parser("tui",     help="Start the full-screen terminal UI")
     sub.add_parser("setup",   help="Interactive setup wizard")
 
     args = parser.parse_args()
 
     if args.command == "gateway":
         return _cmd_gateway()
+    elif args.command == "chat":
+        return _cmd_chat()
+    elif args.command == "tui":
+        return _cmd_tui()
     elif args.command == "setup":
         return _cmd_setup()
-    else:
-        return _cmd_chat()
+    parser.error(f"unsupported command: {args.command}")
+    return 2
 
 
 if __name__ == "__main__":

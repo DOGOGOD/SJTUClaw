@@ -18,6 +18,7 @@ httpx==0.28.1
 qrcode==8.2
 cryptography==44.0.1
 tzlocal==5.3.1
+textual==8.2.8
 
 # Windows desktop launcher and packaging
 pywebview==6.2.1

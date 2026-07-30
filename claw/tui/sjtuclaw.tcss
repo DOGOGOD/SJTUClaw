@@ -1,0 +1,538 @@
+$bg: #100e12;
+$surface: #171419;
+$raised: #1e1a20;
+$line: #302a33;
+$line-soft: #242027;
+$text: #eee8e2;
+$muted: #837b87;
+$red: #d83950;
+$red-bright: #f04f65;
+$gold: #e8ad52;
+$green: #4bc69b;
+
+Screen {
+    background: $bg;
+    color: $text;
+}
+
+#brand-header {
+    height: 1;
+    background: #19151b;
+    color: $text;
+    padding: 0 1;
+}
+
+#top-status {
+    height: 2;
+    padding: 0 2;
+    content-align-vertical: middle;
+    border-bottom: solid $line;
+    background: $surface;
+}
+
+#run-state {
+    width: 11;
+    text-style: bold;
+}
+
+.status-ready { color: $green; }
+.status-busy { color: $gold; }
+
+#session-title {
+    width: 1fr;
+    text-style: bold;
+    color: $text;
+}
+
+.mode-pill {
+    width: auto;
+    min-width: 10;
+    height: 1;
+    margin-left: 1;
+    padding: 0 1;
+    background: #282229;
+    color: #c9c1ca;
+    text-align: center;
+    text-style: bold;
+}
+
+#backend-pill {
+    color: $gold;
+}
+
+#workspace-shell {
+    height: 1fr;
+}
+
+.rail-title-row {
+    height: 2;
+}
+
+.rail-title {
+    width: 1fr;
+    height: 2;
+    color: #8f8793;
+    text-style: bold;
+    padding: 0 1;
+}
+
+.icon-button {
+    min-width: 3;
+    width: 3;
+    height: 1;
+    border: none;
+    background: transparent;
+    color: $red-bright;
+    padding: 0;
+}
+
+.icon-button:hover {
+    background: #33242a;
+    color: white;
+}
+
+#conversation {
+    width: 1fr;
+    background: $bg;
+}
+
+#transcript {
+    width: 100%;
+    height: 1fr;
+    padding: 1 0 0 4;
+    scrollbar-color: #493b43 transparent;
+    scrollbar-size: 1 1;
+}
+
+.message-card {
+    width: 100%;
+    height: auto;
+    margin: 0 0 1 0;
+    padding: 1 2 1 2;
+    border: none;
+    background: transparent;
+}
+
+.message-card.role-user {
+    background: #1b171c;
+    border-left: thick $red;
+}
+
+.message-card.role-assistant {
+    padding-left: 3;
+    background: transparent;
+}
+
+.message-card.role-tool {
+    margin-left: 2;
+    max-width: 118;
+    padding: 0 1;
+    background: #111619;
+    border-left: solid #397f75;
+}
+
+.message-role {
+    height: 1;
+    margin-bottom: 0;
+    color: #887f8b;
+    text-style: bold;
+}
+
+.role-user .message-role { color: $red-bright; }
+.role-assistant .message-role { color: $gold; }
+.role-tool .message-role { color: #5fc6b5; }
+
+.message-body {
+    width: 100%;
+    height: auto;
+    color: #ddd6d0;
+}
+
+#welcome-panel {
+    width: 100%;
+    max-width: 92;
+    height: auto;
+    margin: 2 0 0 1;
+    padding: 2 3;
+    border-left: thick $red;
+    background: #151217;
+}
+
+.welcome-glyph {
+    height: 2;
+    color: $red;
+    text-style: bold;
+}
+
+.welcome-title {
+    height: 2;
+    color: $text;
+    text-style: bold;
+}
+
+.welcome-copy {
+    height: auto;
+    color: #aaa2ac;
+    margin-bottom: 2;
+}
+
+.quote {
+    height: auto;
+    color: #958b98;
+    text-style: italic;
+    border-top: solid $line-soft;
+    padding-top: 1;
+}
+
+#command-hints {
+    display: none;
+    height: auto;
+    max-height: 18;
+    margin: 0 0 0 4;
+    padding: 1 2;
+    border: solid $line;
+    background: #211b21;
+}
+
+#composer-shell {
+    height: 5;
+    min-height: 4;
+    margin: 0 0 0 4;
+    border: solid #3a323b;
+    background: #19161b;
+}
+
+#composer-shell:focus-within {
+    border: solid $red;
+}
+
+#prompt-mark {
+    width: 3;
+    padding: 1 0 0 1;
+    color: $red-bright;
+    text-style: bold;
+}
+
+#composer {
+    width: 1fr;
+    height: 100%;
+    background: transparent;
+    border: none;
+    padding: 0;
+    color: $text;
+    scrollbar-size: 1 1;
+}
+
+#composer:focus {
+    border: none;
+}
+
+#send-hint {
+    width: 11;
+    height: 100%;
+    padding: 1 1;
+    color: #6f6872;
+    text-align: right;
+}
+
+#composer-meta {
+    height: 1;
+    padding: 0 1 0 5;
+    color: #6f6872;
+    text-align: right;
+}
+
+#insight-rail {
+    width: 26;
+    min-width: 23;
+    padding: 1 1;
+    background: #121014;
+    border-left: solid $line;
+}
+
+.insight-card {
+    width: 100%;
+    height: auto;
+    padding: 1;
+    background: transparent;
+    border-top: solid $line-soft;
+    color: #c9c1ca;
+}
+
+.section-gap {
+    margin-top: 2;
+}
+
+#cron-glance {
+    max-height: 13;
+}
+
+#approval-list {
+    height: 1fr;
+}
+
+.approval-card {
+    height: auto;
+    margin-bottom: 1;
+    padding: 1;
+    background: #291e1c;
+    border: solid #70513d;
+}
+
+.approval-title {
+    color: $gold;
+    text-style: bold;
+}
+
+.approval-detail {
+    height: auto;
+    max-height: 7;
+    margin: 1 0;
+    color: #d4ccc5;
+}
+
+.approval-actions {
+    height: 3;
+}
+
+.approval-actions Button {
+    width: 1fr;
+    min-width: 7;
+    height: 3;
+    margin-right: 1;
+}
+
+.muted {
+    color: $muted;
+}
+
+#keybar {
+    height: 1;
+    background: #19151b;
+    color: #8d8490;
+    padding: 0 2;
+    text-align: left;
+}
+
+/* Modal boards */
+
+SessionBoard,
+CronBoard,
+CommandPanel,
+RenameSessionScreen,
+ConfirmDeleteScreen {
+    align: center middle;
+    background: #070609 70%;
+}
+
+#board,
+#help-card {
+    width: 88%;
+    height: 80%;
+    max-width: 132;
+    border: solid #4a3e49;
+    background: $surface;
+    padding: 1 2;
+}
+
+#command-panel {
+    width: 78%;
+    height: 72%;
+    max-width: 112;
+    border: solid #4a3e49;
+    background: $surface;
+    padding: 1 2;
+}
+
+.board-heading {
+    height: 3;
+    border-bottom: solid $line;
+    margin-bottom: 1;
+}
+
+.board-title {
+    width: 1fr;
+    color: $red-bright;
+    text-style: bold;
+    padding: 1 0;
+}
+
+.board-kicker {
+    width: auto;
+    color: #776f7a;
+    padding: 1 0;
+}
+
+#session-table,
+#cron-table {
+    height: 1fr;
+    border: none;
+    background: #131115;
+    scrollbar-color: #493b43 transparent;
+}
+
+#session-search-row {
+    height: 3;
+    margin-bottom: 1;
+    border: solid $line;
+    background: #131115;
+}
+
+#command-search-row {
+    height: 3;
+    margin-bottom: 1;
+    border: solid $line;
+    background: #131115;
+}
+
+#command-search-mark {
+    width: 3;
+    padding: 0 0 0 1;
+    content-align-vertical: middle;
+    color: $red-bright;
+    text-style: bold;
+}
+
+#command-search {
+    width: 1fr;
+    height: 1;
+    border: none;
+    background: transparent;
+    color: $text;
+    padding: 0;
+}
+
+#command-search:focus {
+    border: none;
+}
+
+#command-table {
+    height: 1fr;
+    border: none;
+    background: #131115;
+    scrollbar-color: #493b43 transparent;
+}
+
+#session-search-mark {
+    width: 3;
+    padding: 0 0 0 1;
+    content-align-vertical: middle;
+    color: $red-bright;
+    text-style: bold;
+}
+
+#session-search {
+    width: 1fr;
+    height: 1;
+    border: none;
+    background: transparent;
+    color: $text;
+    padding: 0;
+}
+
+#session-search:focus {
+    border: none;
+}
+
+DataTable > .datatable--header {
+    background: #2b232b;
+    color: #d8cfd9;
+    text-style: bold;
+}
+
+DataTable > .datatable--cursor {
+    background: #4a2630;
+    color: white;
+}
+
+.board-actions {
+    height: 4;
+    padding-top: 1;
+}
+
+.board-actions Button {
+    min-width: 14;
+    margin-right: 1;
+}
+
+.dialog-card {
+    width: 64;
+    height: auto;
+    max-height: 20;
+    border: solid #4a3e49;
+    background: $surface;
+    padding: 2 3;
+}
+
+.dialog-title {
+    height: 2;
+    color: $red-bright;
+    text-style: bold;
+}
+
+.dialog-caption {
+    height: auto;
+    max-height: 3;
+    color: #8b838e;
+    margin-bottom: 1;
+}
+
+.dialog-copy {
+    height: auto;
+    color: #c5bdc6;
+    margin: 1 0;
+}
+
+#rename-input {
+    width: 100%;
+    border: solid #453a45;
+    background: #211c22;
+    color: white;
+}
+
+#rename-input:focus {
+    border: solid $red;
+}
+
+.dialog-actions {
+    height: 4;
+    padding-top: 1;
+}
+
+.dialog-actions Button {
+    min-width: 14;
+    margin-right: 1;
+}
+
+.danger-dialog {
+    border: solid #71404a;
+}
+
+.danger-title {
+    color: #ff687a;
+}
+
+Screen.compact #insight-rail {
+    display: none;
+}
+
+Screen.narrow #transcript {
+    padding: 1 0 0 1;
+}
+
+Screen.narrow #send-hint {
+    display: none;
+}
+
+Screen.narrow .mode-pill {
+    display: none;
+}
+
+Screen.short #composer-shell {
+    height: 3;
+}
+
+Screen.short #top-status {
+    height: 2;
+    padding-top: 0;
+}

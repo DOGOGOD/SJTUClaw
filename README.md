@@ -176,9 +176,33 @@ Web UI 的“设置 → LLM”中设置新会话的默认后端。
 
 ```bash
 sjtuclaw chat       # CLI 交互对话
+sjtuclaw tui        # 全屏终端界面（推荐用于终端交互）
 sjtuclaw gateway    # Gateway、Web UI 与 REST API
 sjtuclaw-desktop    # Desktop：本地 Gateway + pywebview 独立窗口
 ```
+
+#### Terminal UI
+
+![SJTUClaw TUI](docs/images/readme-tui.svg)
+
+`sjtuclaw tui` 提供面向长时间 Agent 工作流的全屏终端界面。它直接复用 Gateway
+运行时，因此 Session、记忆、上下文压缩、Workspace、Sandbox、回退、审批、
+Skills、反思、Cron、桌宠、AUTO / UNLIMITED 模式，以及 Pi / Claude Code
+后端切换都与 CLI 和 Web UI 保持同一行为。
+
+核心快捷键：
+
+```text
+Ctrl+P  搜索命令       Ctrl+S  搜索/选择 Session
+Ctrl+J  Cron 看板      /       行内命令
+Ctrl+R  刷新状态       Ctrl+C  停止当前任务
+Shift+Enter  输入换行
+```
+
+主界面将大部分空间留给对话与 Composer，不常驻显示 Session 侧栏；按 `Ctrl+S`
+打开可搜索的 Session Picker。宽终端中右侧显示 Runtime、Cron 与审批摘要，较窄
+终端会自动收起辅助栏。按 `Ctrl+P` 打开可搜索的 SJTUClaw 命令面板；输入 `/`
+后可用上下方向键滚动全部命令。启动页会随机展示一条计算机科学名言。
 
 Gateway 启动后访问 <http://127.0.0.1:8000>。
 

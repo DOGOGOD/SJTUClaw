@@ -80,6 +80,8 @@ _HELP_TEXT = (
     "  /rollback <checkpointId>  回退到指定检查点\n"
     "  /rollback list            列出当前分支的可用回退点\n"
     "  /rollback status          查看回退状态\n"
+    "  /rollback on              开启当前 session 的回退功能\n"
+    "  /rollback off             关闭回退并清除已有回退点\n"
     "  /rollback undo            撤销最近一次回退（开始新回合后失效）\n"
     "  /rollback help            查看回退指令说明\n"
     "  /approvals               查看待审批操作\n"
@@ -168,13 +170,16 @@ _HELP_MARKDOWN = """# SJTUClaw 可用指令
 
 ## Workspace 回退
 
-> 设置 workspace 后自动启用；未设置 workspace 时不支持回退。
+> 设置 workspace 不会自动开启回退；请使用 `/rollback on` 显式开启。
+> 未设置 workspace 时不支持回退。
 
 - `/rollback`：回退到上一条用户消息发送前
 - `/rollback <n>`：回退到倒数第 n 个用户回合之前
 - `/rollback <checkpointId>`：回退到指定检查点
 - `/rollback list`：列出当前分支的可用回退点
 - `/rollback status`：查看回退状态
+- `/rollback on`：开启当前 session 的回退功能
+- `/rollback off`：关闭回退并清除已有回退点
 - `/rollback undo`：撤销最近一次回退；开始新用户回合后 undo 失效
 - `/rollback help`：查看回退指令说明
 
@@ -576,7 +581,7 @@ def _delete_session(session_id: str, state: RuntimeState) -> str:
     cleanup_warnings: list[str] = []
     if state.rollback_manager is not None:
         try:
-            state.rollback_manager.disable(session_id)
+            state.rollback_manager.purge(session_id)
         except (RollbackError, OSError) as exc:
             cleanup_warnings.append(f"回退数据清理失败: {exc}")
     if state.workspace_manager is not None:
@@ -938,11 +943,12 @@ def _handle_compact_command(state: RuntimeState) -> str:
 
 
 _WORKSPACE_USAGE = """用法:
-  /workspace set <路径>   设置当前 session 的工作区并启用回退
+  /workspace set <路径>   设置当前 session 的工作区
   /workspace show         查看当前工作区路径
   /workspace unset        取消工作区并关闭 UNLIMITED 模式
 
-Workspace 用于限制文件操作范围；设置后会为每个用户回合创建回退点。"""
+Workspace 用于限制文件操作范围；设置后不会自动开启回退。
+如需回退功能，请使用 /rollback on 显式开启。"""
 
 
 def _handle_workspace_command(args: list[str], state: RuntimeState) -> str:
@@ -966,11 +972,22 @@ def _handle_workspace_command(args: list[str], state: RuntimeState) -> str:
         )
         try:
             with guard:
+                rollback_preference = (
+                    state.rollback_manager.preference(sid)
+                    if state.rollback_manager is not None else None
+                )
                 resolved = state.workspace_manager.set(sid, path_str)
                 if state.sandbox_manager is not None:
                     state.sandbox_manager.close_session(sid)
-                if state.rollback_manager is not None:
-                    state.rollback_manager.enable(sid, state.session_store.get(sid))
+                if (
+                    state.rollback_manager is not None
+                    and rollback_preference is True
+                ):
+                    state.rollback_manager.enable(
+                        sid,
+                        state.session_store.get(sid),
+                        explicit=False,
+                    )
             return f"Workspace 已设置为: {resolved}"
         except (WorkspaceError, RollbackError, SandboxError, OSError) as exc:
             try:
@@ -1002,7 +1019,7 @@ def _handle_workspace_command(args: list[str], state: RuntimeState) -> str:
                 if state.sandbox_manager is not None:
                     state.sandbox_manager.close_session(sid)
                 if state.rollback_manager is not None:
-                    state.rollback_manager.disable(sid)
+                    state.rollback_manager.purge(sid)
                 state.workspace_manager.unset(sid)
                 # Removing the sandbox root must never leave unrestricted
                 # filesystem access enabled implicitly.
@@ -1102,10 +1119,14 @@ _ROLLBACK_USAGE = """用法:
   /rollback <checkpointId>   回退到指定检查点
   /rollback list             列出当前分支的可用回退点
   /rollback status           查看回退状态
+  /rollback on               开启当前 session 的回退功能
+  /rollback off              关闭回退并清除已有回退点
   /rollback undo             撤销最近一次回退
   /rollback help             查看这些指令
 
-回退需要先设置 workspace；它会同时恢复会话和工作区文件。"""
+回退需要先设置 workspace，但设置 workspace 不会自动开启回退；
+请使用 /rollback on 显式开启。回退会同时恢复会话和工作区文件。
+注意：rollback功能仍不完善，workspace中文件过多时不建议使用。"""
 
 
 def _handle_rollback_command(args: list[str], state: RuntimeState) -> str:
@@ -1116,26 +1137,52 @@ def _handle_rollback_command(args: list[str], state: RuntimeState) -> str:
         return "Workspace 回退服务未初始化。"
     sid = state.current_session_id
     if len(args) > 1:
-        return "用法: /rollback [<n>|<checkpointId>|list|status|undo]"
+        return "用法: /rollback [<n>|<checkpointId>|list|status|on|off|undo]"
     sub = args[0].lower() if args else "1"
     try:
         if sub in ("status", "show"):
             status = manager.status(sid)
             if not status["enabled"]:
+                if status.get("workspace") and status.get("preference") is False:
+                    return (
+                        "Workspace 回退已关闭。\n"
+                        f"路径: {status['workspace']}\n"
+                        "使用 /rollback on 重新开启。"
+                    )
+                if status.get("workspace"):
+                    return "当前 session 未启用回退。使用 /rollback on 开启。"
                 return "当前 session 未启用回退。请先设置 workspace。"
             return (
                 f"Workspace 回退已启用。\n"
                 f"路径: {status['workspace']}\n"
                 f"回退点: {status['checkpointCount']}\n"
+                f"其中部分快照: {status.get('partialCheckpointCount', 0)}\n"
                 f"可撤销回退: {'是' if status['undoAvailable'] else '否'}"
             )
+        if sub == "on":
+            if manager.workspace_manager.get(sid) is None:
+                return "[错误] 当前 session 未设置 workspace。请先使用 /workspace set <路径>。"
+            status = manager.enable(sid, state.session_store.get(sid))
+            return (
+                "Workspace 回退已开启。\n"
+                f"路径: {status['workspace']}\n"
+                "后续用户回合将创建新的回退点。"
+            )
+        if sub == "off":
+            if manager.workspace_manager.get(sid) is None:
+                return "[错误] 当前 session 未设置 workspace。请先使用 /workspace set <路径>。"
+            manager.disable(sid)
+            return "Workspace 回退已关闭，已有回退点已清除。"
         if sub == "list":
+            status = manager.status(sid)
+            if status.get("preference") is False:
+                return "Workspace 回退已关闭。使用 /rollback on 重新开启。"
             checkpoints = [item for item in manager.list_checkpoints(sid) if item["kind"] == "turn"]
             if not checkpoints:
                 return "当前没有可用的消息回退点。"
             lines = ["可用回退点："]
             for index, item in enumerate(checkpoints, 1):
-                warning = " [仅 workspace]" if item["partial"] else ""
+                warning = " [部分快照]" if item["partial"] else ""
                 lines.append(
                     f"  {index}. {item['checkpointId']}  {item['messagePreview']}{warning}"
                 )
@@ -1149,7 +1196,15 @@ def _handle_rollback_command(args: list[str], state: RuntimeState) -> str:
         target: str | int | None
         target = int(sub) if sub.isdigit() else sub
         result = manager.rollback(sid, target)
-        warning = "\n注意：UNLIMITED 模式下 workspace 外的改动未恢复。" if result["partial"] else ""
+        warning_lines = list(result.get("warnings", []))
+        if result["partial"]:
+            warning_lines.append(
+                "该回退点为部分快照；超出 Workspace 或快照预算的改动可能未恢复。"
+            )
+        warning = (
+            "\n注意：" + "；".join(dict.fromkeys(warning_lines))
+            if warning_lines else ""
+        )
         return (
             f"回退完成。恢复 {result['restored']} 个路径，"
             f"删除 {result['deleted']} 个路径。可使用 /rollback undo 撤销。{warning}"

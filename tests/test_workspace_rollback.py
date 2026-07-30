@@ -75,6 +75,66 @@ def test_no_workspace_disables_rollback(rollback_env):
         rollback.preview(session.session_id)
 
 
+def test_setting_workspace_does_not_enable_rollback(rollback_env):
+    _, session, workspace, manager, rollback = rollback_env
+
+    manager.set("s1", str(workspace))
+
+    status = rollback.status("s1")
+    assert status["enabled"] is False
+    assert status["workspace"] == str(workspace.resolve())
+    assert status["preference"] is None
+    assert rollback.create_turn_checkpoint(
+        "s1",
+        session,
+        message_id="not-enabled",
+        message_preview="must not capture",
+    ) is None
+    with pytest.raises(RollbackError, match="/rollback on"):
+        rollback.preview("s1")
+
+
+def test_legacy_implicit_preference_requires_explicit_reenable(rollback_env):
+    sessions, session, workspace, manager, rollback = rollback_env
+    manager.set("s1", str(workspace))
+    rollback.enable("s1", session)
+    old_binding = rollback.status("s1")["bindingId"]
+    old_checkpoint = rollback.create_turn_checkpoint(
+        "s1",
+        session,
+        message_id="legacy",
+        message_preview="legacy implicit checkpoint",
+    )
+    with rollback._connect() as conn:
+        conn.execute(
+            "UPDATE preferences SET explicit=0 WHERE session_id='s1'"
+        )
+
+    restarted = WorkspaceRollbackManager(
+        manager,
+        sessions,
+        storage_root=rollback.storage_root,
+    )
+
+    assert restarted.preference("s1") is None
+    assert restarted.status("s1")["enabled"] is False
+    assert restarted.list_checkpoints("s1") == []
+    assert restarted.create_turn_checkpoint(
+        "s1",
+        session,
+        message_id="still-disabled",
+        message_preview="must not capture",
+    ) is None
+
+    restarted.enable("s1", session)
+    assert restarted.status("s1")["enabled"] is True
+    assert restarted.status("s1")["bindingId"] != old_binding
+    assert all(
+        item["checkpointId"] != old_checkpoint
+        for item in restarted.list_checkpoints("s1")
+    )
+
+
 def test_rollback_preserves_current_runtime_mode_preferences(rollback_env):
     sessions, session, _, _, rollback = rollback_env
     snapshot = session.to_snapshot_dict()
@@ -115,6 +175,374 @@ def test_checkpoint_scan_ignores_dependency_and_cache_directories(rollback_env):
         in {"node_modules", ".venv", "__pycache__", ".pytest_cache"}
         for path in manifest
     )
+
+
+def test_unchanged_files_reuse_incremental_hash_cache(rollback_env, monkeypatch):
+    _, session, workspace, manager, rollback = rollback_env
+    large = workspace / "large.bin"
+    large.write_bytes(b"x" * (2 * 1024 * 1024))
+    manager.set("s1", str(workspace))
+    rollback.enable("s1", session)
+    rollback.create_turn_checkpoint(
+        "s1", session, message_id="m1", message_preview="first capture"
+    )
+
+    def unexpected_capture(*_args, **_kwargs):
+        raise AssertionError("unchanged cached files must not be read again")
+
+    monkeypatch.setattr(rollback, "_store_blob", unexpected_capture)
+    checkpoint_id = rollback.create_turn_checkpoint(
+        "s1", session, message_id="m2", message_preview="cached capture"
+    )
+
+    assert checkpoint_id
+    with rollback._connect() as conn:
+        payload = conn.execute(
+            "SELECT manifest_json FROM checkpoints WHERE checkpoint_id=?",
+            (checkpoint_id,),
+        ).fetchone()[0]
+    scan = rollback._decode_manifest(payload)
+    assert scan.stats["filesReused"] == 1
+    assert scan.stats["bytesRead"] == 0
+
+
+def test_truncated_cached_object_is_recaptured(rollback_env):
+    _, session, workspace, manager, rollback = rollback_env
+    source = workspace / "cached.bin"
+    source.write_bytes(b"healthy content")
+    manager.set("s1", str(workspace))
+    rollback.enable("s1", session)
+    first = rollback.create_turn_checkpoint(
+        "s1", session, message_id="m1", message_preview="first"
+    )
+    with rollback._connect() as conn:
+        first_payload = conn.execute(
+            "SELECT manifest_json FROM checkpoints WHERE checkpoint_id=?",
+            (first,),
+        ).fetchone()[0]
+    digest = rollback._decode_manifest(first_payload).entries["cached.bin"]["hash"]
+    rollback._object_path(digest).write_bytes(b"bad")
+
+    second = rollback.create_turn_checkpoint(
+        "s1", session, message_id="m2", message_preview="repair cache"
+    )
+
+    assert second
+    assert rollback._object_path(digest).read_bytes() == b"healthy content"
+
+
+def test_snapshot_budget_prefers_small_files(rollback_env):
+    _, _, workspace, _, rollback = rollback_env
+    (workspace / "large.bin").write_bytes(b"x" * 12)
+    (workspace / "small-a.bin").write_bytes(b"a" * 4)
+    (workspace / "small-b.bin").write_bytes(b"b" * 4)
+    rollback.max_snapshot_bytes = 8
+
+    scan = rollback._scan_workspace_report(workspace, store_blobs=False)
+
+    assert {"small-a.bin", "small-b.bin"} <= set(scan.entries)
+    assert "large.bin" in scan.ignored_paths
+
+
+def test_parallel_capture_uses_bounded_workers(rollback_env, monkeypatch):
+    _, _, workspace, _, rollback = rollback_env
+    (workspace / "one.bin").write_bytes(b"1")
+    (workspace / "two.bin").write_bytes(b"2")
+    rollback.scan_workers = 2
+    original_store = rollback._store_blob
+    barrier = threading.Barrier(2, timeout=5)
+    worker_names: set[str] = set()
+    names_lock = threading.Lock()
+
+    def synchronized_store(*args, **kwargs):
+        with names_lock:
+            worker_names.add(threading.current_thread().name)
+        barrier.wait()
+        return original_store(*args, **kwargs)
+
+    monkeypatch.setattr(rollback, "_store_blob", synchronized_store)
+
+    scan = rollback._scan_workspace_report(workspace, store_blobs=True)
+
+    assert scan.complete is True
+    assert len(worker_names) == 2
+    assert all(name.startswith("rollback-scan") for name in worker_names)
+
+
+def test_blob_capture_reads_source_only_once(rollback_env, monkeypatch):
+    _, _, workspace, _, rollback = rollback_env
+    source = workspace / "single-pass.bin"
+    source.write_bytes(b"single pass")
+
+    monkeypatch.setattr(
+        rollback,
+        "_hash_file",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("_store_blob must not hash the source a second time")
+        ),
+    )
+
+    digest = rollback._store_blob(source, expected=source.stat())
+
+    assert rollback._object_path(digest).read_bytes() == b"single pass"
+
+
+def test_verified_blob_copy_rejects_corrupt_object(rollback_env):
+    _, _, workspace, _, rollback = rollback_env
+    source = workspace / "corrupt.object"
+    destination = workspace / "restored.tmp"
+    source.write_bytes(b"corrupt")
+
+    with pytest.raises(RollbackError, match="校验失败"):
+        rollback._copy_blob_verified(source, destination, "0" * 64)
+
+    assert not destination.exists()
+
+
+def test_snapshot_budget_progressively_captures_uncached_files(rollback_env):
+    _, session, workspace, manager, rollback = rollback_env
+    (workspace / "a.bin").write_bytes(b"a" * 8)
+    (workspace / "b.bin").write_bytes(b"b" * 8)
+    rollback.max_snapshot_bytes = 8
+    manager.set("s1", str(workspace))
+    rollback.enable("s1", session)
+
+    first = rollback.create_turn_checkpoint(
+        "s1", session, message_id="m1", message_preview="budget one"
+    )
+    second = rollback.create_turn_checkpoint(
+        "s1", session, message_id="m2", message_preview="budget two"
+    )
+
+    with rollback._connect() as conn:
+        first_row = conn.execute(
+            "SELECT manifest_json,partial FROM checkpoints WHERE checkpoint_id=?",
+            (first,),
+        ).fetchone()
+        second_row = conn.execute(
+            "SELECT manifest_json,partial FROM checkpoints WHERE checkpoint_id=?",
+            (second,),
+        ).fetchone()
+    assert first_row["partial"] == 1
+    assert len(rollback._decode_manifest(first_row["manifest_json"]).entries) == 1
+    assert second_row["partial"] == 0
+    assert len(rollback._decode_manifest(second_row["manifest_json"]).entries) == 2
+
+
+def test_oversized_file_is_left_untouched_by_partial_rollback(rollback_env):
+    _, session, workspace, manager, rollback = rollback_env
+    large = workspace / "large.bin"
+    large.write_bytes(b"before" * 16)
+    rollback.max_file_bytes = 16
+    manager.set("s1", str(workspace))
+    rollback.enable("s1", session)
+    checkpoint_id = rollback.create_turn_checkpoint(
+        "s1", session, message_id="m1", message_preview="partial"
+    )
+
+    large.write_bytes(b"after" * 16)
+    created = workspace / "created.txt"
+    created.write_text("remove me", encoding="utf-8")
+    preview = rollback.preview("s1", checkpoint_id)
+
+    assert preview.partial is True
+    assert "large.bin" not in preview.restore_files
+    assert "large.bin" not in preview.delete_paths
+    assert "created.txt" in preview.delete_paths
+    result = rollback.rollback("s1", checkpoint_id)
+    assert result["partial"] is True
+    assert large.read_bytes() == b"after" * 16
+    assert not created.exists()
+
+
+def test_ignored_file_path_protects_descendants_after_becoming_directory(
+    rollback_env,
+):
+    _, session, workspace, manager, rollback = rollback_env
+    ignored = workspace / "large.bin"
+    ignored.write_bytes(b"x" * 64)
+    rollback.max_file_bytes = 16
+    manager.set("s1", str(workspace))
+    rollback.enable("s1", session)
+    checkpoint_id = rollback.create_turn_checkpoint(
+        "s1", session, message_id="m1", message_preview="ignored path"
+    )
+
+    ignored.unlink()
+    ignored.mkdir()
+    descendant = ignored / "must-survive.txt"
+    descendant.write_text("safe", encoding="utf-8")
+
+    preview = rollback.preview("s1", checkpoint_id)
+    assert "large.bin/must-survive.txt" not in preview.delete_paths
+
+    rollback.rollback("s1", checkpoint_id)
+    assert descendant.read_text(encoding="utf-8") == "safe"
+
+
+def test_partial_safety_checkpoint_does_not_overwrite_uncaptured_file(
+    rollback_env,
+):
+    _, session, workspace, manager, rollback = rollback_env
+    target = workspace / "value.bin"
+    target.write_bytes(b"before")
+    manager.set("s1", str(workspace))
+    rollback.enable("s1", session)
+    checkpoint_id = rollback.create_turn_checkpoint(
+        "s1", session, message_id="m1", message_preview="small target"
+    )
+
+    target.write_bytes(b"after" * 16)
+    rollback.max_file_bytes = 16
+    result = rollback.rollback("s1", checkpoint_id)
+
+    assert result["partial"] is True
+    assert any("安全撤销" in warning for warning in result["warnings"])
+    assert target.read_bytes() == b"after" * 16
+
+
+def test_partial_safety_checkpoint_restores_captured_paths_and_supports_undo(
+    rollback_env,
+):
+    _, session, workspace, manager, rollback = rollback_env
+    target = workspace / "value.txt"
+    target.write_text("before", encoding="utf-8")
+    manager.set("s1", str(workspace))
+    rollback.enable("s1", session)
+    checkpoint_id = rollback.create_turn_checkpoint(
+        "s1", session, message_id="m1", message_preview="before"
+    )
+
+    target.write_text("after", encoding="utf-8")
+    oversized = workspace / "large.bin"
+    oversized.write_bytes(b"x" * 64)
+    rollback.max_file_bytes = 16
+
+    result = rollback.rollback("s1", checkpoint_id)
+    assert result["partial"] is True
+    assert target.read_text(encoding="utf-8") == "before"
+    assert oversized.read_bytes() == b"x" * 64
+
+    rollback.undo("s1")
+    assert target.read_text(encoding="utf-8") == "after"
+    assert oversized.read_bytes() == b"x" * 64
+
+
+def test_rollback_reuses_safety_scan_instead_of_rescanning_workspace(
+    rollback_env, monkeypatch
+):
+    _, session, workspace, manager, rollback = rollback_env
+    target = workspace / "value.txt"
+    target.write_text("before", encoding="utf-8")
+    manager.set("s1", str(workspace))
+    rollback.enable("s1", session)
+    checkpoint_id = rollback.create_turn_checkpoint(
+        "s1", session, message_id="m1", message_preview="before"
+    )
+    target.write_text("after", encoding="utf-8")
+
+    original_scan = rollback._scan_workspace_report
+    scan_count = 0
+
+    def counted_scan(*args, **kwargs):
+        nonlocal scan_count
+        scan_count += 1
+        return original_scan(*args, **kwargs)
+
+    monkeypatch.setattr(rollback, "_scan_workspace_report", counted_scan)
+
+    rollback.rollback("s1", checkpoint_id)
+
+    assert scan_count == 1
+    assert target.read_text(encoding="utf-8") == "before"
+
+
+def test_garbage_collect_removes_interrupted_capture_temp_file(rollback_env):
+    _, _, _, _, rollback = rollback_env
+    rollback.objects_dir.mkdir(parents=True, exist_ok=True)
+    orphan = rollback.objects_dir / ".capture.interrupted.tmp"
+    orphan.write_bytes(b"partial")
+    stale_time = (
+        rollback_module.time.time()
+        - rollback_module._ORPHAN_CAPTURE_MAX_AGE_S
+        - 1
+    )
+    os.utime(orphan, (stale_time, stale_time))
+
+    removed = rollback.garbage_collect()
+
+    assert removed == 1
+    assert not orphan.exists()
+
+
+def test_garbage_collect_preserves_recent_capture_temp_file(rollback_env):
+    _, _, _, _, rollback = rollback_env
+    active = rollback.objects_dir / ".capture.active.tmp"
+    active.write_bytes(b"in progress")
+
+    removed = rollback.garbage_collect()
+
+    assert removed == 0
+    assert active.read_bytes() == b"in progress"
+
+
+def test_file_limit_stops_scan_without_claiming_full_coverage(rollback_env):
+    _, _, workspace, _, rollback = rollback_env
+    (workspace / "one.txt").write_text("1", encoding="utf-8")
+    (workspace / "two.txt").write_text("2", encoding="utf-8")
+    rollback.max_files = 1
+
+    scan = rollback._scan_workspace_report(workspace, store_blobs=False)
+
+    assert scan.complete is False
+    assert scan.partial is True
+    assert any("文件数量" in warning for warning in scan.warnings)
+
+
+def test_incomplete_manifest_never_drives_path_deletion(rollback_env):
+    _, _, workspace, _, rollback = rollback_env
+    extra = workspace / "must-survive.txt"
+    extra.write_text("safe", encoding="utf-8")
+    wanted = rollback._decode_manifest({
+        "__sjtuclawManifestVersion": 2,
+        "entries": {},
+        "ignoredPaths": [],
+        "complete": False,
+        "warnings": ["truncated"],
+        "stats": {},
+    })
+
+    restored, deleted = rollback._apply_manifest(workspace, wanted)
+
+    assert (restored, deleted) == (0, 0)
+    assert extra.read_text(encoding="utf-8") == "safe"
+
+
+def test_unknown_manifest_version_is_rejected(rollback_env):
+    _, _, _, _, rollback = rollback_env
+
+    with pytest.raises(RollbackError, match="不支持"):
+        rollback._decode_manifest({
+            "__sjtuclawManifestVersion": 999,
+            "entries": {},
+        })
+
+
+def test_enabling_rollback_does_not_snapshot_workspace(rollback_env, monkeypatch):
+    _, session, workspace, manager, rollback = rollback_env
+    (workspace / "large-project-file.bin").write_bytes(b"x" * 1024)
+    manager.set("s1", str(workspace))
+
+    def unexpected_scan(*_args, **_kwargs):
+        raise AssertionError("workspace binding must not capture a baseline snapshot")
+
+    monkeypatch.setattr(rollback, "_scan_workspace", unexpected_scan)
+
+    status = rollback.enable("s1", session)
+
+    assert status["enabled"] is True
+    assert status["checkpointCount"] == 0
+    assert rollback.list_checkpoints("s1") == []
 
 
 def test_restore_files_and_conversation_together(rollback_env):
@@ -416,11 +844,14 @@ def test_preview_does_not_store_cancelled_workspace_versions(rollback_env):
     assert after == before
 
 
-def test_disable_purges_checkpoint_metadata_and_unreferenced_objects(rollback_env):
-    _, session, workspace, manager, rollback = rollback_env
+def test_disable_persists_preference_and_stops_new_checkpoints(rollback_env):
+    sessions, session, workspace, manager, rollback = rollback_env
     (workspace / "tracked.txt").write_text("content", encoding="utf-8")
     manager.set("s1", str(workspace))
     rollback.enable("s1", session)
+    rollback.create_turn_checkpoint(
+        "s1", session, message_id="m1", message_preview="track content"
+    )
     assert any(path.is_file() for path in rollback.objects_dir.rglob("*"))
     with rollback._connect() as conn:
         encoded = conn.execute(
@@ -434,6 +865,38 @@ def test_disable_purges_checkpoint_metadata_and_unreferenced_objects(rollback_en
             "SELECT COUNT(*) FROM checkpoints WHERE session_id='s1'"
         ).fetchone()[0] == 0
     assert not any(path.is_file() for path in rollback.objects_dir.rglob("*"))
+    assert rollback.preference("s1") is False
+    assert rollback.status("s1")["preference"] is False
+    assert rollback.create_turn_checkpoint(
+        "s1", session, message_id="m2", message_preview="must stay disabled"
+    ) is None
+
+    restarted = WorkspaceRollbackManager(
+        manager,
+        sessions,
+        storage_root=rollback.storage_root,
+    )
+    assert restarted.preference("s1") is False
+    assert restarted.create_turn_checkpoint(
+        "s1", session, message_id="m3", message_preview="still disabled"
+    ) is None
+
+    restarted.enable("s1", session)
+    assert restarted.preference("s1") is True
+    assert restarted.create_turn_checkpoint(
+        "s1", session, message_id="m4", message_preview="enabled again"
+    )
+
+
+def test_purge_removes_rollback_preference(rollback_env):
+    _, session, workspace, manager, rollback = rollback_env
+    manager.set("s1", str(workspace))
+    rollback.enable("s1", session)
+    rollback.disable("s1")
+
+    rollback.purge("s1")
+
+    assert rollback.preference("s1") is None
 
 
 def test_unlimited_warning_covers_all_removed_turns(rollback_env):
@@ -496,6 +959,39 @@ def test_cli_rollback_command(rollback_env):
     assert "[错误]" in handle_command("/rollback abc", state)
 
 
+def test_cli_rollback_on_off_switch(rollback_env):
+    sessions, session, workspace, manager, rollback = rollback_env
+    manager.set("s1", str(workspace))
+    rollback.enable("s1", session)
+    state = RuntimeState(
+        session_store=sessions,
+        memory_store=_Memory(),
+        llm_client=_LLM(),
+        current_session_id="s1",
+        workspace_manager=manager,
+        rollback_manager=rollback,
+    )
+
+    assert "已关闭" in handle_command("/rollback off", state)
+    assert "已关闭" in handle_command("/rollback status", state)
+    assert rollback.create_turn_checkpoint(
+        "s1", session, message_id="off", message_preview="off"
+    ) is None
+    assert "已关闭" in handle_command("/rollback list", state)
+
+    rebound = workspace.parent / "rebound-workspace"
+    rebound.mkdir()
+    assert "已设置为" in handle_command(f"/workspace set {rebound}", state)
+    assert manager.get("s1") == rebound.resolve()
+    assert "已关闭" in handle_command("/rollback status", state)
+
+    assert "已开启" in handle_command("/rollback on", state)
+    assert "已启用" in handle_command("/rollback status", state)
+    assert rollback.create_turn_checkpoint(
+        "s1", session, message_id="on", message_preview="on"
+    )
+
+
 def test_help_lists_complete_rollback_usage(rollback_env):
     sessions, _, _, manager, rollback = rollback_env
     state = RuntimeState(
@@ -514,11 +1010,22 @@ def test_help_lists_complete_rollback_usage(rollback_env):
         "/rollback <checkpointId>",
         "/rollback list",
         "/rollback status",
+        "/rollback on",
+        "/rollback off",
         "/rollback undo",
     ):
         assert usage in plain
         assert usage in markdown
     assert "未设置 workspace 时不支持回退" in markdown
+    assert "设置 workspace 不会自动开启回退" in markdown
+    assert "设置后不会自动开启回退" in handle_command("/workspace help", state)
+    assert "设置 workspace 不会自动开启回退" in handle_command(
+        "/rollback help", state
+    )
+    assert (
+        "rollback功能仍不完善，workspace中文件过多时不建议使用"
+        in handle_command("/rollback help", state)
+    )
 
 
 def test_cli_workspace_set_restores_previous_binding_when_snapshot_fails(

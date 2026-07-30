@@ -23,8 +23,10 @@ export interface RollbackStatus {
   enabled: boolean;
   workspace: string | null;
   checkpointCount: number;
+  partialCheckpointCount?: number;
   undoAvailable: boolean;
   bindingId?: string;
+  preference?: boolean | null;
 }
 
 export interface RollbackPreview {
@@ -37,6 +39,8 @@ export interface RollbackPreview {
   restoreFiles: string[];
   deletePaths: string[];
   unlimitedWarning: boolean;
+  partial?: boolean;
+  warnings?: string[];
 }
 
 export interface ToolCallData {

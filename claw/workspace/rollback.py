@@ -18,14 +18,17 @@ import shutil
 import sqlite3
 import stat
 import threading
+import time
 import uuid
 import zlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
 
 from claw.config import DATA_DIR
+from claw.env_utils import env_float, env_int
 from claw.session.models import Session
 from claw.session.store import (
     AUTO_MODE_METADATA_KEY,
@@ -53,9 +56,42 @@ _EXCLUDED_DIRS = frozenset(
     }
 )
 
+_MANIFEST_VERSION = 2
+_DEFAULT_MAX_FILES = 100_000
+_DEFAULT_MAX_FILE_BYTES = 128 * 1024 * 1024
+_DEFAULT_MAX_SNAPSHOT_BYTES = 256 * 1024 * 1024
+_DEFAULT_SCAN_TIMEOUT_S = 5.0
+_DEFAULT_SCAN_WORKERS = 4
+_ORPHAN_CAPTURE_MAX_AGE_S = 24 * 60 * 60
+
 
 class RollbackError(RuntimeError):
     """A safe, user-facing rollback failure."""
+
+
+@dataclass(frozen=True)
+class WorkspaceScan:
+    """A bounded workspace scan plus coverage information."""
+
+    entries: dict[str, dict]
+    ignored_paths: tuple[str, ...] = ()
+    complete: bool = True
+    warnings: tuple[str, ...] = ()
+    stats: dict[str, int | float] | None = None
+
+    @property
+    def partial(self) -> bool:
+        return not self.complete or bool(self.ignored_paths)
+
+    def to_payload(self) -> dict:
+        return {
+            "__sjtuclawManifestVersion": _MANIFEST_VERSION,
+            "entries": self.entries,
+            "ignoredPaths": list(self.ignored_paths),
+            "complete": self.complete,
+            "warnings": list(self.warnings),
+            "stats": self.stats or {},
+        }
 
 
 @dataclass(frozen=True)
@@ -67,6 +103,7 @@ class RollbackPreview:
     restore_directories: tuple[str, ...]
     messages_to_remove: int
     partial: bool = False
+    warnings: tuple[str, ...] = ()
 
     def to_dict(self) -> dict:
         return {
@@ -79,6 +116,8 @@ class RollbackPreview:
             "restoreFiles": list(self.restore_files),
             "deletePaths": list(self.delete_paths),
             "unlimitedWarning": self.partial,
+            "partial": self.partial,
+            "warnings": list(self.warnings),
         }
 
 
@@ -95,12 +134,45 @@ class WorkspaceRollbackManager:
         session_store: SessionStore,
         *,
         storage_root: Path | None = None,
+        max_files: int | None = None,
+        max_file_bytes: int | None = None,
+        max_snapshot_bytes: int | None = None,
+        scan_timeout_s: float | None = None,
+        scan_workers: int | None = None,
     ) -> None:
         self.workspace_manager = workspace_manager
         self.session_store = session_store
         self.storage_root = Path(storage_root or (DATA_DIR / "workspace" / "rollback"))
         self.objects_dir = self.storage_root / "objects"
         self.db_path = self.storage_root / "state.db"
+        self.max_files = max_files if max_files is not None else env_int(
+            "ROLLBACK_MAX_FILES", _DEFAULT_MAX_FILES, minimum=1
+        )
+        self.max_file_bytes = (
+            max_file_bytes if max_file_bytes is not None else env_int(
+                "ROLLBACK_MAX_FILE_BYTES", _DEFAULT_MAX_FILE_BYTES, minimum=1
+            )
+        )
+        self.max_snapshot_bytes = (
+            max_snapshot_bytes if max_snapshot_bytes is not None else env_int(
+                "ROLLBACK_MAX_SNAPSHOT_BYTES",
+                _DEFAULT_MAX_SNAPSHOT_BYTES,
+                minimum=1,
+            )
+        )
+        self.scan_timeout_s = (
+            scan_timeout_s if scan_timeout_s is not None else env_float(
+                "ROLLBACK_SCAN_TIMEOUT_S",
+                _DEFAULT_SCAN_TIMEOUT_S,
+                minimum=0.1,
+            )
+        )
+        self.scan_workers = scan_workers if scan_workers is not None else env_int(
+            "ROLLBACK_SCAN_WORKERS",
+            _DEFAULT_SCAN_WORKERS,
+            minimum=1,
+            maximum=16,
+        )
         self.storage_root.mkdir(parents=True, exist_ok=True)
         self.objects_dir.mkdir(parents=True, exist_ok=True)
         self._meta_lock = threading.RLock()
@@ -163,8 +235,36 @@ class WorkspaceRollbackManager:
                     created_at TEXT NOT NULL,
                     completed_at TEXT
                 );
+                CREATE TABLE IF NOT EXISTS preferences (
+                    session_id TEXT PRIMARY KEY,
+                    enabled INTEGER NOT NULL,
+                    explicit INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS file_cache (
+                    root_path TEXT NOT NULL,
+                    relative_path TEXT NOT NULL,
+                    size INTEGER NOT NULL,
+                    mtime_ns INTEGER NOT NULL,
+                    ctime_ns INTEGER NOT NULL,
+                    digest TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (root_path,relative_path)
+                );
                 """
             )
+            preference_columns = {
+                str(row["name"])
+                for row in conn.execute("PRAGMA table_info(preferences)").fetchall()
+            }
+            if "explicit" not in preference_columns:
+                # Existing releases enabled rollback implicitly while setting
+                # a Workspace.  Mark those rows as unverified so upgrading
+                # requires a fresh, explicit `/rollback on`.
+                conn.execute(
+                    """ALTER TABLE preferences
+                       ADD COLUMN explicit INTEGER NOT NULL DEFAULT 0"""
+                )
 
     def recover_incomplete_operations(self) -> int:
         """Compensate rollback operations interrupted by process exit.
@@ -249,7 +349,34 @@ class WorkspaceRollbackManager:
 
     # -- binding lifecycle ------------------------------------------------
 
-    def enable(self, session_id: str, session: Session | None = None) -> dict:
+    def preference(self, session_id: str) -> bool | None:
+        """Return the persisted per-session rollback preference, if explicit."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT enabled,explicit FROM preferences WHERE session_id=?",
+                (session_id,),
+            ).fetchone()
+        if row is None or not bool(row["explicit"]):
+            return None
+        return bool(row["enabled"])
+
+    def enable(
+        self,
+        session_id: str,
+        session: Session | None = None,
+        *,
+        explicit: bool = True,
+    ) -> dict:
+        """Enable rollback metadata without snapshotting the workspace.
+
+        A restorable checkpoint is captured immediately before each user turn
+        by :meth:`create_turn_checkpoint`.  Capturing another, otherwise
+        unused, baseline here made binding a large workspace copy every file
+        before the UI could close its setup dialog.
+
+        ``explicit`` is true only for `/rollback on`. Workspace rebinding may
+        preserve an already explicit preference, but can never create one.
+        """
         self._assert_no_incomplete_operation(session_id)
         workspace = self.workspace_manager.get(session_id)
         if workspace is None:
@@ -259,32 +386,76 @@ class WorkspaceRollbackManager:
             old = conn.execute(
                 "SELECT * FROM bindings WHERE session_id=?", (session_id,)
             ).fetchone()
-            if old and old["root_path"] == root and old["enabled"]:
-                return self.status(session_id)
-            generation = int(old["generation"]) + 1 if old else 1
-            binding_id = f"binding_{uuid.uuid4().hex}"
-            conn.execute(
-                """INSERT OR REPLACE INTO bindings
-                   (session_id,binding_id,root_path,generation,enabled,created_at)
-                   VALUES (?,?,?,?,1,?)""",
-                (session_id, binding_id, root, generation, now_iso()),
+            preference = conn.execute(
+                "SELECT enabled,explicit FROM preferences WHERE session_id=?",
+                (session_id,),
+            ).fetchone()
+            was_explicitly_enabled = bool(
+                preference
+                and preference["enabled"]
+                and preference["explicit"]
             )
-            live = session or self.session_store.get(session_id)
-            self._insert_checkpoint(
-                conn, session_id, binding_id, live,
-                target_message_id=None, message_preview="Workspace 基线",
-                kind="baseline", partial=False,
-            )
+            if not explicit and not was_explicitly_enabled:
+                raise RollbackError(
+                    "当前 session 的 rollback 尚未显式开启。请使用 /rollback on 开启。"
+                )
+            if (
+                old
+                and old["root_path"] == root
+                and old["enabled"]
+                and was_explicitly_enabled
+            ):
+                binding_id = str(old["binding_id"])
+            else:
+                generation = int(old["generation"]) + 1 if old else 1
+                binding_id = f"binding_{uuid.uuid4().hex}"
+                conn.execute(
+                    """INSERT OR REPLACE INTO bindings
+                       (session_id,binding_id,root_path,generation,enabled,created_at)
+                       VALUES (?,?,?,?,1,?)""",
+                    (session_id, binding_id, root, generation, now_iso()),
+                )
+            if explicit:
+                conn.execute(
+                    """INSERT OR REPLACE INTO preferences
+                       (session_id,enabled,explicit,updated_at)
+                       VALUES (?,1,1,?)""",
+                    (session_id, now_iso()),
+                )
+            else:
+                conn.execute(
+                    """UPDATE preferences SET enabled=1,updated_at=?
+                       WHERE session_id=? AND explicit=1""",
+                    (now_iso(), session_id),
+                )
         self._prune_checkpoints(session_id, binding_id)
         return self.status(session_id)
 
     def disable(self, session_id: str) -> None:
+        """Disable rollback until explicitly re-enabled for this session."""
         with self.session_guard(session_id):
             self._assert_no_incomplete_operation(session_id)
             with self._connect() as conn:
                 conn.execute("DELETE FROM checkpoints WHERE session_id=?", (session_id,))
                 conn.execute("DELETE FROM operations WHERE session_id=?", (session_id,))
                 conn.execute("DELETE FROM bindings WHERE session_id=?", (session_id,))
+                conn.execute(
+                    """INSERT OR REPLACE INTO preferences
+                       (session_id,enabled,explicit,updated_at)
+                       VALUES (?,0,1,?)""",
+                    (session_id, now_iso()),
+                )
+            self.garbage_collect()
+
+    def purge(self, session_id: str) -> None:
+        """Remove all rollback data and preferences for a removed workspace/session."""
+        with self.session_guard(session_id):
+            self._assert_no_incomplete_operation(session_id)
+            with self._connect() as conn:
+                conn.execute("DELETE FROM checkpoints WHERE session_id=?", (session_id,))
+                conn.execute("DELETE FROM operations WHERE session_id=?", (session_id,))
+                conn.execute("DELETE FROM bindings WHERE session_id=?", (session_id,))
+                conn.execute("DELETE FROM preferences WHERE session_id=?", (session_id,))
             self.garbage_collect()
 
     def _binding(self, session_id: str) -> sqlite3.Row | None:
@@ -297,9 +468,13 @@ class WorkspaceRollbackManager:
         workspace = self.workspace_manager.get(session_id)
         if workspace is None:
             raise RollbackError("当前 session 未设置 workspace。请先使用 /workspace set <路径>。")
+        if self.preference(session_id) is not True:
+            raise RollbackError(
+                "当前 session 的 rollback 尚未开启。请使用 /rollback on 开启。"
+            )
         binding = self._binding(session_id)
         if binding is None or Path(binding["root_path"]).resolve() != workspace.resolve():
-            self.enable(session_id, session)
+            self.enable(session_id, session, explicit=False)
             binding = self._binding(session_id)
         if binding is None:
             raise RollbackError("Workspace 回退初始化失败。")
@@ -308,9 +483,11 @@ class WorkspaceRollbackManager:
     def status(self, session_id: str) -> dict:
         workspace = self.workspace_manager.get(session_id)
         binding = self._binding(session_id)
+        preference = self.preference(session_id)
         binding_matches = (
             workspace is not None
             and binding is not None
+            and preference is True
             and Path(binding["root_path"]).resolve() == workspace.resolve()
         )
         if not binding_matches:
@@ -318,13 +495,21 @@ class WorkspaceRollbackManager:
                 "enabled": False,
                 "workspace": str(workspace) if workspace else None,
                 "checkpointCount": 0,
+                "partialCheckpointCount": 0,
                 "undoAvailable": False,
+                "preference": preference,
             }
         with self._connect() as conn:
             count = conn.execute(
                 """SELECT COUNT(*) FROM checkpoints
                    WHERE session_id=? AND binding_id=?
                      AND kind='turn' AND status='active'""",
+                (session_id, binding["binding_id"]),
+            ).fetchone()[0]
+            partial_count = conn.execute(
+                """SELECT COUNT(*) FROM checkpoints
+                   WHERE session_id=? AND binding_id=?
+                     AND kind='turn' AND status='active' AND partial=1""",
                 (session_id, binding["binding_id"]),
             ).fetchone()[0]
             undo = conn.execute(
@@ -336,8 +521,10 @@ class WorkspaceRollbackManager:
             "enabled": True,
             "workspace": str(workspace),
             "checkpointCount": int(count),
+            "partialCheckpointCount": int(partial_count),
             "undoAvailable": undo,
             "bindingId": binding["binding_id"],
+            "preference": preference,
         }
 
     def active_turn_checkpoint_ids(self, session_id: str) -> set[str]:
@@ -367,6 +554,8 @@ class WorkspaceRollbackManager:
         partial: bool = False,
     ) -> str | None:
         if self.workspace_manager.get(session_id) is None:
+            return None
+        if self.preference(session_id) is not True:
             return None
         self._assert_no_incomplete_operation(session_id)
         binding = self.ensure_enabled(session_id, session)
@@ -406,7 +595,20 @@ class WorkspaceRollbackManager:
         if workspace is None:
             raise RollbackError("当前 session 未设置 workspace。")
         with self._storage_lock:
-            manifest = self._scan_workspace(workspace, store_blobs=True)
+            # Acquire SQLite's cross-process writer lock before publishing
+            # content objects.  Garbage collection uses the same lock, so it
+            # cannot sweep a newly captured object before its manifest row is
+            # committed.
+            conn.execute(
+                """UPDATE bindings SET generation=generation
+                   WHERE session_id=? AND binding_id=?""",
+                (session_id, binding_id),
+            )
+            scan = self._scan_workspace_report(
+                workspace,
+                store_blobs=True,
+                cache_conn=conn,
+            )
             checkpoint_id = f"cp_{uuid.uuid4().hex}"
             parent = conn.execute(
                 """SELECT checkpoint_id FROM checkpoints
@@ -424,11 +626,58 @@ class WorkspaceRollbackManager:
                 (
                     checkpoint_id, session_id, binding_id,
                     parent[0] if parent else None, target_message_id,
-                    message_preview[:240], json.dumps(manifest, ensure_ascii=False),
-                    session_json, kind, int(partial), now_iso(),
+                    message_preview[:240],
+                    json.dumps(scan.to_payload(), ensure_ascii=False),
+                    session_json, kind, int(partial or scan.partial), now_iso(),
                 ),
             )
         return checkpoint_id
+
+    @staticmethod
+    def _decode_manifest(value: str | dict) -> WorkspaceScan:
+        payload = json.loads(value) if isinstance(value, str) else value
+        version = (
+            payload.get("__sjtuclawManifestVersion")
+            if isinstance(payload, dict) else None
+        )
+        if (
+            isinstance(payload, dict)
+            and version == _MANIFEST_VERSION
+            and isinstance(payload.get("entries"), dict)
+        ):
+            return WorkspaceScan(
+                entries=payload["entries"],
+                ignored_paths=tuple(
+                    path for path in payload.get("ignoredPaths", [])
+                    if isinstance(path, str)
+                ),
+                complete=bool(payload.get("complete", True)),
+                warnings=tuple(
+                    warning for warning in payload.get("warnings", [])
+                    if isinstance(warning, str)
+                ),
+                stats=payload.get("stats") if isinstance(payload.get("stats"), dict) else {},
+            )
+        if version is not None:
+            raise RollbackError(f"不支持的回退快照清单版本: {version}")
+        if not isinstance(payload, dict):
+            raise RollbackError("回退快照清单格式无效。")
+        # Version 1 stored the entries dictionary directly.
+        return WorkspaceScan(entries=payload)
+
+    @staticmethod
+    def _path_is_ignored(relative: str, ignored_paths: set[str]) -> bool:
+        current = relative
+        while current:
+            if current in ignored_paths:
+                return True
+            current = current.rpartition("/")[0]
+        return False
+
+    @staticmethod
+    def _path_contains_ignored(relative: str, ignored_paths: set[str]) -> bool:
+        prefix = relative + "/"
+        return any(path == relative or path.startswith(prefix) for path in ignored_paths)
 
     @staticmethod
     def _encode_session_snapshot(snapshot: dict) -> str:
@@ -479,69 +728,200 @@ class WorkspaceRollbackManager:
     def garbage_collect(self) -> int:
         """Mark-and-sweep content objects not referenced by any checkpoint."""
         with self._storage_lock:
-            referenced: set[str] = set()
+            # BEGIN IMMEDIATE coordinates with checkpoint writers in other
+            # processes.  Keep the transaction open through the file sweep so
+            # the reference set and object directory form one stable view.
             with self._connect() as conn:
-                rows = conn.execute("SELECT manifest_json FROM checkpoints").fetchall()
-            for row in rows:
-                try:
-                    manifest = json.loads(row[0])
-                except (TypeError, json.JSONDecodeError):
-                    continue
-                referenced.update(
-                    entry["hash"]
-                    for entry in manifest.values()
-                    if entry.get("type") == "file" and entry.get("hash")
-                )
+                conn.execute("BEGIN IMMEDIATE")
+                rows = conn.execute(
+                    "SELECT manifest_json FROM checkpoints"
+                ).fetchall()
 
-            removed = 0
-            if not self.objects_dir.exists():
-                return removed
-            for prefix_dir in self.objects_dir.iterdir():
-                if not prefix_dir.is_dir():
-                    continue
-                for object_path in prefix_dir.iterdir():
-                    digest = prefix_dir.name + object_path.name
-                    if object_path.is_file() and len(digest) == 64 and digest not in referenced:
+                removed = 0
+                if self.objects_dir.exists():
+                    # A process interruption can leave an unfinished capture
+                    # next to the content-addressed object directories.  A
+                    # long grace period also protects older clients that do
+                    # not acquire the database writer lock before capture.
+                    stale_before = time.time() - _ORPHAN_CAPTURE_MAX_AGE_S
+                    for temp_path in self.objects_dir.glob(".capture.*.tmp"):
+                        if not temp_path.is_file():
+                            continue
                         try:
-                            object_path.unlink(missing_ok=True)
+                            if temp_path.stat().st_mtime > stale_before:
+                                continue
+                            temp_path.unlink(missing_ok=True)
                             removed += 1
                         except OSError:
-                            # Cleanup must never make checkpoint creation or
-                            # workspace rebinding fail.
                             continue
-                try:
-                    prefix_dir.rmdir()
-                except OSError:
-                    pass
-            return removed
+
+                referenced: set[str] = set()
+                for row in rows:
+                    try:
+                        manifest = self._decode_manifest(row[0]).entries
+                    except (TypeError, json.JSONDecodeError, RollbackError):
+                        continue
+                    referenced.update(
+                        entry["hash"]
+                        for entry in manifest.values()
+                        if entry.get("type") == "file" and entry.get("hash")
+                    )
+
+                if not self.objects_dir.exists():
+                    return removed
+                for prefix_dir in self.objects_dir.iterdir():
+                    if not prefix_dir.is_dir():
+                        continue
+                    for object_path in prefix_dir.iterdir():
+                        digest = prefix_dir.name + object_path.name
+                        if (
+                            object_path.is_file()
+                            and len(digest) == 64
+                            and digest not in referenced
+                        ):
+                            try:
+                                object_path.unlink(missing_ok=True)
+                                removed += 1
+                            except OSError:
+                                # Cleanup must never make checkpoint creation
+                                # or workspace rebinding fail.
+                                continue
+                    try:
+                        prefix_dir.rmdir()
+                    except OSError:
+                        pass
+                return removed
 
     def _object_path(self, digest: str) -> Path:
         if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
             raise RollbackError(f"无效的快照对象哈希: {digest!r}")
         return self.objects_dir / digest[:2] / digest[2:]
 
+    def _object_has_size(self, digest: str, expected_size: int) -> bool:
+        try:
+            return self._object_path(digest).stat().st_size == expected_size
+        except OSError:
+            return False
+
     @staticmethod
-    def _hash_file(path: Path) -> str:
+    def _file_fingerprint(info: os.stat_result) -> tuple[int, int, int]:
+        return (
+            int(info.st_size),
+            int(getattr(info, "st_mtime_ns", int(info.st_mtime * 1_000_000_000))),
+            # Windows directory-entry ctime can lag behind fstat until the
+            # file is reopened. Including it causes stable files to look as
+            # if they changed during capture. Size + nanosecond mtime remain
+            # the reliable content fingerprint on that platform.
+            0 if os.name == "nt" else int(
+                getattr(info, "st_ctime_ns", int(info.st_ctime * 1_000_000_000))
+            ),
+        )
+
+    @classmethod
+    def _opened_file_matches(
+        cls,
+        opened: os.stat_result,
+        expected: os.stat_result,
+    ) -> bool:
+        if not stat.S_ISREG(opened.st_mode):
+            return False
+        if cls._file_fingerprint(opened) != cls._file_fingerprint(expected):
+            return False
+        # DirEntry inode is unavailable on some Windows Python builds (0).
+        # Where both sides expose identity, require it to match as well.
+        if expected.st_ino and opened.st_ino:
+            return (
+                expected.st_ino == opened.st_ino
+                and expected.st_dev == opened.st_dev
+            )
+        return True
+
+    @classmethod
+    def _hash_file(
+        cls,
+        path: Path,
+        *,
+        expected: os.stat_result | None = None,
+        deadline: float | None = None,
+    ) -> str:
         digest = hashlib.sha256()
         with open(path, "rb") as source:
-            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            opened = os.fstat(source.fileno())
+            if expected is not None and not cls._opened_file_matches(opened, expected):
+                raise OSError("文件在快照读取前发生变化")
+            while True:
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError("workspace 快照扫描超时")
+                chunk = source.read(1024 * 1024)
+                if not chunk:
+                    break
                 digest.update(chunk)
+            if cls._file_fingerprint(os.fstat(source.fileno())) != cls._file_fingerprint(opened):
+                raise OSError("文件在快照读取期间发生变化")
         return digest.hexdigest()
 
-    def _store_blob(self, path: Path) -> str:
-        key = self._hash_file(path)
-        destination = self._object_path(key)
-        if not destination.exists():
+    def _store_blob(
+        self,
+        path: Path,
+        *,
+        expected: os.stat_result | None = None,
+        deadline: float | None = None,
+    ) -> str:
+        """Capture and hash a file in one pass, then atomically publish it."""
+        tmp = self.objects_dir / f".capture.{uuid.uuid4().hex}.tmp"
+        digest = hashlib.sha256()
+        try:
+            with open(path, "rb") as source, open(tmp, "xb") as destination_file:
+                opened = os.fstat(source.fileno())
+                if (
+                    expected is not None
+                    and not self._opened_file_matches(opened, expected)
+                ):
+                    raise OSError("文件在快照读取前发生变化")
+                while True:
+                    if deadline is not None and time.monotonic() >= deadline:
+                        raise TimeoutError("workspace 快照扫描超时")
+                    chunk = source.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    destination_file.write(chunk)
+                if self._file_fingerprint(os.fstat(source.fileno())) != self._file_fingerprint(opened):
+                    raise OSError("文件在快照读取期间发生变化")
+                destination_file.flush()
+            key = digest.hexdigest()
+            destination = self._object_path(key)
+            if destination.exists():
+                try:
+                    if destination.stat().st_size == tmp.stat().st_size:
+                        return key
+                except OSError:
+                    pass
             destination.parent.mkdir(parents=True, exist_ok=True)
-            tmp = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.tmp")
             try:
-                shutil.copyfile(path, tmp)
-                if self._hash_file(tmp) != key:
-                    raise RollbackError(f"快照对象校验失败: {path}")
                 os.replace(tmp, destination)
-            finally:
-                tmp.unlink(missing_ok=True)
-        return key
+            except FileExistsError:
+                # Another session may have published the same content.
+                pass
+            return key
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    @staticmethod
+    def _copy_blob_verified(source: Path, destination: Path, expected_hash: str) -> None:
+        """Copy an object while verifying it, without a second full read."""
+        digest = hashlib.sha256()
+        with open(source, "rb") as source_file, open(destination, "xb") as output:
+            while True:
+                chunk = source_file.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                output.write(chunk)
+            output.flush()
+        if digest.hexdigest() != expected_hash:
+            destination.unlink(missing_ok=True)
+            raise RollbackError(f"快照对象校验失败: {expected_hash}")
 
     @staticmethod
     def _is_reparse_point(info: os.stat_result) -> bool:
@@ -551,55 +931,313 @@ class WorkspaceRollbackManager:
     def _scan_workspace(
         self, root: Path, *, store_blobs: bool = True
     ) -> dict[str, dict]:
+        """Compatibility wrapper returning only tracked manifest entries."""
+        return self._scan_workspace_report(root, store_blobs=store_blobs).entries
+
+    def _scan_workspace_report(
+        self,
+        root: Path,
+        *,
+        store_blobs: bool = True,
+        cache_conn: sqlite3.Connection | None = None,
+    ) -> WorkspaceScan:
         root = root.resolve()
         manifest: dict[str, dict] = {}
+        ignored: list[str] = []
+        seen_files: set[str] = set()
+        warnings: list[str] = []
+        cache_updates: list[tuple[str, str, int, int, int, str, str]] = []
+        pending_files: list[
+            tuple[str, Path, os.stat_result, int, tuple[int, int, int]]
+        ] = []
+        root_key = os.path.normcase(str(root))
+        started = time.monotonic()
+        deadline = started + self.scan_timeout_s
+        files_seen = 0
+        files_reused = 0
+        bytes_read = 0
+        oversized_count = 0
+        budget_count = 0
+        unstable_count = 0
+        complete = True
+        stopped_reason = ""
+
+        try:
+            storage_relative = self.storage_root.resolve().relative_to(root).as_posix()
+        except ValueError:
+            storage_relative = ""
+
+        if cache_conn is not None:
+            cached_rows = cache_conn.execute(
+                """SELECT relative_path,size,mtime_ns,ctime_ns,digest
+                   FROM file_cache WHERE root_path=?""",
+                (root_key,),
+            ).fetchall()
+        else:
+            with self._connect() as conn:
+                cached_rows = conn.execute(
+                    """SELECT relative_path,size,mtime_ns,ctime_ns,digest
+                       FROM file_cache WHERE root_path=?""",
+                    (root_key,),
+                ).fetchall()
+        cache = {
+            str(row["relative_path"]): (
+                int(row["size"]),
+                int(row["mtime_ns"]),
+                int(row["ctime_ns"]),
+                str(row["digest"]),
+            )
+            for row in cached_rows
+        }
+
+        def stop(reason: str) -> None:
+            nonlocal complete, stopped_reason
+            complete = False
+            stopped_reason = stopped_reason or reason
 
         def walk(directory: Path) -> None:
+            nonlocal files_seen, files_reused, bytes_read
+            nonlocal oversized_count, budget_count, unstable_count
+            if not complete:
+                return
             try:
-                entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
+                entries = os.scandir(directory)
             except OSError as exc:
-                raise RollbackError(f"无法扫描 workspace: {directory}: {exc}") from exc
-            for entry in entries:
-                if entry.name in _EXCLUDED_DIRS:
-                    continue
-                path = Path(entry.path)
-                try:
-                    path.resolve(strict=False).relative_to(self.storage_root.resolve())
-                    continue
-                except ValueError:
-                    pass
-                rel = path.relative_to(root).as_posix()
-                try:
-                    info = entry.stat(follow_symlinks=False)
-                    mode = stat.S_IMODE(info.st_mode)
-                    if entry.is_symlink() or self._is_reparse_point(info):
-                        manifest[rel] = {
-                            "type": "symlink",
-                            "target": os.readlink(path),
-                            "mode": mode,
-                            "directory": entry.is_dir(follow_symlinks=True),
-                        }
-                    elif entry.is_dir(follow_symlinks=False):
-                        manifest[rel] = {"type": "directory", "mode": mode}
-                        walk(path)
-                    elif entry.is_file(follow_symlinks=False):
-                        manifest[rel] = {
-                            "type": "file",
-                            "hash": (
-                                self._store_blob(path)
-                                if store_blobs else self._hash_file(path)
-                            ),
-                            "size": info.st_size, "mode": mode,
-                        }
-                except OSError as exc:
-                    raise RollbackError(f"无法读取 workspace 路径: {rel}: {exc}") from exc
+                if directory == root:
+                    raise RollbackError(f"无法扫描 workspace: {directory}: {exc}") from exc
+                stop("unreadable-directory")
+                return
+            with entries:
+                for entry in entries:
+                    if time.monotonic() >= deadline:
+                        stop("timeout")
+                        return
+                    if entry.name in _EXCLUDED_DIRS:
+                        continue
+                    path = Path(entry.path)
+                    rel = path.relative_to(root).as_posix()
+                    if storage_relative and (
+                        rel == storage_relative or rel.startswith(storage_relative + "/")
+                    ):
+                        continue
+                    try:
+                        info = entry.stat(follow_symlinks=False)
+                        mode = stat.S_IMODE(info.st_mode)
+                        if entry.is_symlink() or self._is_reparse_point(info):
+                            files_seen += 1
+                            if files_seen > self.max_files:
+                                stop("file-limit")
+                                return
+                            manifest[rel] = {
+                                "type": "symlink",
+                                "target": os.readlink(path),
+                                "mode": mode,
+                                "directory": entry.is_dir(follow_symlinks=True),
+                            }
+                        elif entry.is_dir(follow_symlinks=False):
+                            manifest[rel] = {"type": "directory", "mode": mode}
+                            walk(path)
+                            if not complete:
+                                return
+                        elif entry.is_file(follow_symlinks=False):
+                            seen_files.add(rel)
+                            files_seen += 1
+                            if files_seen > self.max_files:
+                                stop("file-limit")
+                                return
+                            fingerprint = self._file_fingerprint(info)
+                            cached = cache.get(rel)
+                            if (
+                                cached is not None
+                                and cached[:3] == fingerprint
+                                and (
+                                    not store_blobs
+                                    or self._object_has_size(cached[3], info.st_size)
+                                )
+                            ):
+                                digest = cached[3]
+                                files_reused += 1
+                                manifest[rel] = {
+                                    "type": "file",
+                                    "hash": digest,
+                                    "size": info.st_size,
+                                    "mode": mode,
+                                }
+                            elif info.st_size > self.max_file_bytes:
+                                ignored.append(rel)
+                                oversized_count += 1
+                            else:
+                                pending_files.append(
+                                    (rel, path, info, mode, fingerprint)
+                                )
+                    except OSError:
+                        ignored.append(rel)
+                        unstable_count += 1
+                        continue
 
         walk(root)
-        return manifest
+        # Capture smaller uncached files first. This maximizes the number of
+        # restorable paths under the byte budget instead of letting a few
+        # archives consume the whole allowance.
+        if stopped_reason != "timeout":
+            ordered_pending = sorted(
+                pending_files,
+                key=lambda item: (item[2].st_size, item[0]),
+            )
+            capture_candidates = []
+            reserved_bytes = 0
+            for item in ordered_pending:
+                if reserved_bytes + item[2].st_size > self.max_snapshot_bytes:
+                    ignored.append(item[0])
+                    budget_count += 1
+                else:
+                    capture_candidates.append(item)
+                    reserved_bytes += item[2].st_size
+
+            def capture_file(item):
+                rel, path, info, mode, fingerprint = item
+                digest = (
+                    self._store_blob(path, expected=info, deadline=deadline)
+                    if store_blobs else self._hash_file(
+                        path, expected=info, deadline=deadline
+                    )
+                )
+                return rel, info, mode, fingerprint, digest
+
+            batch_size = max(self.scan_workers * 8, 8)
+            with ThreadPoolExecutor(
+                max_workers=self.scan_workers,
+                thread_name_prefix="rollback-scan",
+            ) as executor:
+                for batch_start in range(0, len(capture_candidates), batch_size):
+                    if time.monotonic() >= deadline:
+                        ignored.extend(
+                            item[0] for item in capture_candidates[batch_start:]
+                        )
+                        stop("timeout")
+                        break
+                    batch = capture_candidates[
+                        batch_start:batch_start + batch_size
+                    ]
+                    bytes_read += sum(item[2].st_size for item in batch)
+                    futures = {
+                        executor.submit(capture_file, item): item
+                        for item in batch
+                    }
+                    batch_timed_out = False
+                    for future in as_completed(futures):
+                        item = futures[future]
+                        try:
+                            rel, info, mode, fingerprint, digest = future.result()
+                        except TimeoutError:
+                            ignored.append(item[0])
+                            batch_timed_out = True
+                            continue
+                        except OSError:
+                            ignored.append(item[0])
+                            unstable_count += 1
+                            continue
+                        cache_updates.append(
+                            (
+                                root_key,
+                                rel,
+                                fingerprint[0],
+                                fingerprint[1],
+                                fingerprint[2],
+                                digest,
+                                now_iso(),
+                            )
+                        )
+                        manifest[rel] = {
+                            "type": "file",
+                            "hash": digest,
+                            "size": info.st_size,
+                            "mode": mode,
+                        }
+                    if batch_timed_out:
+                        next_start = batch_start + len(batch)
+                        ignored.extend(
+                            item[0] for item in capture_candidates[next_start:]
+                        )
+                        stop("timeout")
+                        break
+        elif pending_files:
+            ignored.extend(item[0] for item in pending_files)
+
+        stale_cache_paths = (
+            set(cache) - seen_files if complete else set()
+        )
+        if cache_updates:
+            if cache_conn is not None:
+                cache_conn.executemany(
+                    """INSERT OR REPLACE INTO file_cache
+                       (root_path,relative_path,size,mtime_ns,ctime_ns,digest,updated_at)
+                       VALUES (?,?,?,?,?,?,?)""",
+                    cache_updates,
+                )
+            else:
+                with self._connect() as conn:
+                    conn.executemany(
+                        """INSERT OR REPLACE INTO file_cache
+                           (root_path,relative_path,size,mtime_ns,ctime_ns,digest,updated_at)
+                           VALUES (?,?,?,?,?,?,?)""",
+                        cache_updates,
+                    )
+        if stale_cache_paths:
+            target_conn = cache_conn
+            if target_conn is not None:
+                target_conn.executemany(
+                    "DELETE FROM file_cache WHERE root_path=? AND relative_path=?",
+                    ((root_key, path) for path in stale_cache_paths),
+                )
+            else:
+                with self._connect() as conn:
+                    conn.executemany(
+                        "DELETE FROM file_cache WHERE root_path=? AND relative_path=?",
+                        ((root_key, path) for path in stale_cache_paths),
+                    )
+        if oversized_count:
+            warnings.append(
+                f"{oversized_count} 个文件超过单文件快照上限，未纳入回退"
+            )
+        if budget_count:
+            warnings.append(
+                f"{budget_count} 个文件超出本次新增快照数据预算，未纳入回退"
+            )
+        if unstable_count:
+            warnings.append(
+                f"{unstable_count} 个文件在扫描期间变化或无法读取，未纳入回退"
+            )
+        if stopped_reason == "timeout":
+            warnings.append("Workspace 扫描达到时间上限，已安全停止")
+        elif stopped_reason == "file-limit":
+            warnings.append("Workspace 文件数量达到快照上限，已安全停止")
+        elif stopped_reason == "unreadable-directory":
+            warnings.append("Workspace 包含无法读取的目录，快照未完整覆盖")
+
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        return WorkspaceScan(
+            entries=manifest,
+            ignored_paths=tuple(sorted(set(ignored))),
+            complete=complete,
+            warnings=tuple(warnings),
+            stats={
+                "filesSeen": files_seen,
+                "filesTracked": sum(
+                    entry.get("type") == "file" for entry in manifest.values()
+                ),
+                "filesReused": files_reused,
+                "bytesRead": bytes_read,
+                "ignoredCount": len(set(ignored)),
+                "elapsedMs": elapsed_ms,
+            },
+        )
 
     # -- query ------------------------------------------------------------
 
     def list_checkpoints(self, session_id: str) -> list[dict]:
+        if self.preference(session_id) is not True:
+            return []
         binding = self._binding(session_id)
         if binding is None:
             return []
@@ -675,8 +1313,10 @@ class WorkspaceRollbackManager:
             workspace = self.workspace_manager.get(session_id)
             if workspace is None:
                 raise RollbackError("当前 session 未设置 workspace。")
-            current = self._scan_workspace(workspace, store_blobs=False)
-            wanted = json.loads(row["manifest_json"])
+            current_scan = self._scan_workspace_report(workspace, store_blobs=False)
+            wanted_scan = self._decode_manifest(row["manifest_json"])
+            current = current_scan.entries
+            wanted = wanted_scan.entries
             restore_files = tuple(sorted(
                 path for path, entry in wanted.items()
                 if entry["type"] in ("file", "symlink") and current.get(path) != entry
@@ -685,12 +1325,33 @@ class WorkspaceRollbackManager:
                 path for path, entry in wanted.items()
                 if entry["type"] == "directory" and current.get(path) != entry
             ))
-            delete_paths = tuple(sorted(set(current) - set(wanted), reverse=True))
+            ignored_paths = (
+                set(current_scan.ignored_paths) | set(wanted_scan.ignored_paths)
+            )
+            delete_paths = (
+                tuple(sorted(
+                    (
+                        path
+                        for path in set(current) - set(wanted)
+                        if not self._path_is_ignored(path, ignored_paths)
+                    ),
+                    reverse=True,
+                ))
+                if current_scan.complete and wanted_scan.complete
+                else ()
+            )
             snapshot = self._decode_session_snapshot(row["session_json"])
             live = self.session_store.get(session_id)
             current_messages = len(live.messages)
             old_messages = len(snapshot.get("messages", []))
-            partial = self._restore_is_partial(live, snapshot, row)
+            partial = (
+                self._restore_is_partial(live, snapshot, row)
+                or current_scan.partial
+                or wanted_scan.partial
+            )
+            warnings = tuple(dict.fromkeys(
+                (*wanted_scan.warnings, *current_scan.warnings)
+            ))
             return RollbackPreview(
                 checkpoint_id=row["checkpoint_id"],
                 message_preview=row["message_preview"],
@@ -699,6 +1360,7 @@ class WorkspaceRollbackManager:
                 restore_directories=restore_dirs,
                 messages_to_remove=max(0, current_messages - old_messages),
                 partial=partial,
+                warnings=warnings,
             )
 
     # -- restore ----------------------------------------------------------
@@ -744,6 +1406,13 @@ class WorkspaceRollbackManager:
                     target_message_id=None, message_preview="回退前安全点",
                     kind=safety_kind, partial=False,
                 )
+                safety_row = conn.execute(
+                    "SELECT manifest_json FROM checkpoints WHERE checkpoint_id=?",
+                    (safety_id,),
+                ).fetchone()
+                if safety_row is None:
+                    raise RollbackError("无法读取回退前安全点。")
+                safety_scan = self._decode_manifest(safety_row["manifest_json"])
                 conn.execute(
                     """INSERT INTO operations
                        (operation_id,session_id,target_checkpoint_id,safety_checkpoint_id,
@@ -751,9 +1420,25 @@ class WorkspaceRollbackManager:
                     (operation_id, session_id, row["checkpoint_id"], safety_id, "PREPARED", now_iso()),
                 )
 
-            wanted = json.loads(row["manifest_json"])
+            wanted = self._decode_manifest(row["manifest_json"])
+            partial = partial or safety_scan.partial
+            result_warnings = list(
+                dict.fromkeys((*wanted.warnings, *safety_scan.warnings))
+            )
+            if safety_scan.partial:
+                result_warnings.append(
+                    "回退前安全点未完整覆盖；已跳过无法保证安全撤销的路径"
+                )
             try:
-                restored, deleted = self._apply_manifest(Path(binding["root_path"]), wanted)
+                # Reuse the safety checkpoint scan instead of walking the
+                # workspace a second time.  Besides reducing latency, the
+                # partial-scan guard in _apply_manifest then guarantees that
+                # every changed path can be restored by compensation/undo.
+                restored, deleted = self._apply_manifest(
+                    Path(binding["root_path"]),
+                    wanted,
+                    current_scan=safety_scan,
+                )
                 with self._connect() as conn:
                     conn.execute(
                         "UPDATE operations SET status='FILES_APPLIED' WHERE operation_id=?",
@@ -775,7 +1460,10 @@ class WorkspaceRollbackManager:
                     )
                 if safety:
                     try:
-                        self._apply_manifest(Path(binding["root_path"]), json.loads(safety[0]))
+                        self._apply_manifest(
+                            Path(binding["root_path"]),
+                            self._decode_manifest(safety[0]),
+                        )
                         self._restore_session(live, self._decode_session_snapshot(safety[1]))
                         self.session_store.save(live, fsync=True)
                     except Exception as compensation_exc:
@@ -837,6 +1525,7 @@ class WorkspaceRollbackManager:
                 "messages": [message.to_dict() for message in live.messages],
                 "undoAvailable": True,
                 "partial": partial,
+                "warnings": list(dict.fromkeys(result_warnings)),
             }
 
     def undo(self, session_id: str) -> dict:
@@ -914,22 +1603,78 @@ class WorkspaceRollbackManager:
             if self._path_is_link_like(current):
                 raise RollbackError(f"拒绝通过目录链接恢复 workspace 路径: {current}")
 
-    def _apply_manifest(self, root: Path, wanted: dict[str, dict]) -> tuple[int, int]:
+    def _apply_manifest(
+        self,
+        root: Path,
+        wanted: WorkspaceScan | dict | str,
+        *,
+        current_scan: WorkspaceScan | None = None,
+    ) -> tuple[int, int]:
         root = root.resolve()
-        current = self._scan_workspace(root, store_blobs=False)
+        wanted_scan = (
+            wanted if isinstance(wanted, WorkspaceScan) else self._decode_manifest(wanted)
+        )
+        current_scan = current_scan or self._scan_workspace_report(
+            root, store_blobs=False
+        )
+        current = current_scan.entries
+        wanted_entries = wanted_scan.entries
         deleted = 0
         restored = 0
+        ignored_paths = (
+            set(current_scan.ignored_paths) | set(wanted_scan.ignored_paths)
+        )
 
-        # Remove deepest extra paths first.
-        extras = sorted(set(current) - set(wanted), key=lambda value: (value.count("/"), value), reverse=True)
+        # Never infer deletions from a truncated scan. Restoring known paths is
+        # safe, but deleting an unobserved path is not.
+        extras = (
+            sorted(
+                (
+                    path
+                    for path in set(current) - set(wanted_entries)
+                    if not self._path_is_ignored(path, ignored_paths)
+                ),
+                key=lambda value: (value.count("/"), value),
+                reverse=True,
+            )
+            if current_scan.complete and wanted_scan.complete
+            else []
+        )
         for relative in extras:
             target = self._safe_target(root, relative)
             self._remove_path(target)
             deleted += 1
 
+        blocked_restores: set[str] = set()
+        if current_scan.partial:
+            for relative, desired in wanted_entries.items():
+                observed = current.get(relative)
+                if observed == desired:
+                    continue
+                # A partial safety snapshot can only compensate paths whose
+                # current state was captured.  Missing/ignored paths are
+                # ambiguous, while replacing a partially traversed directory
+                # could destroy descendants that were never observed.
+                if (
+                    observed is None
+                    or self._path_is_ignored(relative, ignored_paths)
+                    or self._path_contains_ignored(relative, ignored_paths)
+                    or (
+                        observed.get("type") == "directory"
+                        and desired.get("type") != "directory"
+                    )
+                ):
+                    blocked_restores.add(relative)
+
+        def restore_is_blocked(relative: str) -> bool:
+            return self._path_is_ignored(relative, blocked_restores)
+
         # Directories first, then files/symlinks.
-        for relative, entry in sorted(wanted.items(), key=lambda item: (item[0].count("/"), item[0])):
-            if entry["type"] != "directory":
+        for relative, entry in sorted(
+            wanted_entries.items(),
+            key=lambda item: (item[0].count("/"), item[0]),
+        ):
+            if entry["type"] != "directory" or restore_is_blocked(relative):
                 continue
             target = self._safe_target(root, relative)
             self._assert_real_parents(root, target)
@@ -939,8 +1684,8 @@ class WorkspaceRollbackManager:
             if os.name != "nt":
                 os.chmod(target, entry["mode"])
 
-        for relative, entry in sorted(wanted.items()):
-            if current.get(relative) == entry:
+        for relative, entry in sorted(wanted_entries.items()):
+            if current.get(relative) == entry or restore_is_blocked(relative):
                 continue
             target = self._safe_target(root, relative)
             if entry["type"] == "directory":
@@ -960,11 +1705,11 @@ class WorkspaceRollbackManager:
                 if not source.exists():
                     raise RollbackError(f"快照对象丢失: {entry['hash']}")
                 tmp = target.with_name(f".{target.name}.{uuid.uuid4().hex}.rollback.tmp")
-                shutil.copyfile(source, tmp)
-                if self._hash_file(tmp) != entry["hash"]:
+                try:
+                    self._copy_blob_verified(source, tmp, entry["hash"])
+                    os.replace(tmp, target)
+                finally:
                     tmp.unlink(missing_ok=True)
-                    raise RollbackError(f"恢复文件校验失败: {relative}")
-                os.replace(tmp, target)
                 if os.name != "nt":
                     os.chmod(target, entry["mode"])
             restored += 1

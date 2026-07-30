@@ -94,6 +94,30 @@ describe("SessionModeBadges", () => {
     expect(view.queryByTestId("pi-mode-badge")).toBeNull();
   });
 
+  it("shows the Rollback indicator only when rollback is enabled", () => {
+    const view = render(
+      <SessionModeBadges
+        autoMode={false}
+        unlimitedMode={false}
+        rollbackEnabled
+        piMode={false}
+      />
+    );
+    expect(view.getByTestId("rollback-mode-badge").textContent).toContain(
+      "Rollback"
+    );
+
+    view.rerender(
+      <SessionModeBadges
+        autoMode={false}
+        unlimitedMode={false}
+        rollbackEnabled={false}
+        piMode={false}
+      />
+    );
+    expect(view.queryByTestId("rollback-mode-badge")).toBeNull();
+  });
+
   it("shows the Claude Code indicator for Claude sessions", () => {
     const view = render(
       <SessionModeBadges

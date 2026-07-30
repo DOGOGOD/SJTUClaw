@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Bot, Box, PanelLeft, Moon, Sun, ShieldCheck, Zap } from "lucide-react";
+import { Bot, Box, History, PanelLeft, Moon, Sun, ShieldCheck, Zap } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ThreadViewport } from "./ThreadViewport";
 import { ThreadComposer } from "./ThreadComposer";
@@ -35,12 +35,14 @@ export function SessionModeBadges({
   autoMode,
   sandboxMode = false,
   unlimitedMode,
+  rollbackEnabled = false,
   piMode,
   agentBackend,
 }: {
   autoMode: boolean;
   sandboxMode?: boolean;
   unlimitedMode: boolean;
+  rollbackEnabled?: boolean;
   piMode: boolean;
   agentBackend?: AgentBackend;
 }) {
@@ -64,6 +66,15 @@ export function SessionModeBadges({
       {unlimitedMode && (
         <span className="flex shrink-0 items-center gap-1 rounded-lg border border-destructive/25 bg-destructive/10 px-2 py-1 text-[10px] font-semibold text-destructive">
           <ShieldCheck className="h-3 w-3" /> Unlimited
+        </span>
+      )}
+      {rollbackEnabled && (
+        <span
+          data-testid="rollback-mode-badge"
+          className="flex shrink-0 items-center gap-1 rounded-lg border border-sky-500/25 bg-sky-500/10 px-2 py-1 text-[10px] font-semibold text-sky-700 dark:text-sky-300"
+          title="当前会话已开启 Workspace 回退"
+        >
+          <History className="h-3 w-3" /> Rollback
         </span>
       )}
       {backend === "pi" && (
@@ -210,6 +221,7 @@ export function ThreadShell({
             autoMode={autoMode}
             sandboxMode={sandboxMode}
             unlimitedMode={unlimitedMode}
+            rollbackEnabled={rollbackEnabled}
             piMode={piMode}
             agentBackend={agentBackend}
           />

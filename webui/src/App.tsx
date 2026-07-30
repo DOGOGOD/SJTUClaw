@@ -84,6 +84,7 @@ function Shell() {
     setAutoMode(false);
     setSandboxMode(false);
     setUnlimitedMode(false);
+    setRollbackEnabled(false);
     setAgentBackend("sjtuclaw");
     setMessagesLoading(true);
     fetchMessages(activeSessionId)
@@ -102,6 +103,7 @@ function Shell() {
           setAutoMode(false);
           setSandboxMode(false);
           setUnlimitedMode(false);
+          setRollbackEnabled(false);
           setAgentBackend("sjtuclaw");
         }
       })
@@ -112,6 +114,7 @@ function Shell() {
         setAutoMode(false);
         setSandboxMode(false);
         setUnlimitedMode(false);
+        setRollbackEnabled(false);
         setAgentBackend("sjtuclaw");
       })
       .finally(() => { if (!cancelled) setMessagesLoading(false); });
@@ -436,8 +439,12 @@ function Shell() {
     try {
       const preview = await previewRollback(activeSessionId, checkpointId);
       const detail = preview.preview;
+      const warningDetails = detail.warnings?.length
+        ? `\n${detail.warnings.join("\n")}`
+        : "";
       const warning = detail.unlimitedWarning
-        ? "\n\n注意：UNLIMITED 模式在 workspace 外的改动无法恢复。"
+        ? "\n\n注意：该回退点为部分快照；超出 Workspace 或快照预算的改动可能无法恢复。" +
+          warningDetails
         : "";
       const confirmed = await confirmDialog({
         title: "确认回退",

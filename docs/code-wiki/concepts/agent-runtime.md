@@ -62,6 +62,11 @@ stateDiagram-v2
 
 传入 `rollback_manager` 时，`run_agent_turn()` 先获取 `turn_guard(session_id)`。该锁覆盖完整回合，避免共享同一 Workspace 的两个 Session 在检查点与文件修改之间交错。
 
+设置 Workspace 不会自动开启回退。只有用户执行 `/rollback on` 后，
+当前 Session 才会持久开启并在后续回合创建 Workspace 检查点。
+`/rollback off` 会持久关闭、清除已有回退点；显式开关状态在切换
+Workspace 后仍保留，`/rollback status` 可查看当前状态。
+
 检查点记录：
 
 - 即将写入的用户消息 ID
@@ -69,7 +74,19 @@ stateDiagram-v2
 - Workspace 文件快照
 - UNLIMITED 下是否只能形成部分检查点
 
+扫描器使用文件大小、纳秒级修改时间和内容对象存在性复用未变化文件，
+避免每回合重新读取大文件。新内容在一次流式读取中同时完成 SHA-256
+计算与对象写入。文件数量、单文件大小、单次新增数据量和扫描时间均有
+可配置预算；达到预算时检查点标记为部分，并禁止根据不完整清单推断删除
+额外路径。未缓存文件按体积从小到大排序并由受控线程池捕获，在固定时间
+预算内优先覆盖更多小文件。
+真正执行回退时会复用刚创建的“回退前安全点”扫描，省去一次重复遍历。
+如果安全点只覆盖了部分 Workspace，应用阶段仅修改安全点已捕获且可补偿
+的路径，避免覆盖无法由 undo 恢复的大文件或未扫描路径。
+
 然后才进入 `_run_agent_turn_unlocked()`。
+
+> **注意：rollback功能仍不完善，workspace中文件过多时不建议使用。**
 
 ### 2. Session 与用户消息
 

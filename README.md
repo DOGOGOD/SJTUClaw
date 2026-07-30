@@ -152,14 +152,34 @@ TUI 是直接复用共享运行时的全屏终端界面，不需要先启动 Gat
 /sandbox status
 ```
 
-设置 Workspace 后，每个用户回合开始前会创建检查点：
+设置 Workspace 不会自动开启回退。只有执行 `/rollback on` 后，后续每个
+用户回合开始前才会创建检查点：
 
 ```text
+/rollback on
+/rollback off
+/rollback status
 /rollback
 /rollback 2
 /rollback list
 /rollback undo
 ```
+
+`/rollback on` / `/rollback off` 是显式、持久的 Session 级开关。
+`/rollback off` 会关闭回退并清除已有回退点；已显式开启的 Session
+切换 Workspace 后仍保持开启。开启后 WebUI 顶部会显示 `Rollback`
+状态徽标。
+
+Rollback 会复用未变化文件的增量快照；新内容采用单次流式读取。
+当文件数量、单文件大小、单次新增数据量或扫描时间达到配置预算时，
+检查点会安全降级为“部分快照”，且不会根据不完整扫描误删文件。
+执行回退时会复用回退前安全点的扫描结果；若安全点不完整，只修改已被
+安全捕获且能够撤销的路径，未覆盖路径保持不变。
+预算可通过 `ROLLBACK_MAX_FILES`、`ROLLBACK_MAX_FILE_BYTES`、
+`ROLLBACK_MAX_SNAPSHOT_BYTES`、`ROLLBACK_SCAN_TIMEOUT_S` 和
+`ROLLBACK_SCAN_WORKERS` 调整。
+
+> **注意：rollback功能仍不完善，workspace中文件过多时不建议使用。**
 
 如需 microVM，安装可选依赖并准备镜像：
 

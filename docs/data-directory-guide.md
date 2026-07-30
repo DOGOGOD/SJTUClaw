@@ -100,10 +100,13 @@ data/workspace/
 ```
 
 - `bindings.json`：Session 到宿主 Workspace 的持久映射。
-- `state.db`：回退检查点、分支和文件清单。
+- `state.db`：回退检查点、分支、文件清单、增量文件哈希缓存，以及
+  `/rollback on` / `/rollback off` 的 Session 级持久开关。
 - `objects/`：按内容寻址保存的文件对象。
 
 回退不会直接删除原始 Session 历史，而是恢复工作区快照并建立新的可见对话分支。`state.db-wal` 和 `state.db-shm` 是 SQLite 正常运行文件，不应单独删除。
+
+> **注意：rollback功能仍不完善，workspace中文件过多时不建议使用。**
 
 ## `settings/`
 

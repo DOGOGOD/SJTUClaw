@@ -346,6 +346,8 @@ def test_active_turn_guard_covers_mutating_commands():
     assert _mutating_command_session("/unlimited on", "s1") == "s1"
     assert _mutating_command_session("/compact", "s1") == "s1"
     assert _mutating_command_session("/rollback undo", "s1") == "s1"
+    assert _mutating_command_session("/rollback on", "s1") == "s1"
+    assert _mutating_command_session("/rollback off", "s1") == "s1"
     assert _mutating_command_session("/session delete s2", "s1") == "s2"
     assert _mutating_command_session("/workspace show", "s1") is None
     assert _mutating_command_session("/sandbox status", "s1") is None

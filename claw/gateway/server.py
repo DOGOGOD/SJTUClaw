@@ -2196,10 +2196,19 @@ def set_workspace(req: SetWorkspaceRequest):
     previous = get_workspace(req.session_id) if callable(get_workspace) else None
     try:
         with _rollback_manager.session_guard(req.session_id):
+            rollback_preference = _rollback_manager.preference(req.session_id)
             resolved = _workspace_manager.set(req.session_id, raw_path)
             _sandbox_manager.close_session(req.session_id)
             rollback_status = (
-                _rollback_manager.enable(req.session_id, _session_store.get(req.session_id))
+                (
+                    _rollback_manager.enable(
+                        req.session_id,
+                        _session_store.get(req.session_id),
+                        explicit=False,
+                    )
+                    if rollback_preference is True
+                    else _rollback_manager.status(req.session_id)
+                )
                 if _session_store.exists(req.session_id)
                 else _rollback_manager.status(req.session_id)
             )
@@ -2229,7 +2238,7 @@ def unset_workspace(session_id: str = Query(..., alias="sessionId")):
     try:
         with _rollback_manager.session_guard(session_id):
             _sandbox_manager.close_session(session_id)
-            _rollback_manager.disable(session_id)
+            _rollback_manager.purge(session_id)
             _workspace_manager.unset(session_id)
     except SandboxError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -2763,7 +2772,7 @@ def delete_session(session_id: str):
         # workspace binding and rollback checkpoints must remain recoverable.
         _session_store.delete(session_id)
         try:
-            _rollback_manager.disable(session_id)
+            _rollback_manager.purge(session_id)
         except (RollbackError, OSError):
             cleanup_warnings.append("回退数据清理失败，请查看 Gateway 日志。")
             logger.exception("删除 session 后清理回退数据失败: %s", session_id)

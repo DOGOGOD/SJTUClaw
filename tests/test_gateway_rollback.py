@@ -45,7 +45,21 @@ def test_gateway_rollback_preview_and_apply(rollback_client, tmp_path):
         "/workspace", json={"sessionId": "api-session", "path": str(workspace)}
     )
     assert response.status_code == 200
-    assert response.json()["rollback"]["enabled"] is True
+    assert response.json()["rollback"]["enabled"] is False
+    assert response.json()["rollback"]["preference"] is None
+    assert rollback.create_turn_checkpoint(
+        "api-session",
+        sessions.get("api-session"),
+        message_id="before-enable",
+        message_preview="must not capture",
+    ) is None
+
+    enabled = client.post(
+        "/command",
+        json={"sessionId": "api-session", "command": "/rollback on"},
+    )
+    assert enabled.status_code == 200
+    assert "已开启" in enabled.json()["result"]
 
     session = sessions.get("api-session")
     checkpoint_id = rollback.create_turn_checkpoint(
@@ -169,6 +183,70 @@ def test_gateway_rollback_requires_workspace(rollback_client):
     assert "workspace" in response.json()["detail"]
 
 
+def test_gateway_command_toggles_rollback_for_session(rollback_client, tmp_path):
+    client, sessions, _, rollback = rollback_client
+    workspace = tmp_path / "toggle-project"
+    workspace.mkdir()
+    workspace_response = client.post(
+        "/workspace", json={"sessionId": "api-session", "path": str(workspace)}
+    )
+    assert workspace_response.status_code == 200
+    assert workspace_response.json()["rollback"]["enabled"] is False
+    assert workspace_response.json()["rollback"]["preference"] is None
+    assert rollback.create_turn_checkpoint(
+        "api-session",
+        sessions.get("api-session"),
+        message_id="never-enabled",
+        message_preview="must stay disabled",
+    ) is None
+
+    enabled = client.post(
+        "/command",
+        json={"sessionId": "api-session", "command": "/rollback on"},
+    )
+    assert enabled.status_code == 200
+    assert "已开启" in enabled.json()["result"]
+    assert client.get(
+        "/sessions/api-session/rollback"
+    ).json()["rollback"]["enabled"] is True
+
+    disabled = client.post(
+        "/command",
+        json={"sessionId": "api-session", "command": "/rollback off"},
+    )
+    assert disabled.status_code == 200
+    assert "已关闭" in disabled.json()["result"]
+    assert "reload_rollback_status" in disabled.json()["actions"]
+    status = client.get("/sessions/api-session/rollback").json()["rollback"]
+    assert status["enabled"] is False
+    assert status["preference"] is False
+    assert rollback.create_turn_checkpoint(
+        "api-session",
+        sessions.get("api-session"),
+        message_id="disabled",
+        message_preview="disabled",
+    ) is None
+
+    rebound = tmp_path / "toggle-project-rebound"
+    rebound.mkdir()
+    rebound_response = client.post(
+        "/workspace", json={"sessionId": "api-session", "path": str(rebound)}
+    )
+    assert rebound_response.status_code == 200
+    assert rebound_response.json()["rollback"]["enabled"] is False
+    assert rebound_response.json()["rollback"]["preference"] is False
+
+    enabled = client.post(
+        "/command",
+        json={"sessionId": "api-session", "command": "/rollback on"},
+    )
+    assert enabled.status_code == 200
+    assert "已开启" in enabled.json()["result"]
+    assert client.get(
+        "/sessions/api-session/rollback"
+    ).json()["rollback"]["enabled"] is True
+
+
 def test_gateway_delete_failure_preserves_workspace_and_rollback(
     rollback_client, tmp_path, monkeypatch
 ):
@@ -178,6 +256,10 @@ def test_gateway_delete_failure_preserves_workspace_and_rollback(
     assert client.post(
         "/workspace",
         json={"sessionId": "api-session", "path": str(workspace)},
+    ).status_code == 200
+    assert client.post(
+        "/command",
+        json={"sessionId": "api-session", "command": "/rollback on"},
     ).status_code == 200
     assert rollback.status("api-session")["enabled"] is True
 
@@ -199,6 +281,10 @@ def test_gateway_rejects_invalid_checkpoint_target(rollback_client, tmp_path):
     workspace.mkdir()
     assert client.post(
         "/workspace", json={"sessionId": "api-session", "path": str(workspace)}
+    ).status_code == 200
+    assert client.post(
+        "/command",
+        json={"sessionId": "api-session", "command": "/rollback on"},
     ).status_code == 200
     response = client.post(
         "/sessions/api-session/rollback/preview",
@@ -262,6 +348,10 @@ def test_rebinding_hides_old_message_rollback_button(rollback_client, tmp_path):
     assert client.post(
         "/workspace",
         json={"sessionId": "api-session", "path": str(first_workspace)},
+    ).status_code == 200
+    assert client.post(
+        "/command",
+        json={"sessionId": "api-session", "command": "/rollback on"},
     ).status_code == 200
     session = sessions.get("api-session")
     checkpoint_id = rollback.create_turn_checkpoint(

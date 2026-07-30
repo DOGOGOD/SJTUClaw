@@ -56,6 +56,10 @@ def test_real_cli_workspace_rollback_flow(tmp_path: Path):
         commands = "\n".join([
             f"/workspace set {workspace}",
             "/rollback status",
+            "/rollback off",
+            "/rollback status",
+            "/rollback on",
+            "/rollback status",
             "first turn",
             "/rollback list",
             "/rollback",
@@ -100,6 +104,8 @@ def test_real_cli_workspace_rollback_flow(tmp_path: Path):
     assert completed.returncode == 0, output
     assert "Workspace 已设置为" in output
     assert "Workspace 回退已启用" in output
+    assert "Workspace 回退已关闭" in output
+    assert "Workspace 回退已开启" in output
     assert "可用回退点" in output
     assert "回退完成" in output
     assert "已撤销上一次回退" in output

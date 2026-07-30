@@ -161,6 +161,33 @@ SANDBOX_PROJECT_VENV=true
 
 `required` 采用 fail-closed：Sandbox 不可用时拒绝执行，不回退宿主；同时禁用 UNLIMITED，并拒绝 Pi / Claude Code 后端。
 
+## Workspace Rollback
+
+设置 Workspace 本身不会开启 Rollback。用户必须执行 `/rollback on`
+显式开启；此后该 Session 才会在每个用户回合前创建检查点。
+
+Rollback 使用持久增量哈希缓存：未变化文件不会在每个回合重复读取，
+新文件或已变化文件采用单次流式读取，同时完成哈希和快照对象写入。
+
+| 配置 | 默认值 | 说明 |
+| --- | ---: | --- |
+| `ROLLBACK_MAX_FILES` | `100000` | 单次扫描最多检查的文件与链接数 |
+| `ROLLBACK_MAX_FILE_BYTES` | `134217728` | 单个新快照文件上限（128 MiB） |
+| `ROLLBACK_MAX_SNAPSHOT_BYTES` | `268435456` | 单次最多新读取的数据量（256 MiB） |
+| `ROLLBACK_SCAN_TIMEOUT_S` | `5` | 单次扫描时间上限（秒） |
+| `ROLLBACK_SCAN_WORKERS` | `4` | 新内容并行哈希与对象写入线程数（1–16） |
+
+达到任一预算时，检查点会标记为“部分快照”，并保留具体警告。
+恢复部分快照时只恢复明确记录的文件；扫描覆盖不完整时不会推断并删除
+额外路径。后续检查点会复用已缓存内容，因此在总数据预算触发后可以
+逐回合补齐尚未缓存的普通文件。未缓存文件会优先按体积从小到大处理，
+并在受控线程池中并行捕获，以便在固定时间预算内覆盖更多路径。
+回退操作会直接复用“回退前安全点”的扫描结果，避免在应用文件前再次
+遍历整个 Workspace。若该安全点是部分快照，只修改其中已明确捕获、
+可由补偿或 `/rollback undo` 恢复的路径；未覆盖路径保持原状。
+
+> **注意：rollback功能仍不完善，workspace中文件过多时不建议使用。**
+
 ## Gateway 与 Web UI
 
 ```env

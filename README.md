@@ -104,6 +104,23 @@ TUI 是直接复用共享运行时的全屏终端界面，不需要先启动 Gat
 
 默认后端可以在 Web UI“设置 → Agent”或 `AGENT_BACKEND` 中配置。外部后端仍复用 SJTUClaw 的 Session、入口、审批桥接和宿主工具，但它们自己的原生执行环境不属于 microsandbox 隔离范围。
 
+## 总体架构
+
+所有入口共享同一套会话、上下文和安全边界，再按 Session 路由到不同的 Agent 后端：
+
+```mermaid
+flowchart TB
+    Entry["入口<br/>Desktop · Web / API · TUI · CLI · QQ · Cron"]
+    Runtime["共享运行时<br/>Session · Context · Events"]
+    Router{"Agent 路由"}
+    Backends["SJTUClaw · Pi · Claude Code"]
+    Capabilities["能力与边界<br/>Tools · Memory · Skills · Scheduler<br/>Approval · Workspace · Sandbox"]
+
+    Entry --> Runtime --> Router --> Backends --> Capabilities
+```
+
+更具体的调用链、数据模型和模块职责见 [Code Wiki](docs/CODE_WIKI.md)。
+
 ## Workspace、安全模式与 Sandbox
 
 默认情况下，文件和 Shell 操作被限制在当前 Session 绑定的 Workspace 中，并按操作风险触发审批。

@@ -1,5 +1,16 @@
 # Code Wiki Log
 
+## 2026-07-30: Move the overview architecture to README
+
+**Updated pages**:
+
+- `README.md`
+- `docs/CODE_WIKI.md`
+
+**Change**:
+
+- 将总体架构从 Code Wiki 迁移到 README，并简化为入口、共享运行时、Agent 路由、后端和能力边界五个层次。
+
 ## 2026-07-30: Ingest current SJTUClaw codebase
 
 **Source**: `claw/`, `webui/`, `packaging/`, `pyproject.toml`, `.env.example`

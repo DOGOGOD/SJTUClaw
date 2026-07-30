@@ -54,56 +54,6 @@ Code Wiki 按“一个页面解释一个核心知识实体”组织。建议按�
 - [Windows Distribution](code-wiki/products/windows-distribution.md)
   pywebview 桌面壳、静态 Web 资源、PyInstaller、Inno Setup 和安装版路径。
 
-## 总体架构
-
-```mermaid
-flowchart TB
-    subgraph Entrypoints["入口"]
-        Desktop["Desktop"]
-        Web["Web UI / REST / SSE"]
-        TUI["TUI"]
-        CLI["CLI"]
-        QQ["QQ Bot"]
-        Scheduler["Cron / Heartbeat"]
-    end
-
-    subgraph Runtime["共享运行时"]
-        SessionStore["SessionStore"]
-        Context["ContextBuilder / Compaction"]
-        Router{"RuntimeAgentClient"}
-        Native["SJTUClaw Agent Loop"]
-        Pi["PiAgentClient"]
-        Claude["ClaudeCodeAgentClient"]
-        Tools["ToolRegistry"]
-    end
-
-    subgraph Capabilities["能力与边界"]
-        Approval["ApprovalManager"]
-        Workspace["WorkspaceManager"]
-        Sandbox["SandboxManager"]
-        Memory["Memory / Reflection"]
-        Skills["SkillRegistry"]
-        Cron["CronService"]
-    end
-
-    Entrypoints --> SessionStore
-    Entrypoints --> Router
-    Router --> Native
-    Router --> Pi
-    Router --> Claude
-    Native --> Context
-    Native --> Tools
-    Pi --> Tools
-    Claude --> Tools
-    Tools --> Approval
-    Tools --> Workspace
-    Tools --> Sandbox
-    Context --> Memory
-    Context --> Skills
-    Scheduler --> Cron
-    Cron --> Router
-```
-
 ## 代码地图
 
 | 路径 | 责任 | 主要入口 |

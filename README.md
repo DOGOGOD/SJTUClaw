@@ -14,7 +14,7 @@ SJTUClaw 把多轮对话、工具调用、长期记忆、Skill、定时任务和
 - Workspace 路径边界、操作审批、AUTO / UNLIMITED 模式和可选 microsandbox microVM。
 - Workspace 回退：同时恢复工作区文件和会话分支。
 - Web UI 实时事件流、图片附件、生成文件下载、模型与 Agent 设置。
-- 成熟的键盘优先 TUI：流式对话、Session / Cron 看板、命令面板和内联审批。
+- TUI：流式对话、Session / Cron 看板、命令面板和内联审批。
 - Cron、Heartbeat、QQ Bot 和桌面宠物等后台能力。
 - Windows 桌面打包与标准安装程序。
 
@@ -31,6 +31,8 @@ SJTUClaw 把多轮对话、工具调用、长期记忆、Skill、定时任务和
 ```
 
 覆盖升级和卸载不会主动删除这里的用户数据。
+
+构建 Windows 桌面版方式见[Windows 打包](docs/windows-packaging.md)
 
 ### 源码运行
 
@@ -161,8 +163,6 @@ python -m pip install -e ".[sandbox]"
 
 Web UI 使用 SSE 展示思考、工具调用、审批和最终回复。单条用户消息最多上传 4 张图片，每张最多 20 MB；附件按 Session 隔离保存。
 
-Agent 调用 `create_download` 后，Web UI 会显示图片预览或普通文件下载按钮。注册信息保存在 `data/downloads/registry.json`，最多保留 1000 条；源文件被删除后链接失效。
-
 前端开发：
 
 ```powershell
@@ -200,29 +200,37 @@ npm run build
 
 ## 项目结构
 
-```text
-claw/                 Python 运行时
-  agent/              Agent Loop、事件、预算和健康监控
-  context/            上下文构建、预算和压缩
-  tools/              内置工具与安全护栏
-  session/            Session 模型与 JSONL 存储
-  memory/             长期记忆与 Reflection
-  scheduler/          Cron、Heartbeat 和任务分发
-  workspace/          Workspace 边界与回退
-  sandbox/            microsandbox 生命周期与路由
-  gateway/            FastAPI、REST、SSE 和静态站点
-  tui/                Textual 全屏终端界面
-  pi/                 Pi RPC 适配
-  claude/             Claude Code 适配与审批桥接
-  channels/           QQ Bot
-  pet/                桌面宠物
-webui/                React + TypeScript 前端
-web/                  已构建前端
-prompts/              运行时 Prompt 资源
-skills/               内置 Skill
-packaging/            Sandbox 与 Windows 打包
-tests/                后端、前端和集成测试
-docs/                 项目文档与 Code Wiki
+```
+SJTUClaw/
+├── claw/                    Python 运行时
+│   ├── agent/               Agent Loop、事件、预算和健康监控
+│   ├── approval/            工具执行审批管理
+│   ├── channels/            QQ Bot 频道适配
+│   ├── claude/              Claude Code MCP 适配
+│   ├── cli/                 CLI 入口、REPL 与命令系统
+│   ├── context/             上下文构建、预算和压缩
+│   ├── gateway/             FastAPI、REST、SSE 和静态站点
+│   ├── llm/                 LLM 客户端与协议层
+│   ├── memory/              长期记忆与 Reflection
+│   ├── pet/                 桌面宠物
+│   ├── pi/                  Pi RPC 适配
+│   ├── prompts/             Prompt 模板加载与渲染
+│   ├── sandbox/             microsandbox 生命周期与路由
+│   ├── scheduler/           Cron、Heartbeat 和任务分发
+│   ├── session/             Session 模型与 JSONL 存储
+│   ├── skills/              Skill 注册、管理与用量追踪
+│   ├── tools/               内置工具与安全护栏
+│   ├── tui/                 Textual 全屏终端界面
+│   └── workspace/           Workspace 边界与回退
+├── data/                    运行时数据存储
+├── docs/                    项目文档与 Code Wiki
+├── packaging/               Sandbox 与 Windows 打包
+├── prompts/                 运行时 Prompt 资源
+├── skills/                  内置 Skill
+├── tests/                   后端、前端和集成测试
+├── web/                     已构建前端
+├── webui/                   React + TypeScript 前端
+└── workspace/               Workspace 工作目录
 ```
 
 ## 开发与验证

@@ -1,6 +1,6 @@
 # TUI 使用指南
 
-SJTUClaw TUI 是键盘优先的全屏终端界面。它与 Web UI、CLI 共用 Session、Agent 后端、Workspace、审批、Cron 和长期记忆。
+SJTUClaw TUI 是终端UI界面。它与 Web UI、CLI 共用 Session、Agent 后端、Workspace、审批、Cron 和长期记忆。
 
 ## 启动
 

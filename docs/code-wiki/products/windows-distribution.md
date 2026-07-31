@@ -20,6 +20,12 @@ flowchart LR
 
 `claw/desktop.py` 是 PyInstaller 主入口。
 
+源码环境通过统一 CLI 启动桌面窗口：
+
+```powershell
+sjtuclaw desktop
+```
+
 ### 启动过程
 
 1. 创建 `%USERPROFILE%\.sjtuclaw`。

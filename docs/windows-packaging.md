@@ -52,6 +52,12 @@ dist/installer/SJTUClaw-Setup-0.5.0.exe
 
 安装程序支持中英文向导、自选安装目录、开始菜单、可选桌面快捷方式、覆盖升级和系统卸载入口。
 
+源码环境中可使用统一 CLI 启动桌面窗口：
+
+```powershell
+sjtuclaw desktop
+```
+
 ## 打包内容
 
 `SJTUClaw.spec` 收集：

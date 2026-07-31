@@ -24,7 +24,6 @@ dependencies = [
 
 [project.scripts]
 sjtuclaw = "claw.cli.main:main"
-sjtuclaw-desktop = "claw.desktop:main"
 
 [project.optional-dependencies]
 desktop = ["pywebview>=5.0"]

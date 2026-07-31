@@ -54,7 +54,7 @@ sjtuclaw setup
 sjtuclaw chat       CLI 对话
 sjtuclaw tui        全屏终端界面
 sjtuclaw gateway    Gateway、Web UI 和 REST API
-sjtuclaw-desktop    本地 Gateway + 桌面窗口
+sjtuclaw desktop    本地 Gateway + 桌面窗口
 ```
 
 Gateway 默认地址为 <http://127.0.0.1:8000>。

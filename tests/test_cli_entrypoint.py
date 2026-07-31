@@ -25,3 +25,12 @@ def test_chat_subcommand_is_the_explicit_cli_entry(
     monkeypatch.setattr(cli_main, "_cmd_chat", lambda: 17)
 
     assert cli_main.main() == 17
+
+
+def test_desktop_subcommand_uses_the_unified_cli_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["sjtuclaw", "desktop"])
+    monkeypatch.setattr(cli_main, "_cmd_desktop", lambda: 23)
+
+    assert cli_main.main() == 23

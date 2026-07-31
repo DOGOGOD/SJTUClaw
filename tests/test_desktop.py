@@ -97,7 +97,7 @@ def test_main_does_not_open_window_when_gateway_is_unavailable(
     shown: list[str] = []
     opened: list[str] = []
 
-    monkeypatch.setattr(sys, "argv", ["sjtuclaw-desktop"])
+    monkeypatch.setattr(sys, "argv", ["sjtuclaw", "desktop"])
     monkeypatch.setattr(desktop, "user_root", lambda: tmp_path)
     monkeypatch.setattr(desktop, "_choose_port", lambda: 18765)
     monkeypatch.setattr(desktop, "_run_server", lambda *_args: None)
@@ -134,7 +134,7 @@ def test_main_stops_gateway_after_window_closes(monkeypatch, tmp_path):
     def wait_until_ready(*_args, **_kwargs):
         assert started.wait(timeout=1)
 
-    monkeypatch.setattr(sys, "argv", ["sjtuclaw-desktop"])
+    monkeypatch.setattr(sys, "argv", ["sjtuclaw", "desktop"])
     monkeypatch.setattr(desktop, "user_root", lambda: tmp_path)
     monkeypatch.setattr(desktop, "_choose_port", lambda: 18765)
     monkeypatch.setattr(desktop, "_create_server", lambda *_args: server)

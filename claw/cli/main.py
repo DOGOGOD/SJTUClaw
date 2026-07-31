@@ -5,6 +5,7 @@ Usage:
     sjtuclaw setup                Interactive setup wizard
     sjtuclaw tui                  Start the full-screen terminal UI
     sjtuclaw chat                 Start interactive CLI chat
+    sjtuclaw desktop              Start the local Gateway and desktop window
 
 Follows the CLI structure: ``sjtuclaw gateway``, ``sjtuclaw setup``, etc.
 """
@@ -599,6 +600,12 @@ def _cmd_tui() -> int:
     return tui_main()
 
 
+def _cmd_desktop() -> int:
+    """Start the local Gateway and desktop window."""
+    from claw.desktop import main as desktop_main
+    return desktop_main()
+
+
 def main() -> int:
     force_utf8_stdio()
     parser = argparse.ArgumentParser(
@@ -615,6 +622,7 @@ def main() -> int:
     sub.add_parser("chat",    help="Start interactive CLI chat")
     sub.add_parser("tui",     help="Start the full-screen terminal UI")
     sub.add_parser("setup",   help="Interactive setup wizard")
+    sub.add_parser("desktop", help="Start the local Gateway and desktop window")
 
     args = parser.parse_args()
 
@@ -624,6 +632,8 @@ def main() -> int:
         return _cmd_chat()
     elif args.command == "tui":
         return _cmd_tui()
+    elif args.command == "desktop":
+        return _cmd_desktop()
     elif args.command == "setup":
         return _cmd_setup()
     parser.error(f"unsupported command: {args.command}")

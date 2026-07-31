@@ -262,6 +262,7 @@ setup
 chat
 tui
 gateway
+desktop
 ```
 
 `setup` 分组配置 LLM、偏好、Gateway、高级参数和 QQ。REPL 拦截 Slash Command，普通文本进入 Agent Runtime。

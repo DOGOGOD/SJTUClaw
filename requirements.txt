@@ -10,7 +10,7 @@ uvicorn==0.38.0
 python-multipart==0.0.32
 tiktoken==0.13.0
 filelock==3.29.7
-Pillow==10.4.0
+Pillow==12.3.0
 PyYAML==6.0.2
 croniter==6.2.3
 aiohttp==3.11.10

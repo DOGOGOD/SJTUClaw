@@ -407,6 +407,60 @@ def test_claude_dangerous_tool_uses_sjtuclaw_approval_once():
     assert allowed is True
 
 
+def test_claude_auto_mode_approves_native_mutating_tool_without_prompt():
+    approvals = []
+    bridge = _ClaudeApprovalBridge(
+        "session-auto",
+        lambda request: approvals.append(request),
+        auto_mode=True,
+    )
+    bridge.start()
+    try:
+        allowed, reason = bridge.decide(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Write",
+                "tool_input": {"file_path": "x.txt", "content": "ok"},
+            }
+        )
+    finally:
+        bridge.close()
+
+    assert allowed is True
+    assert "AUTO" in reason
+    assert approvals == []
+
+
+def test_claude_auto_mode_does_not_bypass_unlimited_approval():
+    approvals = []
+
+    def reject(request: ApprovalRequest) -> ApprovalRequest:
+        approvals.append(request)
+        request.status = ApprovalStatus.REJECTED.value
+        return request
+
+    bridge = _ClaudeApprovalBridge(
+        "session-auto-unlimited",
+        reject,
+        auto_mode=True,
+        unlimited_mode=True,
+    )
+    bridge.start()
+    try:
+        allowed, _reason = bridge.decide(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "Bash",
+                "tool_input": {"command": "Remove-Item important.txt"},
+            }
+        )
+    finally:
+        bridge.close()
+
+    assert allowed is False
+    assert len(approvals) == 1
+
+
 def test_claude_dangerous_tool_fails_closed_without_approval_channel():
     bridge = _ClaudeApprovalBridge("session-no-approval", None)
     bridge.start()

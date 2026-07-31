@@ -103,3 +103,9 @@ test-results/
 
 # Local agent state (project instructions remain trackable)
 /.claude/
+
+# Video Maker
+promo-video/
+
+# WorkSpace
+workspace/

@@ -35,6 +35,7 @@ from claw.agent.events import (
 )
 from claw.agent.host_tools import (
     execute_host_tool,
+    external_agent_tool_is_preapproved,
     list_host_tool_definitions,
 )
 from claw.approval.manager import ApprovalRequest, ApprovalStatus
@@ -814,6 +815,13 @@ class _ClaudeApprovalBridge:
             host_tool_safety=self._host_tool_safety,
         ):
             return True, "只读或搜索操作无需 SJTUClaw 审批。"
+
+        if external_agent_tool_is_preapproved(
+            trust_tools=self._trust_tools,
+            auto_mode=self._auto_mode,
+            unlimited_mode=self._unlimited_mode,
+        ):
+            return True, "AUTO 模式已自动批准 Claude Code 危险操作。"
 
         if self._approval_handler is None:
             decision = (False, "当前通道不支持审批，Claude Code 危险操作已拒绝。")

@@ -137,7 +137,7 @@ TUI 是直接复用共享运行时的全屏终端界面，不需要先启动 Gat
 | 模式 | 审批行为 | 路径边界 | 是否持久化 |
 | --- | --- | --- | --- |
 | 默认 | 写入和 Shell 逐次审批 | Workspace 或 Sandbox `/workspace` | — |
-| AUTO | 自动批准所有 `write` 级工具；实际运行在 microVM 内的 Shell 也自动批准 | 不变 | 随 Session 保存 |
+| AUTO | 自动批准所有 `write` 级工具、Pi / Claude Code 原生危险工具；实际运行在 microVM 内的 Shell 也自动批准 | 不变 | 随 Session 保存 |
 | UNLIMITED | 写入、删除和 Shell 仍逐次审批 | 解除宿主 Workspace 边界 | 仅当前进程 |
 | Sandbox | 原生文件、Shell、附件和下载工具路由到 Session 级 microVM | 私有卷或显式绑定目录 | 显式开关随 Session 保存 |
 

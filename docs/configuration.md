@@ -101,7 +101,7 @@ SJTUClaw 会依次检查：
 | `CLAUDE_CODE_TURN_TIMEOUT_S` | 单轮超时，默认 1800 秒 |
 | `CLAUDE_CODE_TRUST_TOOLS` | 跳过 SJTUClaw 审批桥接 |
 
-Claude Code 保留本机登录、Skills、MCP 和原生会话。SJTUClaw 通过 `stream-json` 接收事件，并用本地审批桥接处理危险操作。
+Claude Code 保留本机登录、Skills、MCP 和原生会话。SJTUClaw 通过 `stream-json` 接收事件，并用本地审批桥接处理危险操作。当前 Session 开启 `AUTO` 后，Pi 与 Claude Code 的原生写入、编辑和危险命令也会自动批准；`UNLIMITED` 同时开启时仍强制逐次审批。
 
 ## 上下文与 Agent Loop
 

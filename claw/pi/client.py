@@ -20,7 +20,11 @@ from pathlib import Path
 from typing import Any, Callable, Sequence
 
 from claw.agent.events import ErrorEvent, FinalEvent, ThinkingEvent, ToolCallEndEvent, ToolCallStartEvent
-from claw.agent.host_tools import execute_host_tool, list_host_tool_definitions
+from claw.agent.host_tools import (
+    execute_host_tool,
+    external_agent_tool_is_preapproved,
+    list_host_tool_definitions,
+)
 from claw.approval.manager import ApprovalRequest, ApprovalStatus
 from claw.config import DATA_DIR, MAIN_DIR, PROJECT_ROOT, LLMConfig
 from claw.llm.client import LLMClient, LLMError
@@ -925,7 +929,11 @@ class PiAgentClient(LLMClient):
             payload = json.loads(str(event.get("message") or "{}"))
         except json.JSONDecodeError:
             payload = {}
-        approved = trust_tools
+        approved = external_agent_tool_is_preapproved(
+            trust_tools=trust_tools,
+            auto_mode=auto_mode,
+            unlimited_mode=unlimited_mode,
+        )
         if not approved and approval_handler:
             request = ApprovalRequest(session_id=session_id, tool_name=str(payload.get("toolName") or "pi_tool"),
                                       tool_args=payload.get("input") if isinstance(payload.get("input"), dict) else {})

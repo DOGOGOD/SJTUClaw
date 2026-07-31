@@ -47,6 +47,16 @@ def host_tool_requires_approval(tool, args: dict[str, Any] | None = None) -> boo
     return str(getattr(tool, "safety_level", "") or "") not in _SAFE_HOST_LEVELS
 
 
+def external_agent_tool_is_preapproved(
+    *,
+    trust_tools: bool,
+    auto_mode: bool,
+    unlimited_mode: bool,
+) -> bool:
+    """Apply one preapproval policy to native and bridged external-agent tools."""
+    return bool(trust_tools or (auto_mode and not unlimited_mode))
+
+
 def execute_host_tool(
     payload: dict[str, Any],
     *,
@@ -70,7 +80,11 @@ def execute_host_tool(
         return {"ok": False, "result": f"未知的 SJTUClaw tool: {name}"}
 
     mutating = host_tool_requires_approval(tool, args)
-    approved = trust_tools or (auto_mode and not unlimited_mode)
+    approved = external_agent_tool_is_preapproved(
+        trust_tools=trust_tools,
+        auto_mode=auto_mode,
+        unlimited_mode=unlimited_mode,
+    )
     if mutating and not approved:
         if approval_handler is None:
             return {"ok": False, "result": "当前通道不支持审批，操作已拒绝。"}

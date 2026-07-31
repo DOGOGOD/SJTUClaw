@@ -1686,6 +1686,7 @@ def _handle_auto_command(
                 "- `/auto status`：查看当前状态\n\n"
                 "> AUTO 模式会自动批准 workspace 内的结构化文件写入；"
                 "microsandbox 实际生效时也会自动批准其中的 Shell 操作，"
+                "Pi / Claude Code 的原生危险工具也会自动批准；"
                 "宿主 Shell 仍需明确审批。UNLIMITED 模式下所有危险操作"
                 "也仍需用户明确审批。AUTO 状态会随当前 session 持久保存。"
             )
@@ -1697,6 +1698,7 @@ def _handle_auto_command(
             "  /auto status  查看当前状态\n\n"
             "AUTO 模式会自动批准 workspace 内的结构化文件写入；"
             "microsandbox 实际生效时也会自动批准其中的 Shell 操作，"
+            "Pi / Claude Code 的原生危险工具也会自动批准；"
             "宿主 Shell 仍需明确审批。UNLIMITED 模式下所有危险操作"
             "也仍需用户明确审批。AUTO 状态会随当前 session 持久保存。"
         )
@@ -1710,6 +1712,7 @@ def _handle_auto_command(
             "AUTO 模式已开启并保存到当前 session。"
             "workspace 内的结构化文件写入可自动执行；"
             "microsandbox 实际生效时其中的 Shell 命令也可自动执行，"
+            "Pi / Claude Code 的原生危险工具也可自动执行；"
             "宿主 Shell 仍需逐一审批。"
         )
     elif sub in ("off", "disable", "0"):

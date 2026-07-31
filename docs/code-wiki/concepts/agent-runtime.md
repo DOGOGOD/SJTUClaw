@@ -153,6 +153,8 @@ UNLIMITED 开启            → 始终明确审批
 AUTO + 任意 write 级工具  → 自动批准
 AUTO + microVM 内 Shell   → 自动批准
 AUTO + 宿主 Shell         → 明确审批
+AUTO + Pi / Claude 原生工具 → 自动批准
+AUTO + UNLIMITED          → 始终明确审批
 无 approval_handler       → 需要审批的操作直接拒绝
 ```
 

@@ -158,6 +158,57 @@ def test_pi_rpc_maps_events_approval_and_only_keeps_last_assistant(tmp_path, mon
     assert messages[2].name == "write"
 
 
+def test_pi_auto_mode_approves_native_mutating_tool_without_prompt(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("PYTHONIOENCODING", "utf-8")
+    monkeypatch.setattr(
+        "claw.pi.client.load_pi_config",
+        lambda: _runtime(tmp_path, _FAKE_PI),
+    )
+    client, store = _client_and_store(tmp_path)
+
+    def unexpected_approval(_request):
+        raise AssertionError("AUTO 模式不应请求 Pi 原生工具审批")
+
+    result = client.run_agent_turn(
+        "pi-test",
+        "写入文件",
+        session_store=store,
+        approval_handler=unexpected_approval,
+        auto_mode=True,
+    )
+
+    assert result == "完成喵"
+
+
+def test_pi_auto_mode_does_not_bypass_unlimited_approval(tmp_path, monkeypatch):
+    monkeypatch.setenv("PYTHONIOENCODING", "utf-8")
+    monkeypatch.setattr(
+        "claw.pi.client.load_pi_config",
+        lambda: _runtime(tmp_path, _FAKE_PI),
+    )
+    client, store = _client_and_store(tmp_path)
+    approvals = []
+
+    def reject(request):
+        approvals.append(request)
+        request.status = ApprovalStatus.REJECTED.value
+        return request
+
+    result = client.run_agent_turn(
+        "pi-test",
+        "写入文件",
+        session_store=store,
+        approval_handler=reject,
+        auto_mode=True,
+        unlimited_mode=True,
+    )
+
+    assert result == "拒绝喵"
+    assert [request.tool_name for request in approvals] == ["write"]
+
+
 def test_pi_rpc_pairs_anonymous_tool_events_with_generated_id(tmp_path, monkeypatch):
     monkeypatch.setenv("PYTHONIOENCODING", "utf-8")
     monkeypatch.setattr(
